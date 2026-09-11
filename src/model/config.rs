@@ -85,6 +85,9 @@ impl Config {
 /// "#rrggbb" or "#rrggbbaa" → [r, g, b, a] in 0.0–1.0.
 pub fn parse_color(hex: &str) -> Option<[f32; 4]> {
     let digits = hex.strip_prefix('#')?;
+    if !digits.is_ascii() {
+        return None;
+    }
     if digits.len() != 6 && digits.len() != 8 {
         return None;
     }
@@ -160,5 +163,11 @@ mod tests {
         assert_eq!(parse_color("ff8800"), None);
         assert_eq!(parse_color("#12"), None);
         assert_eq!(parse_color("#gg0000"), None);
+    }
+
+    #[test]
+    fn non_ascii_color_is_rejected_not_a_panic() {
+        assert_eq!(parse_color("#a±bcd"), None);
+        assert_eq!(parse_color("#ab±cdef"), None);
     }
 }
