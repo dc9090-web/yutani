@@ -166,7 +166,7 @@ Key dependencies: `libcosmic` (wayland, wgpu, tokio features),
 
 The compositor thread subscribes to `toplevel_info`. A toplevel is an EVE
 client when its `app_id` is in `config.app_ids` (default
-`["steam_app_8500"]`) **and** its title is not `EVE Launcher`.
+`["exefile.exe", "steam_app_8500"]`) **and** its title is not `EVE Launcher`.
 
 Title parsing (`model::client::parse_title`):
 
