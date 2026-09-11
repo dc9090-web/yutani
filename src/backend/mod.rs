@@ -90,6 +90,8 @@ pub fn subscription(conn: Connection, app_ids: Vec<String>, fps: u32) -> iced::S
         fps: u32,
     }
     impl Hash for Key {
+        // Hash only the display id on purpose: config changes must go
+        // through `Cmd::SetAppIds`/`SetFps`, not restart the backend.
         fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
             self.conn.backend().display_id().hash(state);
         }
@@ -180,56 +182,86 @@ impl AppData {
 fn start(conn: Connection, app_ids: Vec<String>, fps: u32) -> mpsc::Receiver<Event> {
     let (sender, receiver) = mpsc::channel(64);
 
-    let (globals, event_queue) = registry_queue_init(&conn).expect("wayland registry");
+    let (globals, event_queue) = match registry_queue_init(&conn) {
+        Ok(result) => result,
+        Err(err) => {
+            tracing::error!("cannot initialize wayland registry: {err}");
+            eprintln!("yutani: cannot initialize wayland registry: {err}");
+            std::process::exit(1);
+        }
+    };
     let qh = event_queue.handle();
+
+    // Fail fast rather than leave a windowless zombie process: if the
+    // compositor cannot offer what Yutani needs, say so and exit instead of
+    // spawning a backend thread that can never do anything useful.
+    let advertised: Vec<(String, u32)> =
+        globals.contents().clone_list().into_iter().map(|g| (g.interface, g.version)).collect();
+    let checks = crate::doctor::evaluate(&advertised);
+    if !crate::doctor::all_required_present(&checks) {
+        let missing: Vec<&str> =
+            checks.iter().filter(|c| c.required && c.found.is_none()).map(|c| c.interface).collect();
+        tracing::error!("compositor is missing required protocols: {}", missing.join(", "));
+        eprintln!("yutani: compositor is missing required protocols: {} (run `yutani doctor`)", missing.join(", "));
+        std::process::exit(2);
+    }
 
     thread::Builder::new()
         .name("yutani-backend".into())
         .spawn(move || {
-            let dmabuf_state = DmabufState::new(&globals, &qh);
-            if let Err(err) = dmabuf_state.get_default_feedback(&qh) {
-                tracing::warn!("dmabuf feedback unsupported; shm only: {err}");
-            }
-            let registry_state = RegistryState::new(&globals);
-            let mut app_data = AppData {
-                qh: qh.clone(),
-                seat_state: SeatState::new(&globals, &qh),
-                toplevel_info_state: ToplevelInfoState::new(&registry_state, &qh),
-                toplevel_manager_state: ToplevelManagerState::try_new(&registry_state, &qh),
-                screencopy_state: ScreencopyState::new(&globals, &qh),
-                dmabuf_state,
-                dmabuf_feedback: None,
-                gbm_devices: gbm_devices::GbmDevices::default(),
-                shm_state: Shm::bind(&globals, &qh).expect("wl_shm"),
-                captures: HashMap::new(),
-                thread_pool: ThreadPool::builder().pool_size(1).create().expect("thread pool"),
-                registry_state,
-                sender,
-                app_ids,
-                fps: Arc::new(AtomicU32::new(fps)),
-            };
-
-            let (cmd_sender, cmd_channel) = calloop::channel::channel();
-            app_data.send_event(Event::CmdSender(cmd_sender));
-
-            let mut event_loop = calloop::EventLoop::try_new().expect("calloop");
-            WaylandSource::new(conn, event_queue)
-                .insert(event_loop.handle())
-                .expect("wayland source");
-            event_loop
-                .handle()
-                .insert_source(cmd_channel, |event, _, app_data: &mut AppData| {
-                    if let calloop::channel::Event::Msg(cmd) = event {
-                        app_data.handle_cmd(cmd);
-                    }
-                })
-                .expect("cmd channel");
-
-            loop {
-                if let Err(err) = event_loop.dispatch(None, &mut app_data) {
-                    tracing::error!("backend event loop failed: {err}");
-                    std::process::exit(1);
+            // A panic anywhere in the backend thread must not leave the UI
+            // running windowless with a dead backend; bring the whole
+            // process down instead.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let dmabuf_state = DmabufState::new(&globals, &qh);
+                if let Err(err) = dmabuf_state.get_default_feedback(&qh) {
+                    tracing::warn!("dmabuf feedback unsupported; shm only: {err}");
                 }
+                let registry_state = RegistryState::new(&globals);
+                let mut app_data = AppData {
+                    qh: qh.clone(),
+                    seat_state: SeatState::new(&globals, &qh),
+                    toplevel_info_state: ToplevelInfoState::new(&registry_state, &qh),
+                    toplevel_manager_state: ToplevelManagerState::try_new(&registry_state, &qh),
+                    screencopy_state: ScreencopyState::new(&globals, &qh),
+                    dmabuf_state,
+                    dmabuf_feedback: None,
+                    gbm_devices: gbm_devices::GbmDevices::default(),
+                    shm_state: Shm::bind(&globals, &qh).expect("wl_shm"),
+                    captures: HashMap::new(),
+                    thread_pool: ThreadPool::builder().pool_size(1).create().expect("thread pool"),
+                    registry_state,
+                    sender,
+                    app_ids,
+                    fps: Arc::new(AtomicU32::new(fps)),
+                };
+
+                let (cmd_sender, cmd_channel) = calloop::channel::channel();
+                app_data.send_event(Event::CmdSender(cmd_sender));
+
+                let mut event_loop = calloop::EventLoop::try_new().expect("calloop");
+                WaylandSource::new(conn, event_queue)
+                    .insert(event_loop.handle())
+                    .expect("wayland source");
+                event_loop
+                    .handle()
+                    .insert_source(cmd_channel, |event, _, app_data: &mut AppData| {
+                        if let calloop::channel::Event::Msg(cmd) = event {
+                            app_data.handle_cmd(cmd);
+                        }
+                    })
+                    .expect("cmd channel");
+
+                loop {
+                    if let Err(err) = event_loop.dispatch(None, &mut app_data) {
+                        tracing::error!("backend event loop failed: {err}");
+                        std::process::exit(1);
+                    }
+                }
+            }));
+            if result.is_err() {
+                tracing::error!("backend thread panicked");
+                std::process::exit(1);
             }
         })
         .expect("spawn backend thread");

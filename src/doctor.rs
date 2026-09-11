@@ -74,7 +74,7 @@ pub fn run() -> anyhow::Result<ExitCode> {
         .collect();
 
     let checks = evaluate(&advertised);
-    println!("{:<56} {:<9} {}", "interface", "needed", "found");
+    println!("{:<56} {:<9} found", "interface", "needed");
     for c in &checks {
         let needed = if c.required { "required" } else { "optional" };
         let found = match c.found {

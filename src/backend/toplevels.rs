@@ -26,8 +26,14 @@ impl AppData {
                     self.send_event(Event::ClientAdded(handle.clone(), client));
                 }
                 None => {
-                    self.stop_capture(&handle);
-                    self.send_event(Event::ClientRemoved(handle));
+                    // Only a previously-classified client transitions to
+                    // removed; a toplevel that was never a client (e.g. it
+                    // never matched `app_ids`) must not spuriously emit
+                    // `ClientRemoved`.
+                    if self.captures.contains_key(&handle) {
+                        self.stop_capture(&handle);
+                        self.send_event(Event::ClientRemoved(handle));
+                    }
                 }
             }
         }
@@ -57,8 +63,12 @@ impl ToplevelInfoHandler for AppData {
                 self.start_capture(handle);
             }
             None => {
-                self.stop_capture(handle);
-                self.send_event(Event::ClientRemoved(handle.clone()));
+                // See `reclassify_all`: only gate `ClientRemoved` behind a
+                // toplevel that was previously a known client.
+                if self.captures.contains_key(handle) {
+                    self.stop_capture(handle);
+                    self.send_event(Event::ClientRemoved(handle.clone()));
+                }
             }
         }
     }
@@ -72,6 +82,8 @@ impl ToplevelInfoHandler for AppData {
 
 impl ToplevelManagerHandler for AppData {
     fn toplevel_manager_state(&mut self) -> &mut ToplevelManagerState {
+        // `None` is unreachable here: the delegate only dispatches manager
+        // events for a manager it was bound with in the first place.
         self.toplevel_manager_state.as_mut().expect("toplevel manager")
     }
 

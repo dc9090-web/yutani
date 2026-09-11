@@ -86,4 +86,14 @@ mod tests {
         assert_eq!(Login::LoggedIn("Kel".into()).label(), "Kel");
         assert_eq!(Login::LoggingIn.label(), "Logging in…");
     }
+
+    #[test]
+    fn shipped_defaults_detect_the_real_client_and_exclude_the_launcher() {
+        let ids = crate::model::config::Config::default().app_ids;
+        assert_eq!(classify(&ids, "exefile.exe", "EVE"), Some(Login::LoggingIn));
+        assert_eq!(classify(&ids, "exefile.exe", "EVE - Aria Vex"), Some(Login::LoggedIn("Aria Vex".into())));
+        assert_eq!(classify(&ids, "steam_app_8500", "EVE"), Some(Login::LoggingIn));
+        assert_eq!(classify(&ids, "eve-online.exe", "EVE Launcher"), None);
+        assert_eq!(classify(&ids, "exefile.exe", "EVE Launcher"), None);
+    }
 }

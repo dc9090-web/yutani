@@ -55,6 +55,10 @@ pub struct ScreencopySession {
     release: Option<SubsurfaceBufferRelease>,
     last_submit: Instant,
     consecutive_failures: u32,
+    /// At most one `ext_image_copy_capture_frame` may be outstanding per
+    /// session; a second one before the first resolves is a fatal
+    /// `duplicate_frame` protocol error.
+    in_flight: bool,
 }
 
 impl ScreencopySession {
@@ -69,6 +73,7 @@ impl ScreencopySession {
                 release: None,
                 last_submit: Instant::now(),
                 consecutive_failures: 0,
+                in_flight: false,
             }),
             Err(err) => {
                 tracing::error!("cannot create capture session: {err:?}");
@@ -78,6 +83,9 @@ impl ScreencopySession {
     }
 
     fn submit(&mut self, capture: &Arc<Capture>, conn: &Connection, qh: &QueueHandle<AppData>) {
+        if self.in_flight {
+            return;
+        }
         let Some(back) = self.buffers.as_ref().map(|b| &b[1]) else { return };
         self.session.capture(
             &back.buffer,
@@ -85,9 +93,16 @@ impl ScreencopySession {
             qh,
             FrameData { frame_data: Default::default(), capture: Arc::downgrade(capture) },
         );
+        self.in_flight = true;
         self.last_submit = Instant::now();
         let _ = conn.flush();
     }
+}
+
+/// Exponential backoff for `failed` retries: 250 ms, 500 ms, 1 s, then
+/// capped at 2 s ("250 ms → 2 s").
+pub fn retry_delay_ms(consecutive_failures: u32) -> u64 {
+    250u64.saturating_mul(1u64 << consecutive_failures.saturating_sub(1).min(3)).min(2000)
 }
 
 pub struct SessionData {
@@ -175,6 +190,7 @@ impl ScreencopyHandler for AppData {
         let Some(capture) = capture_frame.data::<FrameData>().and_then(|d| d.capture.upgrade()) else { return };
         let mut guard = capture.session.lock().unwrap();
         let Some(state) = guard.as_mut() else { return };
+        state.in_flight = false;
         state.consecutive_failures = 0;
         let Some(buffers) = state.buffers.as_mut() else { return };
 
@@ -198,6 +214,7 @@ impl ScreencopyHandler for AppData {
         };
         let previous_release = state.release.replace(release);
         let last_submit = state.last_submit;
+        let session_id = state.session.clone();
 
         // Next capture: after the previous front buffer is released by the
         // compositor and at least one frame interval since the last submit.
@@ -217,6 +234,13 @@ impl ScreencopyHandler for AppData {
             }
             let mut guard = capture_for_task.session.lock().unwrap();
             if let Some(state) = guard.as_mut() {
+                // Belt and braces: `in_flight` is the primary guard against a
+                // stale task racing a restarted session on the same `Arc`,
+                // but also bail if this task no longer targets the session
+                // it was spawned for.
+                if state.session != session_id {
+                    return;
+                }
                 state.submit(&capture_for_task, &conn, &qh);
             }
         });
@@ -227,6 +251,12 @@ impl ScreencopyHandler for AppData {
 
     fn failed(&mut self, conn: &Connection, qh: &QueueHandle<Self>, capture_frame: &CaptureFrame, reason: WEnum<FailureReason>) {
         let Some(capture) = capture_frame.data::<FrameData>().and_then(|d| d.capture.upgrade()) else { return };
+        {
+            let mut guard = capture.session.lock().unwrap();
+            if let Some(state) = guard.as_mut() {
+                state.in_flight = false;
+            }
+        }
         match reason {
             WEnum::Value(FailureReason::BufferConstraints) => {
                 tracing::info!("buffer constraints changed; reallocating");
@@ -249,9 +279,10 @@ impl ScreencopyHandler for AppData {
                 let Some(state) = guard.as_mut() else { return };
                 state.consecutive_failures += 1;
                 let n = state.consecutive_failures;
+                let session_id = state.session.clone();
                 drop(guard);
 
-                if n >= 4 {
+                if n >= 5 {
                     tracing::warn!(
                         "capture failed {n} times in a row ({other:?}); giving up until the client changes state"
                     );
@@ -259,7 +290,7 @@ impl ScreencopyHandler for AppData {
                     return;
                 }
 
-                let delay_ms = 250u64.saturating_mul(1u64 << (n - 1)).min(2000);
+                let delay_ms = retry_delay_ms(n);
                 tracing::debug!("capture failed: {other:?}; retrying in {delay_ms}ms (attempt {n})");
                 let delay = Duration::from_millis(delay_ms);
                 let capture_for_task = capture.clone();
@@ -269,6 +300,9 @@ impl ScreencopyHandler for AppData {
                     futures_timer::Delay::new(delay).await;
                     let mut guard = capture_for_task.session.lock().unwrap();
                     if let Some(state) = guard.as_mut() {
+                        if state.session != session_id {
+                            return;
+                        }
                         state.submit(&capture_for_task, &conn, &qh);
                     }
                 });
@@ -284,3 +318,18 @@ impl ScreencopyHandler for AppData {
 }
 
 cctk::delegate_screencopy!(AppData);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_delay_ms_schedule() {
+        assert_eq!(retry_delay_ms(1), 250);
+        assert_eq!(retry_delay_ms(2), 500);
+        assert_eq!(retry_delay_ms(3), 1000);
+        assert_eq!(retry_delay_ms(4), 2000);
+        assert_eq!(retry_delay_ms(5), 2000);
+        assert_eq!(retry_delay_ms(6), 2000);
+    }
+}

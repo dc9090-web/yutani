@@ -132,7 +132,7 @@ impl App {
             return Task::none();
         }
         let Some(output) = self.output_for(&client.info) else {
-            tracing::warn!("no outputs yet; deferring surface");
+            tracing::debug!("no outputs yet; deferring surface");
             return Task::none();
         };
         let position = self.next_position();
