@@ -91,8 +91,10 @@ fn run(_key: &Key) -> BoxStream<'static, TrayEvent> {
             None
         }
     };
-    // Keep the ksni handle alive for as long as the stream lives; it owns
-    // the background thread that runs the D-Bus service.
+    // The D-Bus service runs on its own thread regardless of the handle
+    // (ksni 0.3: `Handle` is a Weak + sender, no Drop). We keep it in the
+    // stream state anyway so a future `handle.update(..)` (e.g. dynamic
+    // menu labels) has somewhere to live.
     Box::pin(stream::unfold((rx, handle), |(mut rx, handle)| async move {
         let ev = rx.next().await?;
         Some((ev, (rx, handle)))
