@@ -236,17 +236,27 @@ impl App {
     }
 
     fn destroy_surface(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {
-        match self.clients.get_mut(handle).and_then(|c| c.surface.take()) {
-            Some(id) => {
-                // A drag on a surface that goes away must not linger and block
-                // future drags.
-                if self.drag.as_ref().is_some_and(|d| d.surface == id) {
-                    self.drag = None;
-                }
-                destroy_layer_surface(id)
-            }
+        match self.forget_surface(handle) {
+            Some(id) => destroy_layer_surface(id),
             None => Task::none(),
         }
+    }
+
+    /// Clear `client.surface` (if set) along with any hover/drag state tied
+    /// to it, returning the surface id that was there. A surface that goes
+    /// away — destroyed by us or closed by the compositor — must not leave
+    /// `hovered` set, or the next `create_surface` for this client comes back
+    /// zoomed; and a drag on it must not linger and block future drags.
+    fn forget_surface(&mut self, handle: &Handle) -> Option<SurfaceId> {
+        let id = self.clients.get_mut(handle).and_then(|c| c.surface.take())?;
+        if self.drag.as_ref().is_some_and(|d| d.surface == id) {
+            self.drag = None;
+        }
+        if let Some(c) = self.clients.get_mut(handle) {
+            c.hovered = false;
+            c.last_cursor = Point::ORIGIN;
+        }
+        Some(id)
     }
 
     fn client_for_surface(&self, id: SurfaceId) -> Option<Handle> {
@@ -288,9 +298,12 @@ impl App {
         let client = self.clients.get_mut(handle).unwrap();
         client.position = (saved.x, saved.y);
         client.pinned = saved.pinned;
-        match client.surface {
-            Some(id) => set_margin(id, saved.y, 0, 0, saved.x),
-            None => Task::none(),
+        let surface = client.surface;
+        match surface {
+            // A drag canvas surface must keep its enlarged size until the
+            // drag ends; a margin here would shrink it out from under the drag.
+            Some(id) if !self.in_canvas(id) => set_margin(id, saved.y, 0, 0, saved.x),
+            _ => Task::none(),
         }
     }
 
@@ -455,13 +468,16 @@ impl App {
                     placed: false,
                 });
                 let was_named = matches!(entry.info.login, Login::LoggedIn(_));
-                let had_surface = entry.surface.is_some();
                 entry.info = info;
                 let became_named = !was_named && matches!(entry.info.login, Login::LoggedIn(_));
                 // An activation change on one client can hide/show others, so
                 // reconcile every client's surface, not just this one's.
                 let reconciled = self.reconcile_surfaces();
-                if became_named && had_surface {
+                if became_named {
+                    // A saved position must apply even if the surface was just
+                    // created (or doesn't exist yet): `apply_saved_position`
+                    // updates position/pinned regardless, and is a no-op on
+                    // margin if there's no surface.
                     Task::batch([reconciled, self.apply_saved_position(&handle)])
                 } else {
                     reconciled
@@ -585,14 +601,7 @@ impl Application for App {
                 // The compositor closed this surface (its output went away).
                 if let Some(handle) = self.client_for_surface(id) {
                     tracing::info!("layer surface closed by compositor; recreating");
-                    // A drag on a surface that goes away must not linger and
-                    // block future drags (mirrors destroy_surface).
-                    if self.drag.as_ref().is_some_and(|d| d.surface == id) {
-                        self.drag = None;
-                    }
-                    if let Some(c) = self.clients.get_mut(&handle) {
-                        c.surface = None;
-                    }
+                    self.forget_surface(&handle);
                     return self.reconcile_surfaces();
                 }
                 Task::none()
