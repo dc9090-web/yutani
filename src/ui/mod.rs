@@ -175,6 +175,12 @@ impl App {
                     let show = self.should_show(&self.clients[&h]);
                     let c = self.clients.get_mut(&h).unwrap();
                     let was_shown = c.surface.is_some() || c.docked;
+                    if c.docked {
+                        // Leaving dock mode: this thumbnail's strip widget is
+                        // gone and its `on_exit` never fires; don't let it
+                        // come back zoomed as a floating surface.
+                        c.hovered = false;
+                    }
                     c.docked = false;
                     if show && !was_shown {
                         self.send(Cmd::ResumeCapture(h.clone()));
@@ -214,108 +220,6 @@ impl App {
             }
         }
         Task::batch(tasks)
-    }
-
-    /// Dock mode: the clients shown on `output`, in strip order.
-    fn dock_order_for(&self, output: &WlOutput) -> Vec<Handle> {
-        let shown: Vec<(&Handle, &Client)> = self
-            .clients
-            .iter()
-            .filter(|(_, c)| self.should_show(c) && self.output_for(&c.info).as_ref() == Some(output))
-            .collect();
-        rules::dock_order(shown.iter().map(|(h, c)| (*h, c.info.login.label())))
-    }
-
-    fn dock_thickness_for(&self, output: &WlOutput) -> u32 {
-        let any_hovered = self.dock_order_for(output).iter().any(|h| self.clients[h].hovered);
-        // `None` image: one 16:9-based thickness per strip, whatever the
-        // individual clients' aspects (see `dock::thickness`).
-        dock::thickness(&self.config, any_hovered, None)
-    }
-
-    /// Dock mode: one strip per output that has a shown client; none for
-    /// outputs that don't.
-    fn reconcile_docks(&mut self) -> Task<cosmic::Action<Msg>> {
-        let mut tasks = Vec::new();
-        let outputs: Vec<Output> = self.outputs.clone();
-        for o in &outputs {
-            let needed = !self.dock_order_for(&o.handle).is_empty();
-            let has = self.docks.iter().any(|d| d.output == o.handle);
-            if needed && !has {
-                let id = SurfaceId::unique();
-                let thickness = self.dock_thickness_for(&o.handle);
-                let edge = self.config.dock_edge;
-                tracing::info!(?id, output = %o.name, ?edge, thickness, "dock: create strip");
-                self.docks.push(dock::DockSurface { output: o.handle.clone(), id, last_thickness: thickness });
-                tasks.push(get_layer_surface(dock::settings(id, o.handle.clone(), edge, thickness)));
-            } else if !needed && has {
-                tasks.push(self.destroy_dock_on(&o.handle));
-            }
-        }
-        // Strips on outputs that are gone.
-        let stale: Vec<WlOutput> = self
-            .docks
-            .iter()
-            .filter(|d| !outputs.iter().any(|o| o.handle == d.output))
-            .map(|d| d.output.clone())
-            .collect();
-        for output in stale {
-            tasks.push(self.destroy_dock_on(&output));
-        }
-        Task::batch(tasks)
-    }
-
-    fn destroy_dock_on(&mut self, output: &WlOutput) -> Task<cosmic::Action<Msg>> {
-        let Some(pos) = self.docks.iter().position(|d| d.output == *output) else { return Task::none() };
-        let d = self.docks.remove(pos);
-        let name = self.outputs.iter().find(|o| o.handle == d.output).map(|o| o.name.as_str()).unwrap_or("?");
-        tracing::info!(id = ?d.id, output = %name, "dock: destroy strip");
-        destroy_layer_surface(d.id)
-    }
-
-    fn destroy_docks(&mut self) -> Task<cosmic::Action<Msg>> {
-        let outputs: Vec<WlOutput> = self.docks.iter().map(|d| d.output.clone()).collect();
-        Task::batch(outputs.iter().map(|o| self.destroy_dock_on(o)))
-    }
-
-    /// Resize the strip on `output` to its current thickness, if changed.
-    fn resize_dock_if_needed(&mut self, output: &WlOutput) -> Task<cosmic::Action<Msg>> {
-        let thickness = self.dock_thickness_for(output);
-        let edge = self.config.dock_edge;
-        let Some(d) = self.docks.iter_mut().find(|d| d.output == *output) else { return Task::none() };
-        if d.last_thickness == thickness {
-            return Task::none();
-        }
-        d.last_thickness = thickness;
-        let (w, h) = dock::size_for(edge, thickness);
-        set_size(d.id, w, h)
-    }
-
-    fn on_dock(&mut self, msg: dock::DockMsg) -> Task<cosmic::Action<Msg>> {
-        use dock::DockMsg;
-        match msg {
-            DockMsg::Press(h) => {
-                self.send(Cmd::Activate(h));
-                Task::none()
-            }
-            DockMsg::RightPress(h) => {
-                self.send(Cmd::Minimize(h));
-                Task::none()
-            }
-            DockMsg::Enter(h) => self.set_dock_hover(&h, true),
-            DockMsg::Exit(h) => self.set_dock_hover(&h, false),
-        }
-    }
-
-    /// Dock hover: the thumbnail grows in place on the next redraw; the
-    /// strip is thickened to make room (and shrunk back on exit).
-    fn set_dock_hover(&mut self, h: &Handle, hovered: bool) -> Task<cosmic::Action<Msg>> {
-        let Some(c) = self.clients.get_mut(h) else { return Task::none() };
-        c.hovered = hovered;
-        match self.output_for(&self.clients[h].info) {
-            Some(output) => self.resize_dock_if_needed(&output),
-            None => Task::none(),
-        }
     }
 
     /// Output to show a client on: the one it is on, else the first known.
@@ -721,13 +625,25 @@ impl App {
         if new.fps != self.config.fps {
             self.send(Cmd::SetFps(new.fps));
         }
-        let layout_changed = new.mode != self.config.mode || new.dock_edge != self.config.dock_edge;
+        let mode_changed = new.mode != self.config.mode;
+        let edge_changed = new.dock_edge != self.config.dock_edge;
+        if mode_changed || edge_changed {
+            // A strip teardown/re-anchor never fires each thumbnail's
+            // `on_exit`; don't let any of them come back zoomed.
+            for c in self.clients.values_mut() {
+                c.hovered = false;
+            }
+        }
         self.config = new;
         let mut tasks = Vec::new();
-        if layout_changed {
-            // Mode/edge are baked into the strip surfaces: drop them and let
-            // `reconcile_surfaces` rebuild whatever the new mode needs.
+        if mode_changed {
+            // Mode is baked into whether strips exist at all: drop them and
+            // let `reconcile_surfaces` rebuild whatever the new mode needs.
             tasks.push(self.destroy_docks());
+        } else if edge_changed && self.config.mode == Mode::Dock {
+            // Edge alone: the same strips are still needed, just anchored
+            // (and sized) differently — cheaper than destroy+create.
+            tasks.push(self.reanchor_docks(self.config.dock_edge));
         }
         // Sizes and visibility may have changed.
         tasks.push(self.reconcile_surfaces());
@@ -782,10 +698,13 @@ impl Application for App {
                 let had_outputs = !self.outputs.is_empty();
                 let removed = matches!(event, OutputEvent::Removed);
                 self.on_output(event, output);
+                if self.config.mode == Mode::Dock {
+                    // Any output arrival, update, or removal can change which
+                    // outputs need a strip (or the strip's size); reconcile
+                    // on every event, not just the first output.
+                    return self.reconcile_surfaces();
+                }
                 if !had_outputs && !self.outputs.is_empty() {
-                    if self.config.mode == Mode::Dock {
-                        return self.reconcile_surfaces();
-                    }
                     let pending: Vec<Handle> = self
                         .clients
                         .iter()
