@@ -17,6 +17,19 @@ pub fn size(config: &Config, image: Option<&CaptureImage>) -> (u32, u32) {
     }
 }
 
+/// Layer-surface size when hovered (or not); content scales by
+/// `zoom_factor`, the border stays fixed.
+pub fn zoomed_size(config: &Config, image: Option<&CaptureImage>, zoomed: bool) -> (u32, u32) {
+    if !zoomed {
+        return size(config, image);
+    }
+    let scaled = Config {
+        thumb_width: (config.thumb_width as f32 * config.zoom_factor).round() as u32,
+        ..config.clone()
+    };
+    size(&scaled, image)
+}
+
 pub fn size_for(config: &Config, src_w: u32, src_h: u32) -> (u32, u32) {
     let inner_w = config.thumb_width.max(1);
     let inner_h = ((inner_w as u64 * src_h as u64) / src_w.max(1) as u64) as u32;
@@ -102,6 +115,13 @@ mod tests {
         let config = Config { thumb_width: 320, border_px: 2, ..Config::default() };
         assert_eq!(size_for(&config, 2560, 1440), (324, 184));
         assert_eq!(size_for(&config, 1000, 1000), (324, 324));
+    }
+
+    #[test]
+    fn zoomed_size_scales_content_not_border() {
+        let config = Config { thumb_width: 320, border_px: 2, zoom_factor: 1.5, ..Config::default() };
+        assert_eq!(zoomed_size(&config, None, false), (324, 184));
+        assert_eq!(zoomed_size(&config, None, true), (484, 274));
     }
 
     #[test]

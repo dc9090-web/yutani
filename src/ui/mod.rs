@@ -59,6 +59,8 @@ pub struct Client {
     /// Last surface-local cursor position we saw for this client, since
     /// `ButtonPressed` does not carry one.
     pub last_cursor: Point,
+    /// Cursor is currently over this thumbnail; surface is zoomed.
+    pub hovered: bool,
 }
 
 pub struct App {
@@ -137,6 +139,11 @@ impl App {
         (thumbnail::next_free_x(&taken, 40, w as i32 + 16), 40)
     }
 
+    /// Layer-surface size for `client`, zoomed if hovered.
+    fn surface_size(&self, client: &Client) -> (u32, u32) {
+        thumbnail::zoomed_size(&self.config, client.image.as_ref(), client.hovered)
+    }
+
     fn create_surface(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {
         let Some(client) = self.clients.get(handle) else { return Task::none() };
         if client.surface.is_some() {
@@ -153,7 +160,7 @@ impl App {
         };
         let position = saved.as_ref().map(|s| (s.x, s.y)).unwrap_or_else(|| self.next_position());
         let pinned = saved.as_ref().map(|s| s.pinned).unwrap_or(false);
-        let (width, height) = thumbnail::size(&self.config, client.image.as_ref());
+        let (width, height) = self.surface_size(client);
         let id = SurfaceId::unique();
         let client = self.clients.get_mut(handle).unwrap();
         client.surface = Some(id);
@@ -250,7 +257,9 @@ impl App {
     /// Undo `enter_canvas`: back to a thumbnail-sized surface at the client's
     /// current position. Order matters: anchor, size, margin.
     fn leave_canvas(&self, id: SurfaceId, client: &Client) -> Task<cosmic::Action<Msg>> {
-        let (w, h) = thumbnail::size(&self.config, client.image.as_ref());
+        // `client.hovered` is set true before this is called (the cursor is
+        // over the thumbnail at drag end), so this restores at zoomed size.
+        let (w, h) = self.surface_size(client);
         let (x, y) = client.position;
         Task::batch([
             set_anchor(id, Anchor::TOP | Anchor::LEFT),
@@ -338,6 +347,11 @@ impl App {
                     _ => {}
                 }
                 if was_canvas {
+                    // The cursor is over the thumbnail at drag end (no CursorEntered
+                    // fires for a surface that was already under the pointer), so mark
+                    // it hovered before computing the restore size — leave_canvas then
+                    // restores at zoomed size instead of snapping small first.
+                    self.clients.get_mut(&handle).unwrap().hovered = true;
                     let client = &self.clients[&handle];
                     tracing::debug!(?id, pos = ?client.position, "drag: leaving canvas");
                     self.leave_canvas(id, client)
@@ -345,9 +359,27 @@ impl App {
                     Task::none()
                 }
             }
+            mouse::Event::CursorEntered => {
+                // While dragging the surface is already zoomed (canvas mode);
+                // leave size/hovered alone so drag end restores correctly.
+                if self.drag.as_ref().is_some_and(|d| d.surface == id) {
+                    return Task::none();
+                }
+                let c = self.clients.get_mut(&handle).unwrap();
+                c.hovered = true;
+                let (w, h) = self.surface_size(&self.clients[&handle]);
+                set_size(id, Some(w), Some(h))
+            }
             mouse::Event::CursorLeft => {
-                // Releasing outside is delivered to us anyway (implicit grab); nothing to do.
-                Task::none()
+                // Releasing outside is delivered to us anyway (implicit grab); nothing
+                // to do while dragging — canvas mode owns the size until release.
+                if self.drag.as_ref().is_some_and(|d| d.surface == id) {
+                    return Task::none();
+                }
+                let c = self.clients.get_mut(&handle).unwrap();
+                c.hovered = false;
+                let (w, h) = self.surface_size(&self.clients[&handle]);
+                set_size(id, Some(w), Some(h))
             }
             _ => Task::none(),
         }
@@ -367,6 +399,7 @@ impl App {
                     position: (0, 0),
                     pinned: false,
                     last_cursor: Point::ORIGIN,
+                    hovered: false,
                 });
                 let was_named = matches!(entry.info.login, Login::LoggedIn(_));
                 let had_surface = entry.surface.is_some();
@@ -386,8 +419,8 @@ impl App {
             }
             Event::Frame(handle, image) => {
                 let Some(client) = self.clients.get_mut(&handle) else { return Task::none() };
-                let old = thumbnail::size(&self.config, client.image.as_ref());
-                let new = thumbnail::size(&self.config, Some(&image));
+                let old = thumbnail::zoomed_size(&self.config, client.image.as_ref(), client.hovered);
+                let new = thumbnail::zoomed_size(&self.config, Some(&image), client.hovered);
                 client.image = Some(image);
                 let surface = client.surface;
                 match surface {
