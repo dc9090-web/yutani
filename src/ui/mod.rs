@@ -75,9 +75,7 @@ pub struct App {
 pub enum Msg {
     Wayland(WaylandEvent),
     Backend(Event),
-    Activate(Handle),
     Pointer(SurfaceId, mouse::Event),
-    Minimize(Handle),
 }
 
 impl App {
@@ -199,7 +197,10 @@ impl App {
     /// Remember this client's position (and pin state) under its character name.
     fn persist_position(&mut self, handle: &Handle) {
         let Some(client) = self.clients.get(handle) else { return };
-        let Login::LoggedIn(name) = &client.info.login else { return };
+        let Login::LoggedIn(name) = &client.info.login else {
+            tracing::debug!("position not saved: character name not resolved yet");
+            return;
+        };
         let Some(output) = self.output_name_of(client) else { return };
         self.layout.thumbs.insert(
             name.clone(),
@@ -235,11 +236,13 @@ impl App {
                 Task::none()
             }
             mouse::Event::ButtonPressed(button) => {
-                let c = &self.clients[&handle];
-                // Position of the cursor at press time is not part of ButtonPressed;
-                // use the last CursorMoved we saw for this surface.
-                let cursor = c.last_cursor;
-                self.drag = pointer::on_press(id, button, cursor, c.position, c.pinned);
+                if self.drag.is_none() {
+                    let c = &self.clients[&handle];
+                    // Position of the cursor at press time is not part of ButtonPressed;
+                    // use the last CursorMoved we saw for this surface.
+                    let cursor = c.last_cursor;
+                    self.drag = pointer::on_press(id, button, cursor, c.position, c.pinned);
+                }
                 Task::none()
             }
             mouse::Event::CursorMoved { position } => {
@@ -261,6 +264,16 @@ impl App {
                         let edges = self.config.snap_edges.then_some(12);
                         let (x, y) = layout::snap(Rect { x: raw.0, y: raw.1, ..me }, &others, grid, edges);
                         let (x, y) = (x.max(0), y.max(0));
+                        let (w, h) = (me.w, me.h);
+                        let output_size = self
+                            .output_for(&self.clients[&handle].info)
+                            .and_then(|o| self.outputs.iter().find(|out| out.handle == o).map(|out| out.logical_size));
+                        let (x, y) = match output_size {
+                            Some((ow, oh)) if ow > 0 && oh > 0 => {
+                                (x.min((ow - w).max(0)), y.min((oh - h).max(0)))
+                            }
+                            _ => (x, y),
+                        };
                         self.clients.get_mut(&handle).unwrap().position = (x, y);
                         set_margin(id, y, 0, 0, x)
                     }
@@ -268,9 +281,10 @@ impl App {
                 }
             }
             mouse::Event::ButtonReleased(button) => {
-                let Some(drag) = self.drag.take().filter(|d| d.surface == id && d.button == button) else {
+                if !self.drag.as_ref().is_some_and(|d| d.surface == id && d.button == button) {
                     return Task::none();
-                };
+                }
+                let drag = self.drag.take().unwrap();
                 match pointer::on_release(drag) {
                     pointer::Outcome::Click(mouse::Button::Left) => {
                         self.send(Cmd::Activate(handle));
@@ -307,10 +321,11 @@ impl App {
                     last_cursor: Point::ORIGIN,
                 });
                 let was_named = matches!(entry.info.login, Login::LoggedIn(_));
+                let had_surface = entry.surface.is_some();
                 entry.info = info;
                 let became_named = !was_named && matches!(entry.info.login, Login::LoggedIn(_));
                 let create = self.create_surface(&handle);
-                if became_named {
+                if became_named && had_surface {
                     Task::batch([create, self.apply_saved_position(&handle)])
                 } else {
                     create
@@ -388,15 +403,7 @@ impl Application for App {
             }
             Msg::Wayland(_) => Task::none(),
             Msg::Backend(event) => self.on_backend(event),
-            Msg::Activate(handle) => {
-                self.send(Cmd::Activate(handle));
-                Task::none()
-            }
             Msg::Pointer(id, event) => self.on_pointer(id, event),
-            Msg::Minimize(handle) => {
-                self.send(Cmd::Minimize(handle));
-                Task::none()
-            }
         }
     }
 
