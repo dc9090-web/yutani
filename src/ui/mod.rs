@@ -518,7 +518,9 @@ impl App {
         let mut tasks = vec![self.reconcile_surfaces()];
         let handles: Vec<Handle> = self.clients.keys().cloned().collect();
         for h in handles {
-            if let Some(id) = self.clients[&h].surface {
+            // A surface enlarged to a drag canvas must keep its size until the
+            // drag ends (`leave_canvas` applies the current size then).
+            if let Some(id) = self.clients[&h].surface.filter(|id| !self.in_canvas(*id)) {
                 let (w, hgt) = self.surface_size(&self.clients[&h]);
                 tasks.push(set_size(id, Some(w), Some(hgt)));
             }
