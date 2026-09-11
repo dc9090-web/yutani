@@ -22,6 +22,7 @@ use crate::model::client::Login;
 use crate::model::config::Config;
 use crate::model::layout::{self, Layout, Rect, ThumbPos};
 
+pub mod config_watch;
 pub mod pointer;
 pub mod thumbnail;
 
@@ -86,6 +87,7 @@ pub enum Msg {
     Wayland(WaylandEvent),
     Backend(Event),
     Pointer(SurfaceId, mouse::Event),
+    ConfigChanged(Config),
 }
 
 impl App {
@@ -496,6 +498,33 @@ impl App {
             }
         }
     }
+
+    /// Apply a freshly re-read (and validated) config. Border colours,
+    /// opacity and names apply on the next redraw automatically because
+    /// `view_window` reads `self.config`; sizes and visibility need pushing.
+    fn apply_config(&mut self, new: Config) -> Task<cosmic::Action<Msg>> {
+        if new == self.config {
+            return Task::none();
+        }
+        tracing::info!("config changed; applying");
+        if new.app_ids != self.config.app_ids {
+            self.send(Cmd::SetAppIds(new.app_ids.clone()));
+        }
+        if new.fps != self.config.fps {
+            self.send(Cmd::SetFps(new.fps));
+        }
+        self.config = new;
+        // Sizes and visibility may have changed.
+        let mut tasks = vec![self.reconcile_surfaces()];
+        let handles: Vec<Handle> = self.clients.keys().cloned().collect();
+        for h in handles {
+            if let Some(id) = self.clients[&h].surface {
+                let (w, hgt) = self.surface_size(&self.clients[&h]);
+                tasks.push(set_size(id, Some(w), Some(hgt)));
+            }
+        }
+        Task::batch(tasks)
+    }
 }
 
 impl Application for App {
@@ -570,6 +599,7 @@ impl Application for App {
             Msg::Wayland(_) => Task::none(),
             Msg::Backend(event) => self.on_backend(event),
             Msg::Pointer(id, event) => self.on_pointer(id, event),
+            Msg::ConfigChanged(config) => self.apply_config(config),
         }
     }
 
@@ -583,7 +613,7 @@ impl Application for App {
             // a message: update → redraw → same event again is a hot loop.
             _ => None,
         });
-        let mut subs = vec![events];
+        let mut subs = vec![events, config_watch::subscription().map(Msg::ConfigChanged)];
         if let Some(conn) = self.conn.clone() {
             subs.push(
                 backend::subscription(conn, self.config.app_ids.clone(), self.config.fps)
@@ -595,6 +625,15 @@ impl Application for App {
 
     fn view(&self) -> Element<'_, Msg> {
         unreachable!("no main window")
+    }
+
+    /// `run_single_instance` activates the already-running instance and lets
+    /// this dbus-activation request arrive here instead of spawning a second
+    /// process. Plan 4's IPC will give it a real message; for now, log so a
+    /// second launch is visible rather than silently doing nothing.
+    fn dbus_activation(&mut self, _msg: cosmic::dbus_activation::Message) -> Task<cosmic::Action<Msg>> {
+        tracing::info!("activation request received (another yutani instance was launched)");
+        Task::none()
     }
 
     /// Layer-surface configures arrive here. A drag starts by enlarging the

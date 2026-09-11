@@ -263,9 +263,9 @@ order. No dragging.
 | --- | --- |
 | Left click, no drag | `Command::Activate(client)` |
 | Left or right drag > 4 px | Move (floating, unpinned only). Snap to 32 px grid if `snap_grid`; snap to other thumbnails' edges within 12 px if `snap_edges`. Save `current` layout on release. |
-| Ctrl + left click | `Command::Minimize(client)` |
+| Right click (no drag) | `Command::Minimize(client)` — layer surfaces never receive modifier state, so Ctrl-click is not possible |
 | Middle click | Toggle pin |
-| Hover enter / leave | Animate size to `thumb_width × zoom_factor` and back over 120 ms, growing away from the anchored corner so the thumbnail stays on screen. Applies in both modes. |
+| Hover enter / leave | resize immediately (no animation) to `thumb_width × zoom_factor` and back, growing away from the anchored corner so the thumbnail stays on screen. Applies in both modes. |
 
 ### Visibility (re-evaluated on every focus change)
 
@@ -276,7 +276,10 @@ order. No dragging.
 - Tray Hide / `yutani hide`: all unmapped until Show.
 
 Unmapping never destroys layer surfaces or capture sessions (except the
-`hide_active` pause in §5).
+`hide_active` pause in §5). Implementation note: layer-shell surfaces have no
+hide/show primitive, so "unmapping" is implemented as destroy + recreate;
+the client's position and pinned state are retained across the cycle and the
+thumbnail reappears in the same place.
 
 ### Settings window
 

@@ -6558,6 +6558,7 @@ dependencies = [
  "futures-timer",
  "gbm",
  "libcosmic",
+ "notify",
  "ron 0.10.1",
  "serde",
  "tracing",

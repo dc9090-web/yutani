@@ -19,6 +19,7 @@ calloop = { version = "0.14.4", features = ["executor"] }
 calloop-wayland-source = "0.4.1"
 gbm = "0.18.0"
 futures-timer = "3"
+notify = "8"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
