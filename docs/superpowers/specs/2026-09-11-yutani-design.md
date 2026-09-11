@@ -225,9 +225,8 @@ Per EVE client, in the compositor thread:
 
 Capture continues for the active client (it is shown in the dock) unless
 `hide_active` is on, in which case its session is paused (no captures
-submitted), not destroyed. *Status after plan 2:* not yet implemented —
-hidden clients keep capturing (cheap with zero-copy); to be done together
-with tray Hide in plan 3.
+submitted), not destroyed. *Implemented in plan 3* (`Cmd::PauseCapture` /
+`ResumeCapture`, edge-triggered from surface reconciliation).
 
 ## 6. UI
 
