@@ -8,7 +8,11 @@ use ksni::blocking::TrayMethods;
 
 #[derive(Clone, Debug)]
 pub enum TrayEvent {
+    /// Icon click: flip `hidden`.
     ToggleVisibility,
+    /// Menu items: set `hidden` to exactly this (idempotent — clicking
+    /// "Show" twice must not hide).
+    SetHidden(bool),
     Quit,
 }
 
@@ -35,12 +39,14 @@ impl ksni::Tray for YutaniTray {
         // Two always-present items rather than one label that tracks
         // `hidden`: ksni only re-reads `menu()` on `Handle::update`, and the
         // handle lives inside the subscription's stream, not on `App` — so
-        // there is nothing to call `update` from. This is simpler anyway.
+        // there is nothing to call `update` from. Each item therefore sets
+        // an absolute state rather than toggling, so "Show" while shown is
+        // a no-op instead of hiding.
         vec![
             StandardItem {
                 label: "Show thumbnails".into(),
                 activate: Box::new(|t: &mut Self| {
-                    let _ = t.tx.unbounded_send(TrayEvent::ToggleVisibility);
+                    let _ = t.tx.unbounded_send(TrayEvent::SetHidden(false));
                 }),
                 ..Default::default()
             }
@@ -48,7 +54,7 @@ impl ksni::Tray for YutaniTray {
             StandardItem {
                 label: "Hide thumbnails".into(),
                 activate: Box::new(|t: &mut Self| {
-                    let _ = t.tx.unbounded_send(TrayEvent::ToggleVisibility);
+                    let _ = t.tx.unbounded_send(TrayEvent::SetHidden(true));
                 }),
                 ..Default::default()
             }

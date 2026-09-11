@@ -5,20 +5,25 @@
 //! click and right-click are handled at the widget level (`mouse_area`
 //! around each thumbnail) rather than through the surface-level pointer
 //! path, so `App::client_for_surface` never resolves a dock surface id.
+//!
+//! The strip spans its output along the edge but only the thumbnails accept
+//! input: its wl_surface input region is set to exactly the thumbnail rects
+//! (`item_rects`), so the empty band passes clicks through to whatever is
+//! underneath (EVE's own HUD, typically).
 
 use cosmic::cctk::sctk::shell::wlr_layer::{Anchor, KeyboardInteractivity, Layer};
 use cosmic::cctk::wayland_client::protocol::wl_output::WlOutput;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
-    destroy_layer_surface, get_layer_surface, set_anchor, set_size,
+    destroy_layer_surface, get_layer_surface, set_anchor, set_input_zone, set_size,
 };
 use cosmic::iced::runtime::platform_specific::wayland::layer_surface::{IcedOutput, SctkLayerSurfaceSettings};
 use cosmic::iced::window::Id as SurfaceId;
-use cosmic::iced::{Alignment, Length};
+use cosmic::iced::{Alignment, Length, Rectangle};
 use cosmic::widget;
 use cosmic::{Element, Task};
 
 use super::{App, Client, Msg, Output, rules, thumbnail};
-use crate::backend::{CaptureImage, Cmd, Handle};
+use crate::backend::{Cmd, Handle};
 use crate::model::config::{Config, Edge};
 
 /// Gap between the strip edge and thumbnails, and between thumbnails.
@@ -31,6 +36,9 @@ pub struct DockSurface {
     /// Last thickness sent via `set_size` (or the creation size), so a
     /// resize to the same thickness can be skipped.
     pub last_thickness: u32,
+    /// Last input region sent via `set_input_zone` (or the creation zone),
+    /// so a redundant region update can be skipped.
+    pub last_zone: Vec<Rectangle>,
 }
 
 #[derive(Clone, Debug)]
@@ -41,15 +49,63 @@ pub enum DockMsg {
     Exit(Handle),
 }
 
-/// Strip thickness (the dimension perpendicular to the edge): the thumbnail
-/// height (incl. border) for the given image aspect — zoomed if any
-/// thumbnail on the strip is hovered — plus padding on both sides.
+/// Strip thickness (the dimension perpendicular to the edge) for the
+/// clients on it: the largest thumbnail extent along that axis as `view`
+/// will lay it out — each client at its own aspect, zoomed only if *it* is
+/// hovered — plus padding on both sides. For a top/bottom strip that is the
+/// tallest thumbnail's height; for a left/right strip the widest one's
+/// width. A client without a frame yet is laid out at the 16:9 default, as
+/// is an empty strip.
+pub fn thickness_for_strip<'a>(config: &Config, edge: Edge, clients: impl Iterator<Item = &'a Client>) -> u32 {
+    let horizontal = is_horizontal(edge);
+    let perp = |(w, h): (u32, u32)| if horizontal { h } else { w };
+    let max = clients
+        .map(|c| perp(thumbnail::zoomed_size(config, c.image.as_ref(), c.hovered)))
+        .max()
+        .unwrap_or_else(|| perp(thumbnail::zoomed_size(config, None, false)));
+    max + 2 * DOCK_PADDING
+}
+
+/// Where each of `clients`' thumbnails sits in the strip, in strip-local
+/// logical pixels, exactly as `view` lays them out: `DOCK_PADDING` from the
+/// strip's start corner, `DOCK_PADDING` between items, each at its own
+/// (zoomed if hovered) size. Along the perpendicular axis items sit against
+/// the docked edge — top/left for Top/Left, far side for Bottom/Right — so
+/// a hovered thumbnail grows away from the edge.
 ///
-/// Callers pass `None` for the image so the strip uses the 16:9 default
-/// aspect: one thickness per strip regardless of individual client aspects.
-pub fn thickness(config: &Config, any_hovered: bool, image: Option<&CaptureImage>) -> u32 {
-    let (_, h) = thumbnail::zoomed_size(config, image, any_hovered);
-    h + 2 * DOCK_PADDING
+/// Independent of the output size: the strip content is laid out from its
+/// start corner, not centred, so these rects can be sent as the surface's
+/// input region before (and regardless of) any configure.
+pub fn item_rects(config: &Config, edge: Edge, clients: &[&Client]) -> Vec<Rectangle> {
+    let pad = DOCK_PADDING as f32;
+    let horizontal = is_horizontal(edge);
+    let sizes: Vec<(f32, f32)> = clients
+        .iter()
+        .map(|c| {
+            let (w, h) = thumbnail::zoomed_size(config, c.image.as_ref(), c.hovered);
+            (w as f32, h as f32)
+        })
+        .collect();
+    // Content extent along the perpendicular axis: the largest item.
+    let max_perp = sizes.iter().map(|&(w, h)| if horizontal { h } else { w }).fold(0.0_f32, f32::max);
+    let mut along = pad;
+    sizes
+        .into_iter()
+        .map(|(w, h)| {
+            let rect = if horizontal {
+                let y = if edge == Edge::Bottom { pad + max_perp - h } else { pad };
+                let r = Rectangle { x: along, y, width: w, height: h };
+                along += w + pad;
+                r
+            } else {
+                let x = if edge == Edge::Right { pad + max_perp - w } else { pad };
+                let r = Rectangle { x, y: along, width: w, height: h };
+                along += h + pad;
+                r
+            };
+            rect
+        })
+        .collect()
 }
 
 pub fn is_horizontal(edge: Edge) -> bool {
@@ -74,7 +130,13 @@ pub fn anchor_for(edge: Edge) -> Anchor {
     }
 }
 
-pub fn settings(id: SurfaceId, output: WlOutput, edge: Edge, thickness: u32) -> SctkLayerSurfaceSettings {
+pub fn settings(
+    id: SurfaceId,
+    output: WlOutput,
+    edge: Edge,
+    thickness: u32,
+    input_zone: Vec<Rectangle>,
+) -> SctkLayerSurfaceSettings {
     let anchor = anchor_for(edge);
     SctkLayerSurfaceSettings {
         id,
@@ -85,6 +147,9 @@ pub fn settings(id: SurfaceId, output: WlOutput, edge: Edge, thickness: u32) -> 
         namespace: "yutani-dock".into(),
         size: Some(size_for(edge, thickness)),
         exclusive_zone: 0,
+        // Only the thumbnails take input; the rest of the band is
+        // click-through (see `item_rects`).
+        input_zone: Some(input_zone),
         ..Default::default()
     }
 }
@@ -109,7 +174,9 @@ pub fn view<'a>(app: &'a App, output: &WlOutput) -> Element<'a, Msg> {
         })
         .collect();
     // Items sit against the docked edge, so a hovered (zoomed) thumbnail
-    // grows away from it.
+    // grows away from it. Along the edge the strip starts at the output's
+    // start corner (no centring): `item_rects` must be able to predict these
+    // positions without knowing the output size.
     let edge = app.config.dock_edge;
     let strip: Element<'a, Msg> = match edge {
         Edge::Top => widget::row::with_children(items).spacing(DOCK_PADDING as f32).align_y(Alignment::Start).into(),
@@ -117,7 +184,9 @@ pub fn view<'a>(app: &'a App, output: &WlOutput) -> Element<'a, Msg> {
         Edge::Left => widget::column::with_children(items).spacing(DOCK_PADDING as f32).align_x(Alignment::Start).into(),
         Edge::Right => widget::column::with_children(items).spacing(DOCK_PADDING as f32).align_x(Alignment::End).into(),
     };
-    widget::container(strip).padding(DOCK_PADDING as f32).center(Length::Fill).into()
+    // Shrink-sized root: iced places it at the surface origin, so the
+    // content is `DOCK_PADDING` from the top-left whatever the surface size.
+    widget::container(strip).padding(DOCK_PADDING as f32).into()
 }
 
 /// Dock mode lifecycle: strip creation/teardown/resize and the per-thumbnail
@@ -134,11 +203,18 @@ impl App {
         rules::dock_order(shown.iter().map(|(h, c)| (*h, c.info.login.label())))
     }
 
+    /// Dock mode: the clients shown on `output`, in strip order.
+    fn dock_clients_for(&self, output: &WlOutput) -> Vec<&Client> {
+        self.dock_order_for(output).iter().map(|h| &self.clients[h]).collect()
+    }
+
     pub(super) fn dock_thickness_for(&self, output: &WlOutput) -> u32 {
-        let any_hovered = self.dock_order_for(output).iter().any(|h| self.clients[h].hovered);
-        // `None` image: one 16:9-based thickness per strip, whatever the
-        // individual clients' aspects (see `dock::thickness`).
-        thickness(&self.config, any_hovered, None)
+        thickness_for_strip(&self.config, self.config.dock_edge, self.dock_clients_for(output).into_iter())
+    }
+
+    /// Input region for the strip on `output`: its thumbnails' rects.
+    pub(super) fn dock_zone_for(&self, output: &WlOutput) -> Vec<Rectangle> {
+        item_rects(&self.config, self.config.dock_edge, &self.dock_clients_for(output))
     }
 
     /// Dock mode: one strip per output that has a shown client; none for
@@ -152,10 +228,16 @@ impl App {
             if needed && !has {
                 let id = SurfaceId::unique();
                 let thickness = self.dock_thickness_for(&o.handle);
+                let zone = self.dock_zone_for(&o.handle);
                 let edge = self.config.dock_edge;
-                tracing::info!(?id, output = %o.name, ?edge, thickness, "dock: create strip");
-                self.docks.push(DockSurface { output: o.handle.clone(), id, last_thickness: thickness });
-                tasks.push(get_layer_surface(settings(id, o.handle.clone(), edge, thickness)));
+                tracing::info!(?id, output = %o.name, ?edge, thickness, input_rects = zone.len(), "dock: create strip");
+                self.docks.push(DockSurface {
+                    output: o.handle.clone(),
+                    id,
+                    last_thickness: thickness,
+                    last_zone: zone.clone(),
+                });
+                tasks.push(get_layer_surface(settings(id, o.handle.clone(), edge, thickness, zone)));
             } else if !needed && has {
                 tasks.push(self.destroy_dock_on(&o.handle));
             }
@@ -170,7 +252,33 @@ impl App {
         for output in stale {
             tasks.push(self.destroy_dock_on(&output));
         }
+        // Surviving strips: their client set, hover, or aspects may have
+        // changed, which moves thickness and/or the input region. Both are
+        // deduped against what was last sent.
+        let live: Vec<WlOutput> = self.docks.iter().map(|d| d.output.clone()).collect();
+        for output in live {
+            tasks.push(self.refresh_dock(&output));
+        }
         Task::batch(tasks)
+    }
+
+    /// Bring the strip on `output` (if any) up to date with its clients:
+    /// thickness and input region, each only if it actually changed.
+    pub(super) fn refresh_dock(&mut self, output: &WlOutput) -> Task<cosmic::Action<Msg>> {
+        Task::batch([self.resize_dock_if_needed(output), self.set_dock_zone_if_needed(output)])
+    }
+
+    /// Send the strip's current thumbnail rects as its input region, if
+    /// they differ from what was last sent.
+    pub(super) fn set_dock_zone_if_needed(&mut self, output: &WlOutput) -> Task<cosmic::Action<Msg>> {
+        let zone = self.dock_zone_for(output);
+        let Some(d) = self.docks.iter_mut().find(|d| d.output == *output) else { return Task::none() };
+        if d.last_zone == zone {
+            return Task::none();
+        }
+        tracing::info!(id = ?d.id, input_rects = zone.len(), "dock: set input zone");
+        d.last_zone = zone.clone();
+        set_input_zone(d.id, Some(zone))
     }
 
     pub(super) fn destroy_dock_on(&mut self, output: &WlOutput) -> Task<cosmic::Action<Msg>> {
@@ -232,12 +340,13 @@ impl App {
     }
 
     /// Dock hover: the thumbnail grows in place on the next redraw; the
-    /// strip is thickened to make room (and shrunk back on exit).
+    /// strip is thickened to make room (and shrunk back on exit) and its
+    /// input region follows the new rects.
     fn set_dock_hover(&mut self, h: &Handle, hovered: bool) -> Task<cosmic::Action<Msg>> {
         let Some(c) = self.clients.get_mut(h) else { return Task::none() };
         c.hovered = hovered;
         match self.output_for(&self.clients[h].info) {
-            Some(output) => self.resize_dock_if_needed(&output),
+            Some(output) => self.refresh_dock(&output),
             None => Task::none(),
         }
     }
@@ -246,13 +355,85 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::ClientInfo;
+    use crate::model::client::Login;
     use crate::model::config::Config;
+    use cosmic::iced::Point;
+
+    /// A client with no frame yet (16:9 default aspect), hovered or not.
+    fn client(hovered: bool) -> Client {
+        Client {
+            info: ClientInfo { login: Login::LoggingIn, activated: false, minimized: false, outputs: Vec::new() },
+            image: None,
+            surface: None,
+            position: (0, 0),
+            pinned: false,
+            last_cursor: Point::ORIGIN,
+            hovered,
+            unavailable: false,
+            placed: false,
+            last_size: None,
+            docked: true,
+            paused: false,
+        }
+    }
+
+    fn config() -> Config {
+        Config { thumb_width: 320, border_px: 2, zoom_factor: 1.5, ..Config::default() }
+    }
 
     #[test]
-    fn thickness_is_thumb_height_plus_padding_and_grows_when_hovered() {
-        let config = Config { thumb_width: 320, border_px: 2, zoom_factor: 1.5, ..Config::default() };
-        assert_eq!(thickness(&config, false, None), 184 + 16);
-        assert_eq!(thickness(&config, true, None), 274 + 16);
+    fn thickness_is_tallest_thumb_plus_padding_and_only_the_hovered_one_is_zoomed() {
+        let config = config();
+        // Empty strip: 16:9 default, unzoomed.
+        assert_eq!(thickness_for_strip(&config, Edge::Bottom, std::iter::empty()), 184 + 16);
+        let plain = [client(false), client(false)];
+        assert_eq!(thickness_for_strip(&config, Edge::Bottom, plain.iter()), 184 + 16);
+        // One hovered: its zoomed height wins.
+        let mixed = [client(false), client(true)];
+        assert_eq!(thickness_for_strip(&config, Edge::Top, mixed.iter()), 274 + 16);
+        // Column strips: thickness is along x, i.e. the widest item.
+        assert_eq!(thickness_for_strip(&config, Edge::Left, plain.iter()), 324 + 16);
+        assert_eq!(thickness_for_strip(&config, Edge::Right, mixed.iter()), 484 + 16);
+    }
+
+    #[test]
+    fn item_rects_run_from_the_start_corner_with_padding_and_spacing() {
+        let config = config();
+        let a = client(false);
+        let b = client(false);
+        let rects = item_rects(&config, Edge::Bottom, &[&a, &b]);
+        let (w, h) = thumbnail::zoomed_size(&config, None, false);
+        assert_eq!((w, h), (324, 184));
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0], Rectangle { x: 8.0, y: 8.0, width: 324.0, height: 184.0 });
+        assert_eq!(rects[1], Rectangle { x: 8.0 + 324.0 + 8.0, y: 8.0, width: 324.0, height: 184.0 });
+    }
+
+    #[test]
+    fn item_rects_use_the_zoomed_size_for_the_hovered_item_and_hug_the_docked_edge() {
+        let config = config();
+        let a = client(false);
+        let b = client(true);
+        let (zw, zh) = thumbnail::zoomed_size(&config, None, true);
+        assert_eq!((zw, zh), (484, 274));
+        // Bottom: items sit against the bottom of the content, so the short
+        // one is pushed down by the zoomed one's extra height.
+        let rects = item_rects(&config, Edge::Bottom, &[&a, &b]);
+        assert_eq!(rects[0], Rectangle { x: 8.0, y: 8.0 + (274.0 - 184.0), width: 324.0, height: 184.0 });
+        assert_eq!(rects[1], Rectangle { x: 8.0 + 324.0 + 8.0, y: 8.0, width: 484.0, height: 274.0 });
+        // Top: both at the top.
+        let rects = item_rects(&config, Edge::Top, &[&a, &b]);
+        assert_eq!(rects[0].y, 8.0);
+        assert_eq!(rects[1], Rectangle { x: 8.0 + 324.0 + 8.0, y: 8.0, width: 484.0, height: 274.0 });
+        // Right: a column, items against the right of the content.
+        let rects = item_rects(&config, Edge::Right, &[&a, &b]);
+        assert_eq!(rects[0], Rectangle { x: 8.0 + (484.0 - 324.0), y: 8.0, width: 324.0, height: 184.0 });
+        assert_eq!(rects[1], Rectangle { x: 8.0, y: 8.0 + 184.0 + 8.0, width: 484.0, height: 274.0 });
+        // Left: a column at x = padding.
+        let rects = item_rects(&config, Edge::Left, &[&a, &b]);
+        assert_eq!(rects[0], Rectangle { x: 8.0, y: 8.0, width: 324.0, height: 184.0 });
+        assert_eq!(rects[1].x, 8.0);
     }
 
     #[test]

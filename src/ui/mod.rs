@@ -77,9 +77,12 @@ pub struct Client {
     /// Last size sent via `set_size` (or the surface's creation size), so a
     /// resize to the same size can be skipped.
     pub last_size: Option<(u32, u32)>,
-    /// Dock mode: this client is currently in a dock strip. Together with
-    /// `surface` this is the "shown" state that pause/resume is keyed on.
+    /// Dock mode: this client is currently in a dock strip.
     pub docked: bool,
+    /// Backend capture is paused for this client (last command we sent).
+    /// Pause/resume is an edge on this, not on whether a surface exists, so
+    /// a client born hidden is paused too.
+    pub paused: bool,
 }
 
 pub struct App {
@@ -158,13 +161,26 @@ impl App {
         )
     }
 
+    /// Bring the backend's capture state for `h` in line with `show`: pause
+    /// when it should not be shown but is running, resume when it should be
+    /// but is paused. An edge on `Client::paused` (what we last told the
+    /// backend), so a client that is born hidden gets paused, and a client
+    /// that merely moves between floating and dock gets nothing.
+    fn sync_capture(&mut self, h: &Handle, show: bool) {
+        let Some(c) = self.clients.get(h) else { return };
+        if let Some(pause) = rules::capture_transition(show, c.paused) {
+            self.send(if pause { Cmd::PauseCapture(h.clone()) } else { Cmd::ResumeCapture(h.clone()) });
+            self.clients.get_mut(h).unwrap().paused = pause;
+        }
+    }
+
     /// Make what is on screen match `config.mode` and `should_show`.
     ///
     /// Floating: every shown client has its own surface. Dock: no per-client
     /// surfaces; every output with a shown client has a strip. Capture is
-    /// paused for a client when it stops being shown in either sense and
-    /// resumed when it starts; switching modes alone never pauses, since the
-    /// client stays shown — just somewhere else.
+    /// paused for a client when it should not be shown in either sense and
+    /// resumed when it should (see `sync_capture`); switching modes alone
+    /// never pauses, since the client stays shown — just somewhere else.
     fn reconcile_surfaces(&mut self) -> Task<cosmic::Action<Msg>> {
         let handles: Vec<Handle> = self.clients.keys().cloned().collect();
         let mut tasks = Vec::new();
@@ -174,7 +190,6 @@ impl App {
                 for h in handles {
                     let show = self.should_show(&self.clients[&h]);
                     let c = self.clients.get_mut(&h).unwrap();
-                    let was_shown = c.surface.is_some() || c.docked;
                     if c.docked {
                         // Leaving dock mode: this thumbnail's strip widget is
                         // gone and its `on_exit` never fires; don't let it
@@ -182,11 +197,7 @@ impl App {
                         c.hovered = false;
                     }
                     c.docked = false;
-                    if show && !was_shown {
-                        self.send(Cmd::ResumeCapture(h.clone()));
-                    } else if !show && was_shown {
-                        self.send(Cmd::PauseCapture(h.clone()));
-                    }
+                    self.sync_capture(&h, show);
                     if show && self.clients[&h].surface.is_none() {
                         tasks.push(self.create_surface(&h));
                     } else if !show && self.clients[&h].surface.is_some() {
@@ -198,23 +209,19 @@ impl App {
                 let docked: HashSet<Handle> =
                     self.outputs.iter().flat_map(|o| self.dock_order_for(&o.handle)).collect();
                 for h in handles {
-                    let was_shown = self.clients[&h].surface.is_some() || self.clients[&h].docked;
                     // Leaving floating mode: the per-client surface goes; the
-                    // client is still shown (in the strip), so no pause here.
+                    // client is still shown (in the strip), so `sync_capture`
+                    // sends nothing for it.
                     tasks.push(self.destroy_surface(&h));
-                    let now_shown = docked.contains(&h);
+                    let show = docked.contains(&h);
                     let c = self.clients.get_mut(&h).unwrap();
-                    c.docked = now_shown;
-                    if !now_shown {
+                    c.docked = show;
+                    if !show {
                         // A thumbnail that vanishes from the strip never gets
                         // its `on_exit`; don't let it come back zoomed.
                         c.hovered = false;
                     }
-                    if now_shown && !was_shown {
-                        self.send(Cmd::ResumeCapture(h.clone()));
-                    } else if !now_shown && was_shown {
-                        self.send(Cmd::PauseCapture(h.clone()));
-                    }
+                    self.sync_capture(&h, show);
                 }
                 tasks.push(self.reconcile_docks());
             }
@@ -559,6 +566,7 @@ impl App {
                     placed: false,
                     last_size: None,
                     docked: false,
+                    paused: false,
                 });
                 let was_named = matches!(entry.info.login, Login::LoggedIn(_));
                 entry.info = info;
@@ -590,9 +598,18 @@ impl App {
                 client.image = Some(image);
                 client.unavailable = false;
                 if self.config.mode == Mode::Dock {
-                    // No per-client surface; the strip redraws from `view`
-                    // and its thickness doesn't depend on the image.
-                    Task::none()
+                    // No per-client surface; the strip redraws from `view`,
+                    // but a first frame (or a new aspect) can change the
+                    // thumbnail's size and so the strip's thickness and
+                    // input region. Both are deduped against the last sent.
+                    if client.docked {
+                        match self.output_for(&self.clients[&handle].info) {
+                            Some(output) => self.refresh_dock(&output),
+                            None => Task::none(),
+                        }
+                    } else {
+                        Task::none()
+                    }
                 } else if client.surface.is_some() {
                     // `resize_if_needed` skips a drag canvas and dedupes
                     // against the last size actually sent.
@@ -654,10 +671,8 @@ impl App {
             // then) and dedupes against the last size actually sent.
             tasks.push(self.resize_if_needed(&h));
         }
-        let outputs: Vec<WlOutput> = self.docks.iter().map(|d| d.output.clone()).collect();
-        for o in outputs {
-            tasks.push(self.resize_dock_if_needed(&o));
-        }
+        // Dock strips: `reconcile_surfaces` → `reconcile_docks` already
+        // refreshed every surviving strip's thickness and input region.
         Task::batch(tasks)
     }
 }
@@ -744,6 +759,14 @@ impl Application for App {
             Msg::Tray(tray::TrayEvent::ToggleVisibility) => {
                 self.hidden = !self.hidden;
                 self.reconcile_surfaces()
+            }
+            Msg::Tray(tray::TrayEvent::SetHidden(h)) => {
+                if self.hidden != h {
+                    self.hidden = h;
+                    self.reconcile_surfaces()
+                } else {
+                    Task::none()
+                }
             }
             Msg::Tray(tray::TrayEvent::Quit) => cosmic::iced::exit(),
             Msg::Dock(msg) => self.on_dock(msg),

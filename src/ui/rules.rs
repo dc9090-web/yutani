@@ -39,6 +39,14 @@ pub fn choose_position(
     (next, false)
 }
 
+/// Which capture command (if any) brings the backend in line with `show`:
+/// `Some(true)` = pause, `Some(false)` = resume, `None` = already there.
+/// Keyed on the backend's actual paused state, not on whether a surface
+/// happened to exist, so a client born hidden gets paused too.
+pub fn capture_transition(show: bool, paused: bool) -> Option<bool /* pause? */> {
+    if show == paused { Some(!show) } else { None }
+}
+
 /// Dock order: by label, case-insensitive, stable for equal labels.
 pub fn dock_order<'a>(labels: impl Iterator<Item = (&'a Handle, &'a str)>) -> Vec<Handle> {
     let mut v: Vec<(&Handle, String)> = labels.map(|(h, l)| (h, l.to_lowercase())).collect();
@@ -64,6 +72,14 @@ mod tests {
         assert!(!should_show(Visibility::EveFocusedOnly, false, false, false, false));
         assert!(should_show(Visibility::EveFocusedOnly, false, false, true, false));
         assert!(!should_show(Visibility::EveFocusedOnly, true, false, true, true));
+    }
+
+    #[test]
+    fn capture_transition_is_an_edge_on_actual_paused_state() {
+        assert_eq!(capture_transition(true, true), Some(false)); // shown but paused: resume
+        assert_eq!(capture_transition(false, false), Some(true)); // hidden but running: pause
+        assert_eq!(capture_transition(true, false), None); // shown and running
+        assert_eq!(capture_transition(false, true), None); // hidden and paused
     }
 
     #[test]
