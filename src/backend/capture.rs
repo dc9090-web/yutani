@@ -178,12 +178,18 @@ impl ScreencopyHandler for AppData {
         drop(guard);
 
         let buffers = self.allocate(formats);
+        let unavailable = buffers.is_none();
 
         let mut guard = capture.session.lock().unwrap();
         let Some(state) = guard.as_mut() else { return };
         state.buffers = buffers;
         state.release = None;
         state.submit(&capture, conn, qh);
+        drop(guard);
+
+        if unavailable {
+            self.send_event(Event::CaptureUnavailable(capture.handle.clone()));
+        }
     }
 
     fn ready(&mut self, conn: &Connection, qh: &QueueHandle<Self>, capture_frame: &CaptureFrame, frame: Frame) {
@@ -263,11 +269,17 @@ impl ScreencopyHandler for AppData {
                 let formats = capture.session.lock().unwrap().as_ref().and_then(|s| s.formats.clone());
                 let Some(formats) = formats else { return };
                 let buffers = self.allocate(&formats);
+                let unavailable = buffers.is_none();
                 let mut guard = capture.session.lock().unwrap();
                 if let Some(state) = guard.as_mut() {
                     state.buffers = buffers;
                     state.release = None;
                     state.submit(&capture, conn, qh);
+                }
+                drop(guard);
+
+                if unavailable {
+                    self.send_event(Event::CaptureUnavailable(capture.handle.clone()));
                 }
             }
             WEnum::Value(FailureReason::Stopped) => {
@@ -287,6 +299,7 @@ impl ScreencopyHandler for AppData {
                         "capture failed {n} times in a row ({other:?}); giving up until the client changes state"
                     );
                     capture.stop();
+                    self.send_event(Event::CaptureUnavailable(capture.handle.clone()));
                     return;
                 }
 

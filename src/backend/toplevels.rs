@@ -103,6 +103,7 @@ impl ToplevelManagerHandler for AppData {
             })
             .collect();
         tracing::info!(?caps, "toplevel manager capabilities");
+        self.capabilities = caps;
     }
 }
 

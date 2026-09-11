@@ -31,8 +31,10 @@ use cosmic::iced::{
     self,
     futures::{FutureExt, SinkExt, channel::mpsc, executor::block_on},
 };
+use cosmic::cctk::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1;
 use calloop_wayland_source::WaylandSource;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::{hash::Hash, thread};
@@ -71,6 +73,9 @@ pub enum Event {
     ClientUpdated(Handle, ClientInfo),
     ClientRemoved(Handle),
     Frame(Handle, CaptureImage),
+    /// Capture for this client could not be (re)started; the UI should grey it out
+    /// until the next `Frame`.
+    CaptureUnavailable(Handle),
 }
 
 #[derive(Debug)]
@@ -126,6 +131,7 @@ pub struct AppData {
     pub sender: mpsc::Sender<Event>,
     pub app_ids: Vec<String>,
     pub fps: Arc<AtomicU32>,
+    pub capabilities: HashSet<zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1>,
 }
 
 impl AppData {
@@ -164,6 +170,11 @@ impl AppData {
                 }
             }
             Cmd::Minimize(handle) => {
+                use zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1 as Cap;
+                if !self.capabilities.contains(&Cap::Minimize) {
+                    tracing::warn!("compositor does not advertise the Minimize capability; ignoring");
+                    return;
+                }
                 let Some(cosmic) = self.cosmic_handle(&handle) else { return };
                 let Some(manager) = &self.toplevel_manager_state else { return };
                 manager.manager.set_minimized(&cosmic);
@@ -234,6 +245,7 @@ fn start(conn: Connection, app_ids: Vec<String>, fps: u32) -> mpsc::Receiver<Eve
                     sender,
                     app_ids,
                     fps: Arc::new(AtomicU32::new(fps)),
+                    capabilities: HashSet::new(),
                 };
 
                 let (cmd_sender, cmd_channel) = calloop::channel::channel();

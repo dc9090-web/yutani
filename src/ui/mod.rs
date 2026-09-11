@@ -195,6 +195,12 @@ impl App {
                     None => self.create_surface(&handle),
                 }
             }
+            Event::CaptureUnavailable(handle) => {
+                if let Some(c) = self.clients.get(&handle) {
+                    tracing::warn!(label = c.info.login.label(), "capture unavailable");
+                }
+                Task::none()
+            }
         }
     }
 }
