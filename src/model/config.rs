@@ -142,6 +142,7 @@ impl Config {
         check!(fps, |v: &u32| [10, 15, 30, 60].contains(v), "10|15|30|60");
         check!(zoom_factor, |v: &f32| (1.0..=4.0).contains(v), "1.0..=4.0");
         check!(border_px, |v: &u32| *v <= 16, "0..=16");
+        check!(corner_radius, |v: &u32| *v <= 64, "0..=64");
         check!(active_border, |v: &String| parse_color(v).is_some(), "#rrggbb[aa]");
         check!(inactive_border, |v: &String| parse_color(v).is_some(), "#rrggbb[aa]");
         if self.app_ids.is_empty() {

@@ -88,6 +88,11 @@ impl App {
         }
         let mut tasks = Vec::new();
         for output in self.outputs.clone() {
+            // An output whose logical size is not known yet would centre
+            // everything at negative coordinates; wait for its InfoUpdate.
+            if output.logical_size.0 <= 0 || output.logical_size.1 <= 0 {
+                continue;
+            }
             for (h, pos) in self.dock_positions_for(&output) {
                 let c = self.clients.get_mut(&h).unwrap();
                 if c.position == pos {
