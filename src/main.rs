@@ -1,5 +1,7 @@
+mod backend;
 mod doctor;
 mod model;
+mod ui;
 
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
@@ -30,8 +32,10 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Some(Command::Doctor) => doctor::run(),
         None => {
-            eprintln!("yutani: the app is not built yet; try `yutani doctor`");
-            Ok(ExitCode::from(1))
+            let config = model::config::Config::load();
+            ui::run(config)
+                .map(|()| ExitCode::SUCCESS)
+                .map_err(anyhow::Error::from)
         }
     };
     match result {

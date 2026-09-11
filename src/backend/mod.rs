@@ -1,0 +1,230 @@
+//! Compositor thread: a second event queue on iced's Wayland connection,
+//! driven by calloop. Tracks toplevels, activates them, and (Task 5)
+//! captures them. Modelled on cosmic-workspaces' backend.
+
+use cosmic::cctk::{
+    self,
+    sctk::{
+        registry::{ProvidesRegistryState, RegistryState},
+        seat::{SeatHandler, SeatState},
+    },
+    toplevel_info::{ToplevelInfo, ToplevelInfoState},
+    toplevel_management::ToplevelManagerState,
+    wayland_client::{
+        Connection, QueueHandle,
+        globals::registry_queue_init,
+        protocol::{wl_output::WlOutput, wl_seat},
+    },
+    wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
+};
+use cosmic::cctk::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::State;
+use cosmic::iced::{
+    self,
+    futures::{FutureExt, SinkExt, channel::mpsc, executor::block_on},
+};
+use calloop_wayland_source::WaylandSource;
+use std::{hash::Hash, thread};
+
+use crate::model::client::{Login, classify};
+
+mod toplevels;
+
+pub type Handle = ExtForeignToplevelHandleV1;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClientInfo {
+    pub login: Login,
+    pub activated: bool,
+    pub minimized: bool,
+    pub outputs: Vec<WlOutput>,
+}
+
+#[derive(Clone, Debug)]
+pub enum Event {
+    /// Sent once at startup so the UI can send commands.
+    CmdSender(calloop::channel::Sender<Cmd>),
+    ClientAdded(Handle, ClientInfo),
+    ClientUpdated(Handle, ClientInfo),
+    ClientRemoved(Handle),
+}
+
+#[derive(Debug)]
+pub enum Cmd {
+    Activate(Handle),
+    Minimize(Handle),
+    SetAppIds(Vec<String>),
+    SetFps(u32),
+}
+
+/// iced subscription that owns the backend thread for the app's lifetime.
+pub fn subscription(conn: Connection, app_ids: Vec<String>, fps: u32) -> iced::Subscription<Event> {
+    #[derive(Clone)]
+    struct Key {
+        conn: Connection,
+        app_ids: Vec<String>,
+        fps: u32,
+    }
+    impl Hash for Key {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.conn.backend().display_id().hash(state);
+        }
+    }
+    // `Subscription::run_with` (this pinned iced) takes a bare `fn(&D) -> S`,
+    // so the per-call `app_ids`/`fps` must travel inside the hashable `Key`
+    // rather than being captured by a closure. Boxing the stream sidesteps
+    // an HRTB mismatch between the `impl Trait` return type and the fn
+    // pointer `run_with` expects.
+    fn run(key: &Key) -> iced::futures::stream::BoxStream<'static, Event> {
+        let conn = key.conn.clone();
+        let app_ids = key.app_ids.clone();
+        let fps = key.fps;
+        Box::pin(async move { start(conn, app_ids, fps) }.flatten_stream())
+    }
+    iced::Subscription::run_with(Key { conn, app_ids, fps }, run)
+}
+
+pub struct AppData {
+    pub qh: QueueHandle<Self>,
+    pub registry_state: RegistryState,
+    pub seat_state: SeatState,
+    pub toplevel_info_state: ToplevelInfoState,
+    pub toplevel_manager_state: Option<ToplevelManagerState>,
+    pub sender: mpsc::Sender<Event>,
+    pub app_ids: Vec<String>,
+    pub fps: u32,
+}
+
+impl AppData {
+    pub fn send_event(&mut self, event: Event) {
+        let _ = block_on(self.sender.send(event));
+    }
+
+    /// `None` when the toplevel is not an EVE client.
+    pub fn client_info(&self, info: &ToplevelInfo) -> Option<ClientInfo> {
+        let login = classify(&self.app_ids, &info.app_id, &info.title)?;
+        Some(ClientInfo {
+            login,
+            activated: info.state.contains(&State::Activated),
+            minimized: info.state.contains(&State::Minimized),
+            outputs: info.output.iter().cloned().collect(),
+        })
+    }
+
+    fn cosmic_handle(
+        &self,
+        handle: &Handle,
+    ) -> Option<cctk::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1>
+    {
+        self.toplevel_info_state
+            .info(handle)
+            .and_then(|info| info.cosmic_toplevel.clone())
+    }
+
+    pub fn handle_cmd(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Activate(handle) => {
+                let Some(cosmic) = self.cosmic_handle(&handle) else { return };
+                let Some(manager) = &self.toplevel_manager_state else { return };
+                for seat in self.seat_state.seats() {
+                    manager.manager.activate(&cosmic, &seat);
+                }
+            }
+            Cmd::Minimize(handle) => {
+                let Some(cosmic) = self.cosmic_handle(&handle) else { return };
+                let Some(manager) = &self.toplevel_manager_state else { return };
+                manager.manager.set_minimized(&cosmic);
+            }
+            Cmd::SetAppIds(app_ids) => {
+                self.app_ids = app_ids;
+                self.reclassify_all();
+            }
+            Cmd::SetFps(fps) => {
+                self.fps = fps;
+            }
+        }
+    }
+}
+
+fn start(conn: Connection, app_ids: Vec<String>, fps: u32) -> mpsc::Receiver<Event> {
+    let (sender, receiver) = mpsc::channel(64);
+
+    let (globals, event_queue) = registry_queue_init(&conn).expect("wayland registry");
+    let qh = event_queue.handle();
+
+    thread::Builder::new()
+        .name("yutani-backend".into())
+        .spawn(move || {
+            let registry_state = RegistryState::new(&globals);
+            let mut app_data = AppData {
+                qh: qh.clone(),
+                seat_state: SeatState::new(&globals, &qh),
+                toplevel_info_state: ToplevelInfoState::new(&registry_state, &qh),
+                toplevel_manager_state: ToplevelManagerState::try_new(&registry_state, &qh),
+                registry_state,
+                sender,
+                app_ids,
+                fps,
+            };
+
+            let (cmd_sender, cmd_channel) = calloop::channel::channel();
+            app_data.send_event(Event::CmdSender(cmd_sender));
+
+            let mut event_loop = calloop::EventLoop::try_new().expect("calloop");
+            WaylandSource::new(conn, event_queue)
+                .insert(event_loop.handle())
+                .expect("wayland source");
+            event_loop
+                .handle()
+                .insert_source(cmd_channel, |event, _, app_data: &mut AppData| {
+                    if let calloop::channel::Event::Msg(cmd) = event {
+                        app_data.handle_cmd(cmd);
+                    }
+                })
+                .expect("cmd channel");
+
+            loop {
+                if let Err(err) = event_loop.dispatch(None, &mut app_data) {
+                    tracing::error!("backend event loop failed: {err}");
+                    std::process::exit(1);
+                }
+            }
+        })
+        .expect("spawn backend thread");
+
+    receiver
+}
+
+impl ProvidesRegistryState for AppData {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+    // Deliberately no OutputState: all wl_output handles are iced's.
+    cctk::sctk::registry_handlers!(SeatState);
+}
+
+impl SeatHandler for AppData {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn new_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        _: cctk::sctk::seat::Capability,
+    ) {
+    }
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        _: cctk::sctk::seat::Capability,
+    ) {
+    }
+}
+
+cctk::sctk::delegate_registry!(AppData);
+cctk::sctk::delegate_seat!(AppData);
