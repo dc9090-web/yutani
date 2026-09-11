@@ -28,7 +28,7 @@ pub fn next_free_x(taken: &[i32], origin: i32, pitch: i32) -> i32 {
     (0..).map(|slot| origin + slot * pitch).find(|x| !taken.contains(x)).unwrap()
 }
 
-pub fn view<'a>(client: &'a Client, config: &Config, on_press: Msg) -> Element<'a, Msg> {
+pub fn view<'a>(client: &'a Client, config: &Config) -> Element<'a, Msg> {
     let border_hex = if client.info.activated { &config.active_border } else { &config.inactive_border };
     let [r, g, b, a] = parse_color(border_hex).unwrap_or([1.0, 0.5, 0.0, 1.0]);
     let border_color = cosmic::iced::Color { r, g, b, a };
@@ -64,6 +64,15 @@ pub fn view<'a>(client: &'a Client, config: &Config, on_press: Msg) -> Element<'
                 .into(),
         );
     }
+    if client.pinned {
+        layers.push(
+            widget::container(widget::text("📌").size(14))
+                .align_top(Length::Fill)
+                .align_right(Length::Fill)
+                .padding(4)
+                .into(),
+        );
+    }
 
     let stack = cosmic::iced::widget::stack(layers).width(Length::Fill).height(Length::Fill);
 
@@ -75,7 +84,7 @@ pub fn view<'a>(client: &'a Client, config: &Config, on_press: Msg) -> Element<'
             ..Default::default()
         }));
 
-    widget::mouse_area(framed).on_press(on_press).into()
+    framed.into()
 }
 
 #[cfg(test)]

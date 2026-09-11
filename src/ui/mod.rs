@@ -4,20 +4,24 @@
 use cosmic::cctk::sctk::shell::wlr_layer::{Anchor, KeyboardInteractivity, Layer};
 use cosmic::cctk::wayland_client::{Connection, Proxy, protocol::wl_output::WlOutput};
 use cosmic::iced::event::wayland::{Event as WaylandEvent, OutputEvent};
+use cosmic::iced::mouse;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
-    destroy_layer_surface, get_layer_surface, set_size,
+    destroy_layer_surface, get_layer_surface, set_margin, set_size,
 };
 use cosmic::iced::runtime::platform_specific::wayland::layer_surface::{
     IcedMargin, IcedOutput, SctkLayerSurfaceSettings,
 };
 use cosmic::iced::window::Id as SurfaceId;
-use cosmic::iced::{self, Subscription};
+use cosmic::iced::{self, Point, Subscription};
 use cosmic::{Application, Element, Task};
 use std::collections::HashMap;
 
 use crate::backend::{self, CaptureImage, ClientInfo, Cmd, Event, Handle};
+use crate::model::client::Login;
 use crate::model::config::Config;
+use crate::model::layout::{self, Layout, Rect, ThumbPos};
 
+pub mod pointer;
 pub mod thumbnail;
 
 /// `Config` carries no CLI-parsed subcommand/args; only its file contents
@@ -50,6 +54,10 @@ pub struct Client {
     pub surface: Option<SurfaceId>,
     /// Top-left position on its output, logical pixels.
     pub position: (i32, i32),
+    pub pinned: bool,
+    /// Last surface-local cursor position we saw for this client, since
+    /// `ButtonPressed` does not carry one.
+    pub last_cursor: Point,
 }
 
 pub struct App {
@@ -59,6 +67,8 @@ pub struct App {
     pub cmd: Option<calloop::channel::Sender<Cmd>>,
     pub clients: HashMap<Handle, Client>,
     pub outputs: Vec<Output>,
+    pub layout: Layout,
+    pub drag: Option<pointer::DragState>,
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +76,8 @@ pub enum Msg {
     Wayland(WaylandEvent),
     Backend(Event),
     Activate(Handle),
+    Pointer(SurfaceId, mouse::Event),
+    Minimize(Handle),
 }
 
 impl App {
@@ -135,12 +147,19 @@ impl App {
             tracing::debug!("no outputs yet; deferring surface");
             return Task::none();
         };
-        let position = self.next_position();
+        // Prefer a saved position for this character over the next free slot.
+        let saved = match &client.info.login {
+            Login::LoggedIn(name) => self.layout.thumbs.get(name).cloned(),
+            Login::LoggingIn => None,
+        };
+        let position = saved.as_ref().map(|s| (s.x, s.y)).unwrap_or_else(|| self.next_position());
+        let pinned = saved.as_ref().map(|s| s.pinned).unwrap_or(false);
         let (width, height) = thumbnail::size(&self.config, client.image.as_ref());
         let id = SurfaceId::unique();
         let client = self.clients.get_mut(handle).unwrap();
         client.surface = Some(id);
         client.position = position;
+        client.pinned = pinned;
         tracing::info!(?id, x = position.0, y = position.1, width, height, "create_surface");
         get_layer_surface(SctkLayerSurfaceSettings {
             id,
@@ -163,6 +182,115 @@ impl App {
         }
     }
 
+    fn client_for_surface(&self, id: SurfaceId) -> Option<Handle> {
+        self.clients.iter().find(|(_, c)| c.surface == Some(id)).map(|(h, _)| h.clone())
+    }
+
+    fn rect_of(&self, client: &Client) -> Rect {
+        let (w, h) = thumbnail::size(&self.config, client.image.as_ref());
+        Rect { x: client.position.0, y: client.position.1, w: w as i32, h: h as i32 }
+    }
+
+    fn output_name_of(&self, client: &Client) -> Option<String> {
+        self.output_for(&client.info)
+            .and_then(|o| self.outputs.iter().find(|k| k.handle == o).map(|k| k.name.clone()))
+    }
+
+    /// Remember this client's position (and pin state) under its character name.
+    fn persist_position(&mut self, handle: &Handle) {
+        let Some(client) = self.clients.get(handle) else { return };
+        let Login::LoggedIn(name) = &client.info.login else { return };
+        let Some(output) = self.output_name_of(client) else { return };
+        self.layout.thumbs.insert(
+            name.clone(),
+            ThumbPos { output, x: client.position.0, y: client.position.1, pinned: client.pinned },
+        );
+        if let Err(e) = self.layout.save() {
+            tracing::warn!("cannot save layout: {e}");
+        }
+    }
+
+    /// If we have a saved position for this character, move there.
+    fn apply_saved_position(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {
+        let Some(client) = self.clients.get(handle) else { return Task::none() };
+        let Login::LoggedIn(name) = &client.info.login else { return Task::none() };
+        let Some(saved) = self.layout.thumbs.get(name).cloned() else { return Task::none() };
+        let client = self.clients.get_mut(handle).unwrap();
+        client.position = (saved.x, saved.y);
+        client.pinned = saved.pinned;
+        match client.surface {
+            Some(id) => set_margin(id, saved.y, 0, 0, saved.x),
+            None => Task::none(),
+        }
+    }
+
+    fn on_pointer(&mut self, id: SurfaceId, event: mouse::Event) -> Task<cosmic::Action<Msg>> {
+        let Some(handle) = self.client_for_surface(id) else { return Task::none() };
+        match event {
+            mouse::Event::ButtonPressed(mouse::Button::Middle) => {
+                if let Some(c) = self.clients.get_mut(&handle) {
+                    c.pinned = !c.pinned;
+                }
+                self.persist_position(&handle);
+                Task::none()
+            }
+            mouse::Event::ButtonPressed(button) => {
+                let c = &self.clients[&handle];
+                // Position of the cursor at press time is not part of ButtonPressed;
+                // use the last CursorMoved we saw for this surface.
+                let cursor = c.last_cursor;
+                self.drag = pointer::on_press(id, button, cursor, c.position, c.pinned);
+                Task::none()
+            }
+            mouse::Event::CursorMoved { position } => {
+                if let Some(c) = self.clients.get_mut(&handle) {
+                    c.last_cursor = position;
+                }
+                let Some(drag) = self.drag.as_mut().filter(|d| d.surface == id) else { return Task::none() };
+                let current = self.clients[&handle].position;
+                match pointer::on_move(drag, position, current) {
+                    pointer::Outcome::Move(raw) => {
+                        let me = self.rect_of(&self.clients[&handle]);
+                        let others: Vec<Rect> = self
+                            .clients
+                            .iter()
+                            .filter(|(h, c)| *h != &handle && c.surface.is_some())
+                            .map(|(_, c)| self.rect_of(c))
+                            .collect();
+                        let grid = self.config.snap_grid.then_some(32);
+                        let edges = self.config.snap_edges.then_some(12);
+                        let (x, y) = layout::snap(Rect { x: raw.0, y: raw.1, ..me }, &others, grid, edges);
+                        let (x, y) = (x.max(0), y.max(0));
+                        self.clients.get_mut(&handle).unwrap().position = (x, y);
+                        set_margin(id, y, 0, 0, x)
+                    }
+                    _ => Task::none(),
+                }
+            }
+            mouse::Event::ButtonReleased(button) => {
+                let Some(drag) = self.drag.take().filter(|d| d.surface == id && d.button == button) else {
+                    return Task::none();
+                };
+                match pointer::on_release(drag) {
+                    pointer::Outcome::Click(mouse::Button::Left) => {
+                        self.send(Cmd::Activate(handle));
+                    }
+                    pointer::Outcome::Click(mouse::Button::Right) => {
+                        self.send(Cmd::Minimize(handle));
+                    }
+                    pointer::Outcome::DragEnd => self.persist_position(&handle),
+                    _ => {}
+                }
+                Task::none()
+            }
+            mouse::Event::CursorLeft => {
+                // Releasing outside is delivered to us anyway (implicit grab); nothing to do.
+                Task::none()
+            }
+            _ => Task::none(),
+        }
+    }
+
     fn on_backend(&mut self, event: Event) -> Task<cosmic::Action<Msg>> {
         match event {
             Event::CmdSender(sender) => {
@@ -175,9 +303,18 @@ impl App {
                     image: None,
                     surface: None,
                     position: (0, 0),
+                    pinned: false,
+                    last_cursor: Point::ORIGIN,
                 });
+                let was_named = matches!(entry.info.login, Login::LoggedIn(_));
                 entry.info = info;
-                self.create_surface(&handle)
+                let became_named = !was_named && matches!(entry.info.login, Login::LoggedIn(_));
+                let create = self.create_surface(&handle);
+                if became_named {
+                    Task::batch([create, self.apply_saved_position(&handle)])
+                } else {
+                    create
+                }
             }
             Event::ClientRemoved(handle) => {
                 let task = self.destroy_surface(&handle);
@@ -227,6 +364,8 @@ impl Application for App {
             cmd: None,
             clients: HashMap::new(),
             outputs: Vec::new(),
+            layout: Layout::load(),
+            drag: None,
         };
         (app, Task::none())
     }
@@ -253,19 +392,25 @@ impl Application for App {
                 self.send(Cmd::Activate(handle));
                 Task::none()
             }
+            Msg::Pointer(id, event) => self.on_pointer(id, event),
+            Msg::Minimize(handle) => {
+                self.send(Cmd::Minimize(handle));
+                Task::none()
+            }
         }
     }
 
     fn subscription(&self) -> Subscription<Msg> {
-        let wayland = iced::event::listen_with(|event, _, _| match event {
+        let events = iced::event::listen_with(|event, _status, id| match event {
             iced::Event::PlatformSpecific(iced::event::PlatformSpecific::Wayland(
                 event @ WaylandEvent::Output(..),
             )) => Some(Msg::Wayland(event)),
-            // Every other Wayland event (RequestResize, Frame, …) would trigger
-            // update → redraw → the same event again: a hot loop.
+            iced::Event::Mouse(m) => Some(Msg::Pointer(id, m)),
+            // Every other event (RequestResize, Frame, keyboard, …) must not become
+            // a message: update → redraw → same event again is a hot loop.
             _ => None,
         });
-        let mut subs = vec![wayland];
+        let mut subs = vec![events];
         if let Some(conn) = self.conn.clone() {
             subs.push(
                 backend::subscription(conn, self.config.app_ids.clone(), self.config.fps)
@@ -281,7 +426,7 @@ impl Application for App {
 
     fn view_window(&self, id: SurfaceId) -> Element<'_, Msg> {
         match self.clients.iter().find(|(_, c)| c.surface == Some(id)) {
-            Some((handle, client)) => thumbnail::view(client, &self.config, Msg::Activate(handle.clone())),
+            Some((_, client)) => thumbnail::view(client, &self.config),
             None => cosmic::widget::text("").into(),
         }
     }
