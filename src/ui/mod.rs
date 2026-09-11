@@ -1,5 +1,5 @@
 //! libcosmic application: no main window; one overlay layer surface per
-//! EVE client (Task 6). This task only wires events and logs them.
+//! EVE client, each showing that client's live captured frame.
 
 use cosmic::cctk::sctk::shell::wlr_layer::{Anchor, KeyboardInteractivity, Layer};
 use cosmic::cctk::wayland_client::{Connection, Proxy, protocol::wl_output::WlOutput};
@@ -113,11 +113,17 @@ impl App {
             .or_else(|| self.outputs.first().map(|o| o.handle.clone()))
     }
 
-    /// Next free slot: a row along the top, left to right.
+    /// Next free slot: a row along the top, left to right, filling any gap
+    /// left by a removed client rather than always appending.
     fn next_position(&self) -> (i32, i32) {
         let (w, _) = thumbnail::size(&self.config, None);
-        let used = self.clients.values().filter(|c| c.surface.is_some()).count() as i32;
-        (40 + used * (w as i32 + 16), 40)
+        let taken: Vec<i32> = self
+            .clients
+            .values()
+            .filter(|c| c.surface.is_some())
+            .map(|c| c.position.0)
+            .collect();
+        (thumbnail::next_free_x(&taken, 40, w as i32 + 16), 40)
     }
 
     fn create_surface(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {
@@ -246,9 +252,11 @@ impl Application for App {
 
     fn subscription(&self) -> Subscription<Msg> {
         let wayland = iced::event::listen_with(|event, _, _| match event {
-            iced::Event::PlatformSpecific(iced::event::PlatformSpecific::Wayland(event)) => {
-                Some(Msg::Wayland(event))
-            }
+            iced::Event::PlatformSpecific(iced::event::PlatformSpecific::Wayland(
+                event @ WaylandEvent::Output(..),
+            )) => Some(Msg::Wayland(event)),
+            // Every other Wayland event (RequestResize, Frame, …) would trigger
+            // update → redraw → the same event again: a hot loop.
             _ => None,
         });
         let mut subs = vec![wayland];

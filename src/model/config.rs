@@ -6,7 +6,11 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Wayland app_ids that are EVE clients.
+    /// Wayland app_ids that are EVE clients. Defaults to the app_id observed
+    /// for the EVE client under Steam + GE-Proton with
+    /// `PROTON_ENABLE_WAYLAND=1` (`exefile.exe`) plus the Steam launcher's
+    /// app_id (`steam_app_8500`), seen only transiently before the client
+    /// takes over.
     pub app_ids: Vec<String>,
     /// Thumbnail width in logical pixels; height follows the window's aspect.
     pub thumb_width: u32,
@@ -24,7 +28,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            app_ids: vec!["steam_app_8500".to_string()],
+            app_ids: vec!["exefile.exe".to_string(), "steam_app_8500".to_string()],
             thumb_width: 320,
             opacity: 0.9,
             fps: 30,
@@ -106,7 +110,7 @@ mod tests {
     #[test]
     fn defaults_match_spec() {
         let c = Config::default();
-        assert_eq!(c.app_ids, vec!["steam_app_8500".to_string()]);
+        assert_eq!(c.app_ids, vec!["exefile.exe".to_string(), "steam_app_8500".to_string()]);
         assert_eq!(c.thumb_width, 320);
         assert_eq!(c.opacity, 0.9);
         assert_eq!(c.fps, 30);

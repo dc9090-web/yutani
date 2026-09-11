@@ -23,6 +23,11 @@ pub fn size_for(config: &Config, src_w: u32, src_h: u32) -> (u32, u32) {
     (inner_w + 2 * config.border_px, inner_h.max(1) + 2 * config.border_px)
 }
 
+/// Smallest x along a top row (`origin`, step `pitch`) not already used.
+pub fn next_free_x(taken: &[i32], origin: i32, pitch: i32) -> i32 {
+    (0..).map(|slot| origin + slot * pitch).find(|x| !taken.contains(x)).unwrap()
+}
+
 pub fn view<'a>(client: &'a Client, config: &Config, on_press: Msg) -> Element<'a, Msg> {
     let border_hex = if client.info.activated { &config.active_border } else { &config.inactive_border };
     let [r, g, b, a] = parse_color(border_hex).unwrap_or([1.0, 0.5, 0.0, 1.0]);
@@ -88,5 +93,14 @@ mod tests {
         let config = Config { thumb_width: 320, border_px: 2, ..Config::default() };
         assert_eq!(size_for(&config, 2560, 1440), (324, 184));
         assert_eq!(size_for(&config, 1000, 1000), (324, 324));
+    }
+
+    #[test]
+    fn next_free_x_fills_the_first_gap() {
+        assert_eq!(next_free_x(&[], 40, 336), 40);
+        assert_eq!(next_free_x(&[40], 40, 336), 376);
+        assert_eq!(next_free_x(&[40, 376], 40, 336), 712);
+        assert_eq!(next_free_x(&[376], 40, 336), 40);
+        assert_eq!(next_free_x(&[40, 712], 40, 336), 376);
     }
 }
