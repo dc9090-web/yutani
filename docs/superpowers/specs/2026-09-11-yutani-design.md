@@ -54,7 +54,7 @@ One binary, `yutani`, with three roles:
 
 - `yutani` — the app (daemon + UI). Single instance via libcosmic
   `run_single_instance` (D-Bus).
-- `yutani focus <n> | next | prev | toggle | show | hide | layout <name> | quit`
+- `yutani focus <n> | next | prev | show | hide | toggle | layout <name> | settings | quit`
   — thin CLI: sends one command over the IPC socket and exits. Invoked by COSMIC
   shortcuts.
 - `yutani doctor` — reports which protocols the compositor advertises and
@@ -264,7 +264,8 @@ goes to the first.
 Unix socket `$XDG_RUNTIME_DIR/yutani.sock`, mode 0600, removed on exit.
 Newline-delimited text; one command per connection.
 
-Commands: `focus <n>`, `next`, `prev`, `toggle`, `show`, `hide`,
+Commands: `focus <n>`, `next`, `prev`, `show`, `hide`, `toggle` (show if hidden,
+hide if shown),
 `layout <name>`, `settings`, `quit`.
 Reply: `ok\n` or `err <message>\n`. The CLI prints the error and exits 1;
 if the socket is absent it prints "yutani is not running" and exits 1.
