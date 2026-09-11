@@ -649,3 +649,23 @@ cd ~/Yutani && git add src && git commit -m "feat: dock mode — per-output stri
 **Placeholder scan:** none; API names flagged where they might differ (`row::with_children`, `run_with` fn-pointer) carry a concrete fallback.
 
 **Type consistency:** `rules::should_show` signature matches its call in Task 1 Step 3; `Phase::Idle`/`Outcome::StartDrag` used consistently across Task 2 steps; `Cmd::PauseCapture/ResumeCapture` defined in Task 3 Step 1 and used in Steps 2 and Task 4; `thumbnail::Callbacks` defined in Task 4 Step 3 and used in Step 2; `dock::thickness`/`settings`/`view` signatures consistent between Steps 2 and 4.
+
+
+---
+
+### Task 6 (addendum, decided with Daniel after hands-on): Dock v2 — per-thumbnail surfaces, centred, new defaults
+
+**Why:** cosmic-comp's `cosmic_corner_radius_layer_v1` rounds a whole layer surface *including its subsurfaces* (verified by eye 2026-09-11), so rounded corners work only when each thumbnail is its own surface. A single wide strip can't round per thumbnail and needs input-region bookkeeping. Daniel's requested default is "one thumbnail, top centre, at the hover size, always".
+
+**Files:** modify `src/ui/dock.rs`, `src/ui/mod.rs`, `src/model/config.rs`, `src/ui/thumbnail.rs` (pin glyph gating).
+
+**Interfaces:**
+- `dock::layout(edge: Edge, output: (i32, i32), sizes: &[(u32, u32)], gap: i32, inset: i32) -> Vec<(i32, i32)>` — pure: positions (top-left, logical px) of N thumbnails laid along `edge`, centred along the edge's axis, `inset` px from the edge, `gap` px apart. Tests: 1 and 3 items on Top/Bottom/Left/Right of a 2560×1440 output; odd total widths centre by integer division; empty input → empty.
+- Dock mode reuses the floating per-client surfaces: `create_surface` gets its position from `dock::layout` when `mode == Dock` (`placed` is ignored in dock mode); `reconcile_surfaces` in dock mode, after create/destroy, recomputes the layout for each output's shown clients (ordered by `rules::dock_order`) and `set_margin`s any surface whose position changed; hover enter/leave (per-surface, via the existing pointer path — `Msg::Dock`/`mouse_area` are removed) changes that client's size and re-runs the layout so neighbours shift.
+- In dock mode: no drag (pointer press on a dock-positioned surface never starts a `DragState` — return `Task::none()`; clicks still Activate/Minimize), no pin (middle click ignored; pin glyph hidden), positions are not persisted.
+- Delete: `DockSurface`, `App.docks`, `dock::settings/thickness/thickness_for_strip/item_rects/size_for/anchor_for`, `set_input_zone` use, `Msg::Dock`, `thumbnail::interactive/Callbacks`, `Client.docked` (replace with `mode == Dock` checks), the re-anchor path in `apply_config` (edge change = relayout). Keep `rules::dock_order` and `DOCK_PADDING` (rename `DOCK_GAP = 8`, `DOCK_INSET = 8`).
+- Corner radius is requested for every thumbnail surface (already in `create_surface`).
+- Config defaults change to: `mode: Dock`, `dock_edge: Top`, `thumb_width: 480`, `zoom_factor: 1.0`, `corner_radius: 8`. Update `defaults_match_spec`/`plan2_defaults`/`plan3_defaults` tests accordingly and `validate` ranges (thumb_width 80..=1600 still fine; zoom 1.0..=4.0 fine).
+- Spec: update §6 dock paragraph and §9 defaults to match; note the per-surface design.
+
+**Verify:** `cargo test` green; smoke with EVE and no config file: one `create_surface` at x = (2560−484)/2 = 1038, y = 8 on the EVE output; `(mode: Floating)` → floating at remembered position; delete → back to dock. Hands-on (Daniel): centred at top, rounded corners, 480 px wide, no hover growth; a second client (if available) appears beside it, both centred as a pair.
