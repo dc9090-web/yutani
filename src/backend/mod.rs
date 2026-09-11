@@ -13,7 +13,7 @@ use cosmic::cctk::{
     wayland_client::{
         Connection, QueueHandle,
         globals::registry_queue_init,
-        protocol::{wl_output::WlOutput, wl_seat},
+        protocol::{wl_output::{self, WlOutput}, wl_seat},
     },
     wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
 };
@@ -24,7 +24,6 @@ use cosmic::cctk::{
         dmabuf::{DmabufFeedback, DmabufState},
         shm::{Shm, ShmHandler},
     },
-    wayland_client::protocol::wl_output,
 };
 use cosmic::iced::futures::executor::ThreadPool;
 use cosmic::iced::platform_specific::shell::subsurface_widget::SubsurfaceBuffer;

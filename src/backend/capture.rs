@@ -54,6 +54,7 @@ pub struct ScreencopySession {
     session: CaptureSession,
     release: Option<SubsurfaceBufferRelease>,
     last_submit: Instant,
+    consecutive_failures: u32,
 }
 
 impl ScreencopySession {
@@ -61,7 +62,14 @@ impl ScreencopySession {
         let udata = SessionData { session_data: Default::default(), capture: Arc::downgrade(capture) };
         let source = CaptureSource::Toplevel(capture.handle.clone());
         match screencopy.capturer().create_session(&source, CaptureOptions::empty(), qh, udata) {
-            Ok(session) => Some(Self { formats: None, buffers: None, session, release: None, last_submit: Instant::now() }),
+            Ok(session) => Some(Self {
+                formats: None,
+                buffers: None,
+                session,
+                release: None,
+                last_submit: Instant::now(),
+                consecutive_failures: 0,
+            }),
             Err(err) => {
                 tracing::error!("cannot create capture session: {err:?}");
                 None
@@ -140,22 +148,34 @@ impl ScreencopyHandler for AppData {
 
     fn init_done(&mut self, conn: &Connection, qh: &QueueHandle<Self>, session: &CaptureSession, formats: &Formats) {
         let Some(capture) = Capture::for_session(session) else { return };
-        let buffers = self.allocate(formats);
+
+        // At most one frame may be in flight per session; a second `init_done`
+        // (e.g. after a resize) can race with a frame that's already in
+        // flight, so only the first `init_done` (no buffers yet) may submit.
+        // Later resizes are handled by `failed(BufferConstraints)`, which is
+        // only reached once nothing is in flight.
         let mut guard = capture.session.lock().unwrap();
         let Some(state) = guard.as_mut() else { return };
-        let resized = state.formats.as_ref().is_some_and(|f| f.buffer_size != formats.buffer_size);
         state.formats = Some(formats.clone());
-        if state.buffers.is_none() || resized {
-            state.buffers = buffers;
-            state.release = None;
-            state.submit(&capture, conn, qh);
+        if state.buffers.is_some() {
+            return;
         }
+        drop(guard);
+
+        let buffers = self.allocate(formats);
+
+        let mut guard = capture.session.lock().unwrap();
+        let Some(state) = guard.as_mut() else { return };
+        state.buffers = buffers;
+        state.release = None;
+        state.submit(&capture, conn, qh);
     }
 
     fn ready(&mut self, conn: &Connection, qh: &QueueHandle<Self>, capture_frame: &CaptureFrame, frame: Frame) {
         let Some(capture) = capture_frame.data::<FrameData>().and_then(|d| d.capture.upgrade()) else { return };
         let mut guard = capture.session.lock().unwrap();
         let Some(state) = guard.as_mut() else { return };
+        state.consecutive_failures = 0;
         let Some(buffers) = state.buffers.as_mut() else { return };
 
         // Back buffer now holds the newest frame: make it the front.
@@ -177,17 +197,21 @@ impl ScreencopyHandler for AppData {
             },
         };
         let previous_release = state.release.replace(release);
+        let last_submit = state.last_submit;
 
         // Next capture: after the previous front buffer is released by the
         // compositor and at least one frame interval since the last submit.
-        let wait = frame_interval(&self.fps).saturating_sub(state.last_submit.elapsed());
+        // The wait is computed *after* the release resolves, since waiting
+        // for release can itself take longer than the frame interval.
         let capture_for_task = capture.clone();
         let conn = conn.clone();
         let qh = qh.clone();
+        let fps = self.fps.clone();
         self.thread_pool.spawn_ok(async move {
             if let Some(release) = previous_release {
                 release.await;
             }
+            let wait = frame_interval(&fps).saturating_sub(last_submit.elapsed());
             if !wait.is_zero() {
                 futures_timer::Delay::new(wait).await;
             }
@@ -221,12 +245,28 @@ impl ScreencopyHandler for AppData {
                 capture.stop();
             }
             other => {
-                tracing::warn!("capture failed: {other:?}; retrying in 500ms");
+                let mut guard = capture.session.lock().unwrap();
+                let Some(state) = guard.as_mut() else { return };
+                state.consecutive_failures += 1;
+                let n = state.consecutive_failures;
+                drop(guard);
+
+                if n >= 4 {
+                    tracing::warn!(
+                        "capture failed {n} times in a row ({other:?}); giving up until the client changes state"
+                    );
+                    capture.stop();
+                    return;
+                }
+
+                let delay_ms = 250u64.saturating_mul(1u64 << (n - 1)).min(2000);
+                tracing::debug!("capture failed: {other:?}; retrying in {delay_ms}ms (attempt {n})");
+                let delay = Duration::from_millis(delay_ms);
                 let capture_for_task = capture.clone();
                 let conn = conn.clone();
                 let qh = qh.clone();
                 self.thread_pool.spawn_ok(async move {
-                    futures_timer::Delay::new(Duration::from_millis(500)).await;
+                    futures_timer::Delay::new(delay).await;
                     let mut guard = capture_for_task.session.lock().unwrap();
                     if let Some(state) = guard.as_mut() {
                         state.submit(&capture_for_task, &conn, &qh);
