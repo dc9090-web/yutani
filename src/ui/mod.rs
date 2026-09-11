@@ -64,6 +64,10 @@ pub struct Client {
     /// Last capture attempt for this client failed; show a placeholder
     /// instead of a stale or absent frame.
     pub unavailable: bool,
+    /// `create_surface` has placed this client at least once; on a later
+    /// destroy+recreate cycle, reuse `position`/`pinned` instead of falling
+    /// back to a saved or freshly computed slot.
+    pub placed: bool,
 }
 
 pub struct App {
@@ -188,19 +192,29 @@ impl App {
             tracing::debug!("no outputs yet; deferring surface");
             return Task::none();
         };
-        // Prefer a saved position for this character over the next free slot.
-        let saved = match &client.info.login {
-            Login::LoggedIn(name) => self.layout.thumbs.get(name).cloned(),
-            Login::LoggingIn => None,
+        // Prefer this client's own previous placement (destroy+recreate cycles
+        // like hide_active, EveFocusedOnly, or output loss should put the
+        // thumbnail back where it was even if never persisted); otherwise a
+        // saved position for this character; otherwise the next free slot.
+        let (position, pinned) = if client.placed {
+            (client.position, client.pinned)
+        } else {
+            let saved = match &client.info.login {
+                Login::LoggedIn(name) => self.layout.thumbs.get(name).cloned(),
+                Login::LoggingIn => None,
+            };
+            match saved {
+                Some(s) => ((s.x, s.y), s.pinned),
+                None => (self.next_position(), false),
+            }
         };
-        let position = saved.as_ref().map(|s| (s.x, s.y)).unwrap_or_else(|| self.next_position());
-        let pinned = saved.as_ref().map(|s| s.pinned).unwrap_or(false);
         let (width, height) = self.surface_size(client);
         let id = SurfaceId::unique();
         let client = self.clients.get_mut(handle).unwrap();
         client.surface = Some(id);
         client.position = position;
         client.pinned = pinned;
+        client.placed = true;
         tracing::info!(?id, x = position.0, y = position.1, width, height, "create_surface");
         get_layer_surface(SctkLayerSurfaceSettings {
             id,
@@ -436,6 +450,7 @@ impl App {
                     last_cursor: Point::ORIGIN,
                     hovered: false,
                     unavailable: false,
+                    placed: false,
                 });
                 let was_named = matches!(entry.info.login, Login::LoggedIn(_));
                 let had_surface = entry.surface.is_some();
@@ -527,9 +542,10 @@ impl Application for App {
                     return Task::batch(pending.iter().map(|h| self.create_surface(h)));
                 }
                 if removed {
-                    // Surfaces on the removed output will get a Layer(Done, ..);
-                    // clients whose output_for now resolves elsewhere are
-                    // recreated there.
+                    // This does not itself recreate anything: the compositor
+                    // sends Layer(Done, ..) for each surface on the removed
+                    // output, and that handler is what actually recreates
+                    // them (on this or another output, via output_for).
                     return self.reconcile_surfaces();
                 }
                 Task::none()
@@ -538,6 +554,11 @@ impl Application for App {
                 // The compositor closed this surface (its output went away).
                 if let Some(handle) = self.client_for_surface(id) {
                     tracing::info!("layer surface closed by compositor; recreating");
+                    // A drag on a surface that goes away must not linger and
+                    // block future drags (mirrors destroy_surface).
+                    if self.drag.as_ref().is_some_and(|d| d.surface == id) {
+                        self.drag = None;
+                    }
                     if let Some(c) = self.clients.get_mut(&handle) {
                         c.surface = None;
                     }
