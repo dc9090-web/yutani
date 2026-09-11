@@ -3,6 +3,12 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Visibility {
+    Always,
+    EveFocusedOnly,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -23,6 +29,15 @@ pub struct Config {
     pub inactive_border: String,
     pub border_px: u32,
     pub show_names: bool,
+    /// Hover zoom multiplier, 1.0–4.0.
+    pub zoom_factor: f32,
+    pub visibility: Visibility,
+    /// Hide the thumbnail of the client that currently has focus.
+    pub hide_active: bool,
+    /// Snap to a 32 px grid while dragging.
+    pub snap_grid: bool,
+    /// Snap flush against other thumbnails while dragging.
+    pub snap_edges: bool,
 }
 
 impl Default for Config {
@@ -36,6 +51,11 @@ impl Default for Config {
             inactive_border: "#404040".to_string(),
             border_px: 2,
             show_names: true,
+            zoom_factor: 1.5,
+            visibility: Visibility::Always,
+            hide_active: false,
+            snap_grid: true,
+            snap_edges: true,
         }
     }
 }
@@ -64,7 +84,7 @@ impl Config {
             }
         };
         match ron::from_str(&text) {
-            Ok(config) => config,
+            Ok(config) => Config::validate(config),
             Err(err) => {
                 tracing::warn!("cannot parse {}: {err}; using defaults", path.display());
                 Self::default()
@@ -83,6 +103,31 @@ impl Config {
         let text = ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default())?;
         std::fs::write(path, text)?;
         Ok(())
+    }
+
+    /// Replace out-of-range values with defaults, warning about each.
+    pub fn validate(mut self) -> Self {
+        let d = Config::default();
+        macro_rules! check {
+            ($field:ident, $ok:expr, $why:literal) => {
+                if !$ok(&self.$field) {
+                    tracing::warn!(concat!("config: ", stringify!($field), " {:?} is invalid (", $why, "); using default"), self.$field);
+                    self.$field = d.$field.clone();
+                }
+            };
+        }
+        check!(thumb_width, |v: &u32| (80..=1600).contains(v), "80..=1600");
+        check!(opacity, |v: &f32| (0.0..=1.0).contains(v), "0.0..=1.0");
+        check!(fps, |v: &u32| [10, 15, 30, 60].contains(v), "10|15|30|60");
+        check!(zoom_factor, |v: &f32| (1.0..=4.0).contains(v), "1.0..=4.0");
+        check!(border_px, |v: &u32| *v <= 16, "0..=16");
+        check!(active_border, |v: &String| parse_color(v).is_some(), "#rrggbb[aa]");
+        check!(inactive_border, |v: &String| parse_color(v).is_some(), "#rrggbb[aa]");
+        if self.app_ids.is_empty() {
+            tracing::warn!("config: app_ids is empty; using default");
+            self.app_ids = d.app_ids.clone();
+        }
+        self
     }
 }
 
@@ -173,5 +218,54 @@ mod tests {
     fn non_ascii_color_is_rejected_not_a_panic() {
         assert_eq!(parse_color("#a±bcd"), None);
         assert_eq!(parse_color("#ab±cdef"), None);
+    }
+
+    #[test]
+    fn plan2_defaults() {
+        let c = Config::default();
+        assert_eq!(c.zoom_factor, 1.5);
+        assert_eq!(c.visibility, Visibility::Always);
+        assert!(!c.hide_active);
+        assert!(c.snap_grid);
+        assert!(c.snap_edges);
+    }
+
+    #[test]
+    fn validate_replaces_bad_values_with_defaults() {
+        let c = Config {
+            thumb_width: 10,
+            opacity: 7.0,
+            fps: 17,
+            zoom_factor: 0.2,
+            active_border: "nope".into(),
+            border_px: 99,
+            ..Config::default()
+        }
+        .validate();
+        let d = Config::default();
+        assert_eq!(c.thumb_width, d.thumb_width);
+        assert_eq!(c.opacity, d.opacity);
+        assert_eq!(c.fps, d.fps);
+        assert_eq!(c.zoom_factor, d.zoom_factor);
+        assert_eq!(c.active_border, d.active_border);
+        assert_eq!(c.border_px, d.border_px);
+    }
+
+    #[test]
+    fn validate_keeps_good_values() {
+        let c = Config { thumb_width: 480, opacity: 0.5, fps: 60, zoom_factor: 2.0, border_px: 0, ..Config::default() };
+        assert_eq!(c.clone().validate(), c);
+    }
+
+    #[test]
+    fn load_from_validates() {
+        let dir = std::env::temp_dir().join(format!("yutani-val-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.ron");
+        std::fs::write(&path, "(fps: 17, thumb_width: 400)").unwrap();
+        let c = Config::load_from(&path);
+        assert_eq!(c.fps, 30);
+        assert_eq!(c.thumb_width, 400);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
