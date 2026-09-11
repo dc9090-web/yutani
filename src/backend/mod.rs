@@ -84,6 +84,8 @@ pub enum Cmd {
     Minimize(Handle),
     SetAppIds(Vec<String>),
     SetFps(u32),
+    PauseCapture(Handle),
+    ResumeCapture(Handle),
 }
 
 /// iced subscription that owns the backend thread for the app's lifetime.
@@ -160,7 +162,7 @@ impl AppData {
             .and_then(|info| info.cosmic_toplevel.clone())
     }
 
-    pub fn handle_cmd(&mut self, cmd: Cmd) {
+    pub fn handle_cmd(&mut self, cmd: Cmd, conn: &Connection) {
         match cmd {
             Cmd::Activate(handle) => {
                 let Some(cosmic) = self.cosmic_handle(&handle) else { return };
@@ -185,6 +187,12 @@ impl AppData {
             }
             Cmd::SetFps(fps) => {
                 self.fps.store(fps, Ordering::Relaxed);
+            }
+            Cmd::PauseCapture(handle) => {
+                self.set_paused(&handle, true, conn);
+            }
+            Cmd::ResumeCapture(handle) => {
+                self.set_paused(&handle, false, conn);
             }
         }
     }
@@ -252,14 +260,17 @@ fn start(conn: Connection, app_ids: Vec<String>, fps: u32) -> mpsc::Receiver<Eve
                 app_data.send_event(Event::CmdSender(cmd_sender));
 
                 let mut event_loop = calloop::EventLoop::try_new().expect("calloop");
+                // `handle_cmd` needs a `Connection` to flush after commands like
+                // pause/resume; clone it before `conn` is moved into the source.
+                let cmd_conn = conn.clone();
                 WaylandSource::new(conn, event_queue)
                     .insert(event_loop.handle())
                     .expect("wayland source");
                 event_loop
                     .handle()
-                    .insert_source(cmd_channel, |event, _, app_data: &mut AppData| {
+                    .insert_source(cmd_channel, move |event, _, app_data: &mut AppData| {
                         if let calloop::channel::Event::Msg(cmd) = event {
-                            app_data.handle_cmd(cmd);
+                            app_data.handle_cmd(cmd, &cmd_conn);
                         }
                     })
                     .expect("cmd channel");

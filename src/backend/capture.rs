@@ -12,7 +12,7 @@ use cosmic::cctk::{
     wayland_client::{Connection, QueueHandle, WEnum},
 };
 use cosmic::iced::platform_specific::shell::subsurface_widget::{SubsurfaceBuffer, SubsurfaceBufferRelease};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -24,11 +24,14 @@ const BUFFER_COUNT: usize = 2;
 pub struct Capture {
     pub handle: Handle,
     pub session: Mutex<Option<ScreencopySession>>,
+    /// Set by `AppData::set_paused` when the UI hides this client's
+    /// thumbnail: capture stops submitting new frames until resumed.
+    pub paused: AtomicBool,
 }
 
 impl Capture {
     pub fn new(handle: Handle) -> Arc<Self> {
-        Arc::new(Capture { handle, session: Mutex::new(None) })
+        Arc::new(Capture { handle, session: Mutex::new(None), paused: AtomicBool::new(false) })
     }
 
     pub fn for_session(session: &CaptureSession) -> Option<Arc<Self>> {
@@ -83,6 +86,9 @@ impl ScreencopySession {
     }
 
     fn submit(&mut self, capture: &Arc<Capture>, conn: &Connection, qh: &QueueHandle<AppData>) {
+        if capture.paused.load(Ordering::Relaxed) {
+            return;
+        }
         if self.in_flight {
             return;
         }
@@ -136,6 +142,21 @@ impl AppData {
     pub fn stop_capture(&mut self, handle: &Handle) {
         if let Some(capture) = self.captures.remove(handle) {
             capture.stop();
+        }
+    }
+
+    /// Pause (or resume) capture for a client whose thumbnail the UI has
+    /// hidden (or shown again). Resuming re-submits immediately if nothing
+    /// is already in flight; `submit`'s own `in_flight` guard makes this
+    /// safe to call unconditionally.
+    pub fn set_paused(&mut self, handle: &Handle, paused: bool, conn: &Connection) {
+        let Some(capture) = self.captures.get(handle).cloned() else { return };
+        capture.paused.store(paused, Ordering::Relaxed);
+        if !paused {
+            let mut guard = capture.session.lock().unwrap();
+            if let Some(state) = guard.as_mut() {
+                state.submit(&capture, conn, &self.qh);
+            }
         }
     }
 

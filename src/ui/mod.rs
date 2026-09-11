@@ -26,6 +26,7 @@ pub mod config_watch;
 pub mod pointer;
 pub mod rules;
 pub mod thumbnail;
+pub mod tray;
 
 /// `Config` carries no CLI-parsed subcommand/args; only its file contents
 /// matter, so this satisfies `run_single_instance`'s bound trivially.
@@ -95,6 +96,7 @@ pub enum Msg {
     Backend(Event),
     Pointer(SurfaceId, mouse::Event),
     ConfigChanged(Config),
+    Tray(tray::TrayEvent),
 }
 
 impl App {
@@ -155,8 +157,10 @@ impl App {
             let show = self.should_show(&self.clients[&h]);
             let has = self.clients[&h].surface.is_some();
             if show && !has {
+                self.send(Cmd::ResumeCapture(h.clone()));
                 tasks.push(self.create_surface(&h));
             } else if !show && has {
+                self.send(Cmd::PauseCapture(h.clone()));
                 tasks.push(self.destroy_surface(&h));
             }
         }
@@ -635,6 +639,11 @@ impl Application for App {
             Msg::Backend(event) => self.on_backend(event),
             Msg::Pointer(id, event) => self.on_pointer(id, event),
             Msg::ConfigChanged(config) => self.apply_config(config),
+            Msg::Tray(tray::TrayEvent::ToggleVisibility) => {
+                self.hidden = !self.hidden;
+                self.reconcile_surfaces()
+            }
+            Msg::Tray(tray::TrayEvent::Quit) => cosmic::iced::exit(),
         }
     }
 
@@ -648,7 +657,11 @@ impl Application for App {
             // a message: update → redraw → same event again is a hot loop.
             _ => None,
         });
-        let mut subs = vec![events, config_watch::subscription().map(Msg::ConfigChanged)];
+        let mut subs = vec![
+            events,
+            config_watch::subscription().map(Msg::ConfigChanged),
+            tray::subscription().map(Msg::Tray),
+        ];
         if let Some(conn) = self.conn.clone() {
             subs.push(
                 backend::subscription(conn, self.config.app_ids.clone(), self.config.fps)
