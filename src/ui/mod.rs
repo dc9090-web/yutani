@@ -24,6 +24,7 @@ use crate::model::layout::{self, Layout, Rect, ThumbPos};
 
 pub mod config_watch;
 pub mod pointer;
+pub mod rules;
 pub mod thumbnail;
 
 /// `Config` carries no CLI-parsed subcommand/args; only its file contents
@@ -80,6 +81,9 @@ pub struct App {
     pub outputs: Vec<Output>,
     pub layout: Layout,
     pub drag: Option<pointer::DragState>,
+    /// Tray-toggled visibility: when true, no thumbnail is shown regardless
+    /// of `Visibility`/`hide_active`. Set by the tray icon (Task 3).
+    pub hidden: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -131,12 +135,13 @@ impl App {
     }
 
     fn should_show(&self, client: &Client) -> bool {
-        use crate::model::config::Visibility;
-        let visible = match self.config.visibility {
-            Visibility::Always => true,
-            Visibility::EveFocusedOnly => self.any_client_activated(),
-        };
-        visible && !(self.config.hide_active && client.info.activated)
+        rules::should_show(
+            self.config.visibility,
+            self.config.hide_active,
+            self.hidden,
+            self.any_client_activated(),
+            client.info.activated,
+        )
     }
 
     /// Make every client's surface existence match `should_show`.
@@ -198,18 +203,15 @@ impl App {
         // like hide_active, EveFocusedOnly, or output loss should put the
         // thumbnail back where it was even if never persisted); otherwise a
         // saved position for this character; otherwise the next free slot.
-        let (position, pinned) = if client.placed {
-            (client.position, client.pinned)
-        } else {
-            let saved = match &client.info.login {
-                Login::LoggedIn(name) => self.layout.thumbs.get(name).cloned(),
-                Login::LoggingIn => None,
-            };
-            match saved {
-                Some(s) => ((s.x, s.y), s.pinned),
-                None => (self.next_position(), false),
-            }
+        let saved = match &client.info.login {
+            Login::LoggedIn(name) => self.layout.thumbs.get(name).cloned(),
+            Login::LoggingIn => None,
         };
+        let (position, pinned) = rules::choose_position(
+            client.placed.then_some((client.position, client.pinned)),
+            saved.as_ref(),
+            self.next_position(),
+        );
         let (width, height) = self.surface_size(client);
         let id = SurfaceId::unique();
         let client = self.clients.get_mut(handle).unwrap();
@@ -569,6 +571,7 @@ impl Application for App {
             outputs: Vec::new(),
             layout: Layout::load(),
             drag: None,
+            hidden: false,
         };
         (app, Task::none())
     }

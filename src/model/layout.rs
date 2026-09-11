@@ -34,7 +34,10 @@ fn round_to(v: i32, grid: i32) -> i32 {
 
 /// Snap a dragged rect's top-left. Edge snapping (flush against, or aligned
 /// with, another rect's edges within `edge_threshold`) takes precedence over
-/// the grid, per axis.
+/// the grid, per axis. Edge distances are measured from the grid-snapped
+/// coordinate (when grid snapping is on), so a thumbnail that lands on a
+/// grid line near a neighbour still snaps flush; the effective edge
+/// threshold is therefore up to `grid/2 + edge_threshold`.
 pub fn snap(rect: Rect, others: &[Rect], grid: Option<i32>, edge_threshold: Option<i32>) -> (i32, i32) {
     let mut x = rect.x;
     let mut y = rect.y;
@@ -159,6 +162,17 @@ mod tests {
     fn edge_snap_wins_over_grid_when_both_enabled() {
         let other = r(200, 40);
         assert_eq!(snap(r(93, 51), &[other], Some(32), Some(12)), (100, 64));
+    }
+
+    #[test]
+    fn edge_snap_picks_the_nearest_of_several_neighbours() {
+        let a = r(200, 40);  // right edge 300
+        let b = r(400, 40);  // left edge 400
+        // our left edge (305) is 5 from a's right, our right edge (405) is 5 from b's left → tie → first wins (a)
+        assert_eq!(snap(r(305, 40), &[a, b], None, Some(12)), (300, 40));
+        // clearly nearer to b
+        assert_eq!(snap(r(296, 300), &[a, b], None, Some(12)), (300, 300));
+        assert_eq!(snap(r(309, 300), &[b, a], None, Some(12)), (300, 300));
     }
 
     #[test]

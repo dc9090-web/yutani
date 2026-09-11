@@ -9,6 +9,20 @@ pub enum Visibility {
     EveFocusedOnly,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Mode {
+    Floating,
+    Dock,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Edge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -38,6 +52,8 @@ pub struct Config {
     pub snap_grid: bool,
     /// Snap flush against other thumbnails while dragging.
     pub snap_edges: bool,
+    pub mode: Mode,
+    pub dock_edge: Edge,
 }
 
 impl Default for Config {
@@ -56,6 +72,8 @@ impl Default for Config {
             hide_active: false,
             snap_grid: true,
             snap_edges: true,
+            mode: Mode::Floating,
+            dock_edge: Edge::Bottom,
         }
     }
 }
@@ -255,6 +273,17 @@ mod tests {
     fn validate_keeps_good_values() {
         let c = Config { thumb_width: 480, opacity: 0.5, fps: 60, zoom_factor: 2.0, border_px: 0, ..Config::default() };
         assert_eq!(c.clone().validate(), c);
+    }
+
+    #[test]
+    fn plan3_defaults_and_validation() {
+        let c = Config::default();
+        assert_eq!(c.mode, Mode::Floating);
+        assert_eq!(c.dock_edge, Edge::Bottom);
+        let text = "(mode: Dock, dock_edge: Left)";
+        let c: Config = ron::from_str(text).unwrap();
+        assert_eq!(c.mode, Mode::Dock);
+        assert_eq!(c.dock_edge, Edge::Left);
     }
 
     #[test]
