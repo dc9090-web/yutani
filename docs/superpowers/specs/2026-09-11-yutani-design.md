@@ -42,8 +42,12 @@ cosmic-comp advertises:
 There is **no** GlobalShortcuts portal in xdg-desktop-portal-cosmic 1.7.
 Global hotkeys go through COSMIC's custom-shortcut config instead (§7).
 
-EVE under Steam/GE-Proton appears as `app_id = "steam_app_8500"`. The launcher's
-title is `EVE Launcher`; the client's title is `EVE` before login and
+EVE under Steam/GE-Proton with `PROTON_ENABLE_WAYLAND=1` (measured live on
+2026-09-11): the **client** window has `app_id = "exefile.exe"`, the launcher
+`app_id = "eve-online.exe"`; `steam_app_8500` was only observed transiently on
+the launcher during startup. Default detection therefore uses
+`app_ids: ["exefile.exe", "steam_app_8500"]`. The launcher's title is
+`EVE Launcher`; the client's title is `EVE` before login and
 `EVE - <Character Name>` after.
 
 Rust toolchain: stable via rustup (1.98 at time of writing).
@@ -57,8 +61,9 @@ configuration on the target machine and the reason the project exists.
 
 Concretely:
 
-- Steam sets `app_id = "steam_app_8500"` on every window of the game,
-  launcher and client alike; that is the default detection key.
+- The client window's `app_id` is `exefile.exe` (native Wayland via Wine's
+  Wayland driver reports the executable name); `steam_app_8500` is kept as a
+  secondary key. Both are in the default `app_ids`.
 - The launcher (`EVE Launcher`) is excluded by title; each client window is
   `EVE` then `EVE - <Character Name>`.
 - Multiple clients started from one launcher are separate toplevels with the
@@ -115,6 +120,11 @@ deliberately does **not** bind `wl_output`, so every output handle in the
 process is iced's and can be passed straight to `IcedOutput::Output`.
 `cosmic-client-toolkit` is used through libcosmic's re-export `cosmic::cctk`,
 which guarantees matching `wayland-client` versions.
+
+The UI's Wayland event subscription must forward **only** the event variants
+it handles (`Output`, later `Layer`). Forwarding `RequestResize` or `Frame`
+as messages creates an update → redraw → event loop that pins a core
+(measured: ~40 000 redraws/s).
 
 ### Crate layout
 
@@ -318,7 +328,7 @@ if the socket is absent it prints "yutani is not running" and exits 1.
 
 ```ron
 (
-  app_ids: ["steam_app_8500"],
+  app_ids: ["exefile.exe", "steam_app_8500"],
   mode: Floating,            // Floating | Dock
   dock_edge: Bottom,         // Top | Bottom | Left | Right
   thumb_width: 320,
