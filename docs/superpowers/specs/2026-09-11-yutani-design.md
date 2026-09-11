@@ -92,25 +92,29 @@ One binary, `yutani`, with three roles:
 - `yutani doctor` — reports which protocols the compositor advertises and
   whether a test capture succeeds.
 
-Inside the app, two threads with two Wayland connections:
+Inside the app, two threads sharing **one** Wayland connection with two
+event queues (the pattern System76's own cosmic-workspaces uses):
 
 ```
-┌─────────────────────────────┐   channel: WindowEvent / Frame    ┌────────────────────────────┐
+┌─────────────────────────────┐   channel: Event (Client*/Frame)  ┌────────────────────────────┐
 │  Compositor thread          │ ────────────────────────────────▶ │  UI thread (libcosmic)     │
-│  own wayland-client conn    │                                   │  iced runtime, wgpu        │
-│  • toplevel_info  (list)    │ ◀──────────────────────────────── │  • settings window         │
-│  • toplevel_mgmt  (focus)   │   channel: Command                │  • N thumbnail layer       │
-│  • screencopy     (capture) │   (Activate, Minimize,            │    surfaces (floating)     │
-│  • gbm buffer pools         │    StartCapture, SetFps…)         │  • 1 dock layer surface    │
-│  • IPC socket listener      │                                   │    per output              │
-└─────────────────────────────┘                                   │  • tray icon               │
-                                                                  └────────────────────────────┘
+│  2nd event queue on the     │                                   │  iced runtime, wgpu        │
+│  same wl connection, driven │ ◀──────────────────────────────── │  • settings window         │
+│  by calloop                 │   calloop channel: Cmd            │  • N thumbnail layer       │
+│  • toplevel_info  (list)    │   (Activate, Minimize,            │    surfaces (floating)     │
+│  • toplevel_mgmt  (focus)   │    SetAppIds, SetFps)             │  • 1 dock layer surface    │
+│  • screencopy     (capture) │                                   │    per output              │
+│  • gbm buffer pools         │                                   │  • tray icon               │
+└─────────────────────────────┘                                   └────────────────────────────┘
 ```
 
-libcosmic owns its own connection and event loop. `cosmic-client-toolkit`
-must own the toplevel handles and seat on *its* connection for `activate()`
-to be valid, hence the second connection. dmabuf file descriptors cross the
-boundary freely. This mirrors libcosmic's `sctk_subsurface_gst` example.
+The UI recovers iced's `Connection` from the first `wl_output` event
+(`Connection::from_backend`) and hands it to the backend, which calls
+`registry_queue_init` on it to get its own queue and globals. The backend
+deliberately does **not** bind `wl_output`, so every output handle in the
+process is iced's and can be passed straight to `IcedOutput::Output`.
+`cosmic-client-toolkit` is used through libcosmic's re-export `cosmic::cctk`,
+which guarantees matching `wayland-client` versions.
 
 ### Crate layout
 
@@ -160,6 +164,11 @@ Title parsing (`model::client::parse_title`):
 | --- | --- | --- |
 | `EVE - Aria Vex` | `Some("Aria Vex")` | LoggedIn |
 | `EVE` | `None` | LoggingIn |
+| anything else with a matching app_id | `None` | LoggingIn |
+
+The last row makes any non-launcher window of a matching app_id a client.
+Besides covering EVE's transient titles, it lets the whole pipeline be tested
+without EVE by temporarily setting `app_ids: ["firefox"]`.
 
 Every title / state / geometry / output change is forwarded to the UI as a
 `WindowEvent::{Added, Updated, Removed}`. Nothing polls. The `activated`
@@ -177,15 +186,16 @@ Per EVE client, in the compositor thread:
 
 1. `Capturer::create_session(CaptureSource::Toplevel(handle), paint_cursors = false)`.
 2. On `formats { buffer_size, dmabuf_device, dmabuf_formats }`: open the gbm
-   device for `dmabuf_device`, allocate a pool of **3** buffer objects at
-   `buffer_size` in the first mutually supported format (prefer
-   `Argb8888`/`Xrgb8888` with an advertised modifier), wrap each as a
-   `wl_buffer` via `zwp_linux_dmabuf_v1` params.
+   device for `dmabuf_device`, allocate a swapchain of **2** buffer objects at
+   `buffer_size` in `Abgr8888` with the advertised modifiers, wrap each as a
+   `wl_buffer` via `zwp_linux_dmabuf_v1` params. Fall back to `wl_shm` if
+   gbm allocation fails (cosmic-workspaces does the same for some Intel GPUs).
 3. Loop: take a free BO, `session.capture(buffer, damage)`. On `ready`, send
    `Frame { client_id, dmabuf: {planes(fd, offset, stride), format, modifier, w, h} }`
-   to the UI. The UI wraps it in `SubsurfaceBuffer`; the returned
-   `SubsurfaceBufferRelease` is sent back to the compositor thread, which marks
-   the BO free when it fires.
+   to the UI as a `SubsurfaceBuffer` created from the buffer's shared
+   `Arc<BufferSource>` (so the widget reuses its `wl_buffer`). The
+   `SubsurfaceBufferRelease` future stays in the compositor thread; the next
+   capture into that buffer is only submitted after it resolves.
 4. Throttle: do not submit the next capture until `1 / config.fps` seconds
    have elapsed since the last submit. Capture is also damage-driven by the
    protocol, so idle windows cost nothing.
