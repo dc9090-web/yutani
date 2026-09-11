@@ -70,6 +70,9 @@ pub struct Client {
     /// destroy+recreate cycle, reuse `position`/`pinned` instead of falling
     /// back to a saved or freshly computed slot.
     pub placed: bool,
+    /// Last size sent via `set_size` (or the surface's creation size), so a
+    /// resize to the same size can be skipped.
+    pub last_size: Option<(u32, u32)>,
 }
 
 pub struct App {
@@ -219,6 +222,7 @@ impl App {
         client.position = position;
         client.pinned = pinned;
         client.placed = true;
+        client.last_size = Some((width, height));
         tracing::info!(?id, x = position.0, y = position.1, width, height, "create_surface");
         get_layer_surface(SctkLayerSurfaceSettings {
             id,
@@ -322,11 +326,13 @@ impl App {
 
     /// Undo `enter_canvas`: back to a thumbnail-sized surface at the client's
     /// current position. Order matters: anchor, size, margin.
-    fn leave_canvas(&self, id: SurfaceId, client: &Client) -> Task<cosmic::Action<Msg>> {
+    fn leave_canvas(&mut self, id: SurfaceId, handle: &Handle) -> Task<cosmic::Action<Msg>> {
+        let Some(client) = self.clients.get(handle) else { return Task::none() };
         // `client.hovered` is set true before this is called (the cursor is
         // over the thumbnail at drag end), so this restores at zoomed size.
         let (w, h) = self.surface_size(client);
         let (x, y) = client.position;
+        self.clients.get_mut(handle).unwrap().last_size = Some((w, h));
         Task::batch([
             set_anchor(id, Anchor::TOP | Anchor::LEFT),
             set_size(id, Some(w), Some(h)),
@@ -334,9 +340,26 @@ impl App {
         ])
     }
 
-    /// True while `id` is enlarged to a drag canvas (any phase).
+    /// True while `id` is enlarged to a drag canvas: a drag on this surface
+    /// has crossed the arming threshold (`phase != Idle`) and is not pinned.
     fn in_canvas(&self, id: SurfaceId) -> bool {
-        self.drag.as_ref().is_some_and(|d| d.surface == id && !d.pinned)
+        self.drag.as_ref().is_some_and(|d| d.surface == id && !d.pinned && d.phase != pointer::Phase::Idle)
+    }
+
+    /// Resize `handle`'s surface to its current target size, but only if it
+    /// isn't already that size and it isn't a full-output drag canvas.
+    fn resize_if_needed(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {
+        let Some(client) = self.clients.get(handle) else { return Task::none() };
+        let Some(id) = client.surface else { return Task::none() };
+        if self.in_canvas(id) {
+            return Task::none();
+        }
+        let size = self.surface_size(client);
+        if client.last_size == Some(size) {
+            return Task::none();
+        }
+        self.clients.get_mut(handle).unwrap().last_size = Some(size);
+        set_size(id, Some(size.0), Some(size.1))
     }
 
     fn on_pointer(&mut self, id: SurfaceId, event: mouse::Event) -> Task<cosmic::Action<Msg>> {
@@ -359,41 +382,47 @@ impl App {
                 // still thumbnail-sized here, so local + position is absolute.
                 let cursor = c.last_cursor;
                 self.drag = pointer::on_press(id, button, cursor, c.position, c.pinned);
-                match &self.drag {
-                    // Pinned thumbnails only click; no need to enlarge.
-                    Some(d) if !d.pinned => {
-                        tracing::debug!(?id, press_abs = ?d.press_abs, "drag: arming canvas");
-                        Self::enter_canvas(id)
-                    }
-                    _ => Task::none(),
-                }
+                // Idle: the canvas isn't entered until motion crosses the
+                // threshold (see CursorMoved), so a plain click never
+                // touches the surface at all.
+                Task::none()
             }
             mouse::Event::CursorMoved { position } => {
                 if let Some(c) = self.clients.get_mut(&handle) {
                     c.last_cursor = position;
                 }
                 let Some(drag) = self.drag.as_mut().filter(|d| d.surface == id) else { return Task::none() };
-                match pointer::on_move(drag, position) {
-                    pointer::Outcome::Move(raw) => {
-                        let canvas = drag.canvas;
-                        let me = self.rect_of(&self.clients[&handle]);
-                        let others: Vec<Rect> = self
-                            .clients
-                            .iter()
-                            .filter(|(h, c)| *h != &handle && c.surface.is_some())
-                            .map(|(_, c)| self.rect_of(c))
-                            .collect();
-                        let grid = self.config.snap_grid.then_some(32);
-                        let edges = self.config.snap_edges.then_some(12);
-                        let (x, y) = layout::snap(Rect { x: raw.0, y: raw.1, ..me }, &others, grid, edges);
-                        // Keep the thumbnail fully inside the canvas (== the output).
-                        let x = x.clamp(0, (canvas.0 - me.w).max(0));
-                        let y = y.clamp(0, (canvas.1 - me.h).max(0));
-                        self.clients.get_mut(&handle).unwrap().position = (x, y);
-                        // No set_margin: the surface stays put; the view draws the offset.
-                        Task::none()
-                    }
-                    _ => Task::none(),
+                match drag.phase {
+                    pointer::Phase::Idle => match pointer::on_move_local(drag, position) {
+                        pointer::Outcome::StartDrag => {
+                            tracing::debug!(?id, "drag: threshold crossed; arming canvas");
+                            Self::enter_canvas(id)
+                        }
+                        _ => Task::none(),
+                    },
+                    pointer::Phase::Arming => Task::none(),
+                    pointer::Phase::Dragging => match pointer::on_move(drag, position) {
+                        pointer::Outcome::Move(raw) => {
+                            let canvas = drag.canvas;
+                            let me = self.rect_of(&self.clients[&handle]);
+                            let others: Vec<Rect> = self
+                                .clients
+                                .iter()
+                                .filter(|(h, c)| *h != &handle && c.surface.is_some())
+                                .map(|(_, c)| self.rect_of(c))
+                                .collect();
+                            let grid = self.config.snap_grid.then_some(32);
+                            let edges = self.config.snap_edges.then_some(12);
+                            let (x, y) = layout::snap(Rect { x: raw.0, y: raw.1, ..me }, &others, grid, edges);
+                            // Keep the thumbnail fully inside the canvas (== the output).
+                            let x = x.clamp(0, (canvas.0 - me.w).max(0));
+                            let y = y.clamp(0, (canvas.1 - me.h).max(0));
+                            self.clients.get_mut(&handle).unwrap().position = (x, y);
+                            // No set_margin: the surface stays put; the view draws the offset.
+                            Task::none()
+                        }
+                        _ => Task::none(),
+                    },
                 }
             }
             mouse::Event::ButtonReleased(button) => {
@@ -401,7 +430,10 @@ impl App {
                     return Task::none();
                 }
                 let drag = self.drag.take().unwrap();
-                let was_canvas = !drag.pinned;
+                // The canvas is only entered once motion crosses the threshold
+                // (`drag.moved`); if it never did, the surface never changed
+                // and there's nothing to restore.
+                let entered_canvas = !drag.pinned && drag.moved;
                 match pointer::on_release(drag) {
                     pointer::Outcome::Click(mouse::Button::Left) => {
                         self.send(Cmd::Activate(handle.clone()));
@@ -412,15 +444,14 @@ impl App {
                     pointer::Outcome::DragEnd => self.persist_position(&handle),
                     _ => {}
                 }
-                if was_canvas {
+                if entered_canvas {
                     // The cursor is over the thumbnail at drag end (no CursorEntered
                     // fires for a surface that was already under the pointer), so mark
                     // it hovered before computing the restore size — leave_canvas then
                     // restores at zoomed size instead of snapping small first.
                     self.clients.get_mut(&handle).unwrap().hovered = true;
-                    let client = &self.clients[&handle];
-                    tracing::debug!(?id, pos = ?client.position, "drag: leaving canvas");
-                    self.leave_canvas(id, client)
+                    tracing::debug!(?id, pos = ?self.clients[&handle].position, "drag: leaving canvas");
+                    self.leave_canvas(id, &handle)
                 } else {
                     Task::none()
                 }
@@ -431,10 +462,8 @@ impl App {
                 if self.drag.as_ref().is_some_and(|d| d.surface == id) {
                     return Task::none();
                 }
-                let c = self.clients.get_mut(&handle).unwrap();
-                c.hovered = true;
-                let (w, h) = self.surface_size(&self.clients[&handle]);
-                set_size(id, Some(w), Some(h))
+                self.clients.get_mut(&handle).unwrap().hovered = true;
+                self.resize_if_needed(&handle)
             }
             mouse::Event::CursorLeft => {
                 // Releasing outside is delivered to us anyway (implicit grab); nothing
@@ -442,10 +471,8 @@ impl App {
                 if self.drag.as_ref().is_some_and(|d| d.surface == id) {
                     return Task::none();
                 }
-                let c = self.clients.get_mut(&handle).unwrap();
-                c.hovered = false;
-                let (w, h) = self.surface_size(&self.clients[&handle]);
-                set_size(id, Some(w), Some(h))
+                self.clients.get_mut(&handle).unwrap().hovered = false;
+                self.resize_if_needed(&handle)
             }
             _ => Task::none(),
         }
@@ -468,6 +495,7 @@ impl App {
                     hovered: false,
                     unavailable: false,
                     placed: false,
+                    last_size: None,
                 });
                 let was_named = matches!(entry.info.login, Login::LoggedIn(_));
                 entry.info = info;
@@ -492,19 +520,14 @@ impl App {
             }
             Event::Frame(handle, image) => {
                 let Some(client) = self.clients.get_mut(&handle) else { return Task::none() };
-                let old = thumbnail::zoomed_size(&self.config, client.image.as_ref(), client.hovered);
-                let new = thumbnail::zoomed_size(&self.config, Some(&image), client.hovered);
                 client.image = Some(image);
                 client.unavailable = false;
-                let surface = client.surface;
-                match surface {
-                    // While enlarged to a drag canvas the surface must keep its
-                    // size; `leave_canvas` applies the current size on release.
-                    Some(id) if old != new && !self.in_canvas(id) => {
-                        set_size(id, Some(new.0), Some(new.1))
-                    }
-                    Some(_) => Task::none(),
-                    None => self.create_surface(&handle),
+                if client.surface.is_some() {
+                    // `resize_if_needed` skips a drag canvas and dedupes
+                    // against the last size actually sent.
+                    self.resize_if_needed(&handle)
+                } else {
+                    self.create_surface(&handle)
                 }
             }
             Event::CaptureUnavailable(handle) => {
@@ -536,12 +559,10 @@ impl App {
         let mut tasks = vec![self.reconcile_surfaces()];
         let handles: Vec<Handle> = self.clients.keys().cloned().collect();
         for h in handles {
-            // A surface enlarged to a drag canvas must keep its size until the
-            // drag ends (`leave_canvas` applies the current size then).
-            if let Some(id) = self.clients[&h].surface.filter(|id| !self.in_canvas(*id)) {
-                let (w, hgt) = self.surface_size(&self.clients[&h]);
-                tasks.push(set_size(id, Some(w), Some(hgt)));
-            }
+            // `resize_if_needed` skips a drag canvas (must keep its size
+            // until the drag ends — `leave_canvas` applies the current size
+            // then) and dedupes against the last size actually sent.
+            tasks.push(self.resize_if_needed(&h));
         }
         Task::batch(tasks)
     }

@@ -188,6 +188,10 @@ impl ScreencopyHandler for AppData {
         drop(guard);
 
         if unavailable {
+            // No buffers: this session can't produce frames. Stop it so the
+            // next state change (`start_capture`) creates a fresh one instead
+            // of no-op-ing on a session stuck with `buffers = None`.
+            capture.stop();
             self.send_event(Event::CaptureUnavailable(capture.handle.clone()));
         }
     }
@@ -279,6 +283,9 @@ impl ScreencopyHandler for AppData {
                 drop(guard);
 
                 if unavailable {
+                    // Same as `init_done`: no buffers means this session is
+                    // dead; stop it so a later state change starts fresh.
+                    capture.stop();
                     self.send_event(Event::CaptureUnavailable(capture.handle.clone()));
                 }
             }
