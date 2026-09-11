@@ -8,6 +8,8 @@ use cosmic::cctk::wayland_client::{Connection, Proxy, protocol::wl_output::WlOut
 use cosmic::iced::event::wayland::{Event as WaylandEvent, LayerEvent, OutputEvent};
 use cosmic::iced::mouse;
 use cosmic::iced::core::layout::Limits;
+use cosmic::iced::platform_specific::shell::commands::corner_radius::corner_radius;
+use cosmic::iced::runtime::platform_specific::wayland::CornerRadius;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
     destroy_layer_surface, get_layer_surface, set_anchor, set_margin, set_size,
 };
@@ -290,7 +292,7 @@ impl App {
         client.placed = true;
         client.last_size = Some((width, height));
         tracing::info!(?id, x = position.0, y = position.1, width, height, "create_surface");
-        get_layer_surface(SctkLayerSurfaceSettings {
+        let create = get_layer_surface(SctkLayerSurfaceSettings {
             id,
             layer: Layer::Overlay,
             keyboard_interactivity: KeyboardInteractivity::None,
@@ -300,11 +302,20 @@ impl App {
             margin: IcedMargin { top: position.1, left: position.0, ..Default::default() },
             size: Some((Some(width), Some(height))),
             exclusive_zone: 0,
-            // Default limits cap at 1920×1080, which would clip the full-output
-            // drag canvas on larger outputs.
+            // This pinned iced ignores size_limits for layer surfaces; NONE is harmless.
             size_limits: Limits::NONE,
             ..Default::default()
-        })
+        });
+        // Ask cosmic-comp to round the surface's corners like a window
+        // (cosmic_corner_radius_layer_v1). Whether the captured subsurface is
+        // clipped too is compositor behaviour — verified by eye.
+        let r = self.config.corner_radius;
+        let round = corner_radius(
+            id,
+            Some(CornerRadius { top_left: r, top_right: r, bottom_left: r, bottom_right: r }),
+        )
+        .map(|_| unreachable!("oneshot corner_radius never produces output"));
+        Task::batch([create, round])
     }
 
     fn destroy_surface(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {

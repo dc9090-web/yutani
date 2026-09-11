@@ -118,11 +118,12 @@ pub fn view<'a>(client: &'a Client, config: &Config) -> Element<'a, Msg> {
 
     let stack = cosmic::iced::widget::stack(layers).width(Length::Fill).height(Length::Fill);
 
+    let radius = config.corner_radius as f32;
     let framed = widget::container(stack)
         .width(Length::Fill)
         .height(Length::Fill)
         .class(theme::Container::custom(move |_| widget::container::Style {
-            border: Border { color: border_color, width: border_px, radius: 4.0.into() },
+            border: Border { color: border_color, width: border_px, radius: radius.into() },
             ..Default::default()
         }));
 

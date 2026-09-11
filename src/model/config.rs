@@ -53,6 +53,8 @@ pub struct Config {
     /// Snap flush against other thumbnails while dragging.
     pub snap_edges: bool,
     pub mode: Mode,
+    /// Corner radius of each thumbnail in logical px (COSMIC window radius is 8).
+    pub corner_radius: u32,
     pub dock_edge: Edge,
 }
 
@@ -73,6 +75,7 @@ impl Default for Config {
             snap_grid: true,
             snap_edges: true,
             mode: Mode::Floating,
+            corner_radius: 8,
             dock_edge: Edge::Bottom,
         }
     }
