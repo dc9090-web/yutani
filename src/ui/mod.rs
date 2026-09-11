@@ -3,7 +3,7 @@
 
 use cosmic::cctk::sctk::shell::wlr_layer::{Anchor, KeyboardInteractivity, Layer};
 use cosmic::cctk::wayland_client::{Connection, Proxy, protocol::wl_output::WlOutput};
-use cosmic::iced::event::wayland::{Event as WaylandEvent, OutputEvent};
+use cosmic::iced::event::wayland::{Event as WaylandEvent, LayerEvent, OutputEvent};
 use cosmic::iced::mouse;
 use cosmic::iced::core::layout::Limits;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
@@ -61,6 +61,9 @@ pub struct Client {
     pub last_cursor: Point,
     /// Cursor is currently over this thumbnail; surface is zoomed.
     pub hovered: bool,
+    /// Last capture attempt for this client failed; show a placeholder
+    /// instead of a stale or absent frame.
+    pub unavailable: bool,
 }
 
 pub struct App {
@@ -117,6 +120,35 @@ impl App {
         }
     }
 
+    fn any_client_activated(&self) -> bool {
+        self.clients.values().any(|c| c.info.activated)
+    }
+
+    fn should_show(&self, client: &Client) -> bool {
+        use crate::model::config::Visibility;
+        let visible = match self.config.visibility {
+            Visibility::Always => true,
+            Visibility::EveFocusedOnly => self.any_client_activated(),
+        };
+        visible && !(self.config.hide_active && client.info.activated)
+    }
+
+    /// Make every client's surface existence match `should_show`.
+    fn reconcile_surfaces(&mut self) -> Task<cosmic::Action<Msg>> {
+        let handles: Vec<Handle> = self.clients.keys().cloned().collect();
+        let mut tasks = Vec::new();
+        for h in handles {
+            let show = self.should_show(&self.clients[&h]);
+            let has = self.clients[&h].surface.is_some();
+            if show && !has {
+                tasks.push(self.create_surface(&h));
+            } else if !show && has {
+                tasks.push(self.destroy_surface(&h));
+            }
+        }
+        Task::batch(tasks)
+    }
+
     /// Output to show a client on: the one it is on, else the first known.
     fn output_for(&self, info: &ClientInfo) -> Option<WlOutput> {
         info.outputs
@@ -147,6 +179,9 @@ impl App {
     fn create_surface(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {
         let Some(client) = self.clients.get(handle) else { return Task::none() };
         if client.surface.is_some() {
+            return Task::none();
+        }
+        if !self.should_show(client) {
             return Task::none();
         }
         let Some(output) = self.output_for(&client.info) else {
@@ -400,16 +435,19 @@ impl App {
                     pinned: false,
                     last_cursor: Point::ORIGIN,
                     hovered: false,
+                    unavailable: false,
                 });
                 let was_named = matches!(entry.info.login, Login::LoggedIn(_));
                 let had_surface = entry.surface.is_some();
                 entry.info = info;
                 let became_named = !was_named && matches!(entry.info.login, Login::LoggedIn(_));
-                let create = self.create_surface(&handle);
+                // An activation change on one client can hide/show others, so
+                // reconcile every client's surface, not just this one's.
+                let reconciled = self.reconcile_surfaces();
                 if became_named && had_surface {
-                    Task::batch([create, self.apply_saved_position(&handle)])
+                    Task::batch([reconciled, self.apply_saved_position(&handle)])
                 } else {
-                    create
+                    reconciled
                 }
             }
             Event::ClientRemoved(handle) => {
@@ -422,6 +460,7 @@ impl App {
                 let old = thumbnail::zoomed_size(&self.config, client.image.as_ref(), client.hovered);
                 let new = thumbnail::zoomed_size(&self.config, Some(&image), client.hovered);
                 client.image = Some(image);
+                client.unavailable = false;
                 let surface = client.surface;
                 match surface {
                     // While enlarged to a drag canvas the surface must keep its
@@ -434,8 +473,9 @@ impl App {
                 }
             }
             Event::CaptureUnavailable(handle) => {
-                if let Some(c) = self.clients.get(&handle) {
+                if let Some(c) = self.clients.get_mut(&handle) {
                     tracing::warn!(label = c.info.login.label(), "capture unavailable");
+                    c.unavailable = true;
                 }
                 Task::none()
             }
@@ -475,6 +515,7 @@ impl Application for App {
         match message {
             Msg::Wayland(WaylandEvent::Output(event, output)) => {
                 let had_outputs = !self.outputs.is_empty();
+                let removed = matches!(event, OutputEvent::Removed);
                 self.on_output(event, output);
                 if !had_outputs && !self.outputs.is_empty() {
                     let pending: Vec<Handle> = self
@@ -485,8 +526,26 @@ impl Application for App {
                         .collect();
                     return Task::batch(pending.iter().map(|h| self.create_surface(h)));
                 }
+                if removed {
+                    // Surfaces on the removed output will get a Layer(Done, ..);
+                    // clients whose output_for now resolves elsewhere are
+                    // recreated there.
+                    return self.reconcile_surfaces();
+                }
                 Task::none()
             }
+            Msg::Wayland(WaylandEvent::Layer(LayerEvent::Done, _, id)) => {
+                // The compositor closed this surface (its output went away).
+                if let Some(handle) = self.client_for_surface(id) {
+                    tracing::info!("layer surface closed by compositor; recreating");
+                    if let Some(c) = self.clients.get_mut(&handle) {
+                        c.surface = None;
+                    }
+                    return self.reconcile_surfaces();
+                }
+                Task::none()
+            }
+            Msg::Wayland(WaylandEvent::Layer(..)) => Task::none(),
             Msg::Wayland(_) => Task::none(),
             Msg::Backend(event) => self.on_backend(event),
             Msg::Pointer(id, event) => self.on_pointer(id, event),
@@ -496,7 +555,7 @@ impl Application for App {
     fn subscription(&self) -> Subscription<Msg> {
         let events = iced::event::listen_with(|event, _status, id| match event {
             iced::Event::PlatformSpecific(iced::event::PlatformSpecific::Wayland(
-                event @ WaylandEvent::Output(..),
+                event @ (WaylandEvent::Output(..) | WaylandEvent::Layer(..)),
             )) => Some(Msg::Wayland(event)),
             iced::Event::Mouse(m) => Some(Msg::Pointer(id, m)),
             // Every other event (RequestResize, Frame, keyboard, …) must not become

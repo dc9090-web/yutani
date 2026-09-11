@@ -47,17 +47,27 @@ pub fn view<'a>(client: &'a Client, config: &Config) -> Element<'a, Msg> {
     let border_color = cosmic::iced::Color { r, g, b, a };
     let border_px = config.border_px as f32;
 
-    let image: Element<'a, Msg> = match &client.image {
-        Some(img) => Subsurface::new(img.buffer.clone())
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .content_fit(ContentFit::Contain)
-            .alpha(config.opacity)
-            .transform(img.transform)
-            .into(),
-        None => widget::container(widget::text("waiting for frame…").size(12))
+    let image: Element<'a, Msg> = if client.unavailable {
+        widget::container(widget::text("capture unavailable").size(12))
             .center(Length::Fill)
-            .into(),
+            .class(theme::Container::custom(|_| widget::container::Style {
+                background: Some(cosmic::iced::Background::Color(cosmic::iced::Color { r: 0.25, g: 0.25, b: 0.25, a: 0.9 })),
+                ..Default::default()
+            }))
+            .into()
+    } else {
+        match &client.image {
+            Some(img) => Subsurface::new(img.buffer.clone())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .content_fit(ContentFit::Contain)
+                .alpha(config.opacity)
+                .transform(img.transform)
+                .into(),
+            None => widget::container(widget::text("waiting for frame…").size(12))
+                .center(Length::Fill)
+                .into(),
+        }
     };
 
     let mut layers: Vec<Element<'a, Msg>> = vec![image];
