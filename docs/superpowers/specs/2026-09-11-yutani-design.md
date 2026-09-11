@@ -225,7 +225,9 @@ Per EVE client, in the compositor thread:
 
 Capture continues for the active client (it is shown in the dock) unless
 `hide_active` is on, in which case its session is paused (no captures
-submitted), not destroyed.
+submitted), not destroyed. *Status after plan 2:* not yet implemented —
+hidden clients keep capturing (cheap with zero-copy); to be done together
+with tray Hide in plan 3.
 
 ## 6. UI
 
@@ -377,6 +379,9 @@ drag, pin, or order change:
 
 Outputs are referenced by connector name. If a layout names an output that
 is not connected, those thumbnails use the primary output at the same x/y.
+*Status after plan 2:* `output` is saved but not yet used for placement (the
+client's own output is used); `order` and `new_client_anchor` are not yet
+written. Both land with named layouts in plan 4.
 Applying a named layout copies it to `current.ron`.
 
 ## 10. Errors and logging
