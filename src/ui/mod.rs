@@ -526,13 +526,17 @@ impl Application for App {
             return;
         }
         let Some(client) = self.clients.values().find(|c| c.surface == Some(id)) else { return };
-        let (thumb_w, _) = thumbnail::size(&self.config, client.image.as_ref());
-        tracing::debug!(?id, width, height, thumb_w, "drag: resize while arming");
-        // Ignore configures that are not the enlargement (e.g. a late
-        // thumbnail-size ack); the canvas is at least twice a thumbnail wide.
-        if width >= 2.0 * thumb_w as f32 {
+        // Any configure wider than every possible thumbnail size (unzoomed or zoomed)
+        // must be the full-output canvas. Ignore resizes to zoomed thumbnail size.
+        let unzoomed = thumbnail::zoomed_size(&self.config, client.image.as_ref(), false).0 as f32;
+        let zoomed = thumbnail::zoomed_size(&self.config, client.image.as_ref(), true).0 as f32;
+        let largest_thumb = unzoomed.max(zoomed);
+        tracing::debug!(?id, width, height, unzoomed, zoomed, largest_thumb, "drag: resize while arming");
+        if width > largest_thumb + 1.0 {
             pointer::on_armed(drag, (width as i32, height as i32));
             tracing::debug!(?id, canvas = ?drag.canvas, "drag: armed");
+        } else {
+            tracing::debug!(width, largest_thumb, "drag: resize while arming (thumbnail-sized ack, ignoring)");
         }
     }
 
