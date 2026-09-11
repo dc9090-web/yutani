@@ -48,6 +48,38 @@ title is `EVE Launcher`; the client's title is `EVE` before login and
 
 Rust toolchain: stable via rustup (1.98 at time of writing).
 
+## 2a. Supported launch configuration (primary target)
+
+Yutani **must** work with EVE launched from **Steam** using **Proton**
+(GE-Proton or Valve Proton), with `PROTON_ENABLE_WAYLAND=1 %command%` in the
+game's launch options so the client is a native Wayland window. This is the
+configuration on the target machine and the reason the project exists.
+
+Concretely:
+
+- Steam sets `app_id = "steam_app_8500"` on every window of the game,
+  launcher and client alike; that is the default detection key.
+- The launcher (`EVE Launcher`) is excluded by title; each client window is
+  `EVE` then `EVE - <Character Name>`.
+- Multiple clients started from one launcher are separate toplevels with the
+  same `app_id`; they are told apart by toplevel handle and, once logged in,
+  by character name.
+- The same Steam + Proton setup **without** `PROTON_ENABLE_WAYLAND` (an
+  XWayland window) must also work: cosmic-comp exposes XWayland windows
+  through the same toplevel and capture protocols, so no code path differs.
+  This is verified, not assumed, in the acceptance checklist below.
+
+Acceptance checklist (run before v1 is called done):
+
+1. Steam + GE-Proton + `PROTON_ENABLE_WAYLAND=1`, one client → thumbnail
+   appears at login screen, name resolves after character load, click
+   focuses, hotkey focuses.
+2. Same, two clients from the same launcher → two thumbnails, correct names,
+   active border follows focus, `next`/`prev` cycle.
+3. Same as 1 with the launch option removed (XWayland) → identical behaviour.
+4. Client goes fullscreen → thumbnails still visible above it.
+5. Client closes → its thumbnail disappears; relaunch → same saved position.
+
 ## 3. Architecture
 
 One binary, `yutani`, with three roles:
