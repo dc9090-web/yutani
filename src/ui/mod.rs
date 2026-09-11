@@ -101,6 +101,11 @@ impl App {
             Event::ClientRemoved(handle) => {
                 self.clients.remove(&handle);
             }
+            Event::Frame(handle, image) => {
+                if let Some(client) = self.clients.get(&handle) {
+                    tracing::debug!(label = client.info.login.label(), w = image.width, h = image.height, "frame");
+                }
+            }
         }
         Task::none()
     }

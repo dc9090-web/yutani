@@ -18,16 +18,33 @@ use cosmic::cctk::{
     wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
 };
 use cosmic::cctk::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::State;
+use cosmic::cctk::{
+    screencopy::ScreencopyState,
+    sctk::{
+        dmabuf::{DmabufFeedback, DmabufState},
+        shm::{Shm, ShmHandler},
+    },
+    wayland_client::protocol::wl_output,
+};
+use cosmic::iced::futures::executor::ThreadPool;
+use cosmic::iced::platform_specific::shell::subsurface_widget::SubsurfaceBuffer;
 use cosmic::iced::{
     self,
     futures::{FutureExt, SinkExt, channel::mpsc, executor::block_on},
 };
 use calloop_wayland_source::WaylandSource;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::{hash::Hash, thread};
 
 use crate::model::client::{Login, classify};
 
 mod toplevels;
+mod buffer;
+mod capture;
+mod dmabuf;
+mod gbm_devices;
 
 pub type Handle = ExtForeignToplevelHandleV1;
 
@@ -40,12 +57,21 @@ pub struct ClientInfo {
 }
 
 #[derive(Clone, Debug)]
+pub struct CaptureImage {
+    pub buffer: SubsurfaceBuffer,
+    pub width: u32,
+    pub height: u32,
+    pub transform: wl_output::Transform,
+}
+
+#[derive(Clone, Debug)]
 pub enum Event {
     /// Sent once at startup so the UI can send commands.
     CmdSender(calloop::channel::Sender<Cmd>),
     ClientAdded(Handle, ClientInfo),
     ClientUpdated(Handle, ClientInfo),
     ClientRemoved(Handle),
+    Frame(Handle, CaptureImage),
 }
 
 #[derive(Debug)]
@@ -89,9 +115,16 @@ pub struct AppData {
     pub seat_state: SeatState,
     pub toplevel_info_state: ToplevelInfoState,
     pub toplevel_manager_state: Option<ToplevelManagerState>,
+    pub screencopy_state: ScreencopyState,
+    pub dmabuf_state: DmabufState,
+    pub dmabuf_feedback: Option<DmabufFeedback>,
+    pub gbm_devices: gbm_devices::GbmDevices,
+    pub shm_state: Shm,
+    pub captures: HashMap<Handle, Arc<capture::Capture>>,
+    pub thread_pool: ThreadPool,
     pub sender: mpsc::Sender<Event>,
     pub app_ids: Vec<String>,
-    pub fps: u32,
+    pub fps: Arc<AtomicU32>,
 }
 
 impl AppData {
@@ -139,7 +172,7 @@ impl AppData {
                 self.reclassify_all();
             }
             Cmd::SetFps(fps) => {
-                self.fps = fps;
+                self.fps.store(fps, Ordering::Relaxed);
             }
         }
     }
@@ -154,16 +187,27 @@ fn start(conn: Connection, app_ids: Vec<String>, fps: u32) -> mpsc::Receiver<Eve
     thread::Builder::new()
         .name("yutani-backend".into())
         .spawn(move || {
+            let dmabuf_state = DmabufState::new(&globals, &qh);
+            if let Err(err) = dmabuf_state.get_default_feedback(&qh) {
+                tracing::warn!("dmabuf feedback unsupported; shm only: {err}");
+            }
             let registry_state = RegistryState::new(&globals);
             let mut app_data = AppData {
                 qh: qh.clone(),
                 seat_state: SeatState::new(&globals, &qh),
                 toplevel_info_state: ToplevelInfoState::new(&registry_state, &qh),
                 toplevel_manager_state: ToplevelManagerState::try_new(&registry_state, &qh),
+                screencopy_state: ScreencopyState::new(&globals, &qh),
+                dmabuf_state,
+                dmabuf_feedback: None,
+                gbm_devices: gbm_devices::GbmDevices::default(),
+                shm_state: Shm::bind(&globals, &qh).expect("wl_shm"),
+                captures: HashMap::new(),
+                thread_pool: ThreadPool::builder().pool_size(1).create().expect("thread pool"),
                 registry_state,
                 sender,
                 app_ids,
-                fps,
+                fps: Arc::new(AtomicU32::new(fps)),
             };
 
             let (cmd_sender, cmd_channel) = calloop::channel::channel();
@@ -228,3 +272,11 @@ impl SeatHandler for AppData {
 
 cctk::sctk::delegate_registry!(AppData);
 cctk::sctk::delegate_seat!(AppData);
+
+impl ShmHandler for AppData {
+    fn shm_state(&mut self) -> &mut Shm {
+        &mut self.shm_state
+    }
+}
+
+cctk::sctk::delegate_shm!(AppData);

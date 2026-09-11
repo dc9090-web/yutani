@@ -21,8 +21,14 @@ impl AppData {
             .collect();
         for (handle, info) in infos {
             match self.client_info(&info) {
-                Some(client) => self.send_event(Event::ClientAdded(handle, client)),
-                None => self.send_event(Event::ClientRemoved(handle)),
+                Some(client) => {
+                    self.start_capture(&handle);
+                    self.send_event(Event::ClientAdded(handle.clone(), client));
+                }
+                None => {
+                    self.stop_capture(&handle);
+                    self.send_event(Event::ClientRemoved(handle));
+                }
             }
         }
     }
@@ -38,6 +44,7 @@ impl ToplevelInfoHandler for AppData {
         if let Some(client) = self.client_info(&info) {
             tracing::info!(title = %info.title, "client added");
             self.send_event(Event::ClientAdded(handle.clone(), client));
+            self.start_capture(handle);
         }
     }
 
@@ -46,15 +53,19 @@ impl ToplevelInfoHandler for AppData {
         match self.client_info(&info) {
             Some(client) => {
                 tracing::debug!(title = %info.title, activated = client.activated, "client updated");
-                // The UI treats Updated for an unknown handle as Added.
                 self.send_event(Event::ClientUpdated(handle.clone(), client));
+                self.start_capture(handle);
             }
-            None => self.send_event(Event::ClientRemoved(handle.clone())),
+            None => {
+                self.stop_capture(handle);
+                self.send_event(Event::ClientRemoved(handle.clone()));
+            }
         }
     }
 
     fn toplevel_closed(&mut self, _: &Connection, _: &QueueHandle<Self>, handle: &Handle) {
         tracing::info!("toplevel closed");
+        self.stop_capture(handle);
         self.send_event(Event::ClientRemoved(handle.clone()));
     }
 }
