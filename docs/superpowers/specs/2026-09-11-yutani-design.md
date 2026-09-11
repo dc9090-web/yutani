@@ -74,6 +74,13 @@ Concretely:
   through the same toplevel and capture protocols, so no code path differs.
   This is verified, not assumed, in the acceptance checklist below.
 
+Recommended in-game setting: **Window Mode = Fixed Window** (borderless).
+In plain windowed mode Wine draws client-side decorations (title bar and
+frame) that are part of the captured surface and therefore appear in the
+thumbnail; Fixed Window removes them (verified 2026-09-11). A source-crop
+option (`wp_viewport.set_source`) is a plan-2 candidate for users who keep
+decorations — it needs a small patch to libcosmic's `Subsurface` widget.
+
 Acceptance checklist (run before v1 is called done):
 
 1. Steam + GE-Proton + `PROTON_ENABLE_WAYLAND=1`, one client → thumbnail
@@ -391,5 +398,6 @@ Applying a named layout copies it to `current.ron`.
 ## 12. Out of scope for v1 (candidates for later)
 
 Persistent per-character hotkeys, hide-when-overlapped via
-`zcosmic_overlap_notify`, per-thumbnail opacity, scroll-to-resize, a COSMIC
+`zcosmic_overlap_notify`, per-thumbnail opacity, scroll-to-resize, source
+crop insets (needs libcosmic `Subsurface` source-rect support), a COSMIC
 panel applet, other compositors.
