@@ -5,15 +5,16 @@ use cosmic::cctk::sctk::shell::wlr_layer::{Anchor, KeyboardInteractivity, Layer}
 use cosmic::cctk::wayland_client::{Connection, Proxy, protocol::wl_output::WlOutput};
 use cosmic::iced::event::wayland::{Event as WaylandEvent, OutputEvent};
 use cosmic::iced::mouse;
+use cosmic::iced::core::layout::Limits;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
-    destroy_layer_surface, get_layer_surface, set_margin, set_size,
+    destroy_layer_surface, get_layer_surface, set_anchor, set_margin, set_size,
 };
 use cosmic::iced::runtime::platform_specific::wayland::layer_surface::{
     IcedMargin, IcedOutput, SctkLayerSurfaceSettings,
 };
 use cosmic::iced::window::Id as SurfaceId;
-use cosmic::iced::{self, Point, Subscription};
-use cosmic::{Application, Element, Task};
+use cosmic::iced::{self, Length, Point, Subscription};
+use cosmic::{Application, Element, Task, widget};
 use std::collections::HashMap;
 
 use crate::backend::{self, CaptureImage, ClientInfo, Cmd, Event, Handle};
@@ -169,13 +170,23 @@ impl App {
             margin: IcedMargin { top: position.1, left: position.0, ..Default::default() },
             size: Some((Some(width), Some(height))),
             exclusive_zone: 0,
+            // Default limits cap at 1920×1080, which would clip the full-output
+            // drag canvas on larger outputs.
+            size_limits: Limits::NONE,
             ..Default::default()
         })
     }
 
     fn destroy_surface(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {
         match self.clients.get_mut(handle).and_then(|c| c.surface.take()) {
-            Some(id) => destroy_layer_surface(id),
+            Some(id) => {
+                // A drag on a surface that goes away must not linger and block
+                // future drags.
+                if self.drag.as_ref().is_some_and(|d| d.surface == id) {
+                    self.drag = None;
+                }
+                destroy_layer_surface(id)
+            }
             None => Task::none(),
         }
     }
@@ -225,6 +236,34 @@ impl App {
         }
     }
 
+    /// Enlarge the surface to cover its whole output so that, while dragging,
+    /// surface-local pointer coordinates are absolute. The surface itself no
+    /// longer moves; `view_window` draws the thumbnail at `client.position`.
+    fn enter_canvas(id: SurfaceId) -> Task<cosmic::Action<Msg>> {
+        Task::batch([
+            set_anchor(id, Anchor::all()),
+            set_margin(id, 0, 0, 0, 0),
+            set_size(id, None, None),
+        ])
+    }
+
+    /// Undo `enter_canvas`: back to a thumbnail-sized surface at the client's
+    /// current position. Order matters: anchor, size, margin.
+    fn leave_canvas(&self, id: SurfaceId, client: &Client) -> Task<cosmic::Action<Msg>> {
+        let (w, h) = thumbnail::size(&self.config, client.image.as_ref());
+        let (x, y) = client.position;
+        Task::batch([
+            set_anchor(id, Anchor::TOP | Anchor::LEFT),
+            set_size(id, Some(w), Some(h)),
+            set_margin(id, y, 0, 0, x),
+        ])
+    }
+
+    /// True while `id` is enlarged to a drag canvas (any phase).
+    fn in_canvas(&self, id: SurfaceId) -> bool {
+        self.drag.as_ref().is_some_and(|d| d.surface == id && !d.pinned)
+    }
+
     fn on_pointer(&mut self, id: SurfaceId, event: mouse::Event) -> Task<cosmic::Action<Msg>> {
         let Some(handle) = self.client_for_surface(id) else { return Task::none() };
         match event {
@@ -236,23 +275,32 @@ impl App {
                 Task::none()
             }
             mouse::Event::ButtonPressed(button) => {
-                if self.drag.is_none() {
-                    let c = &self.clients[&handle];
-                    // Position of the cursor at press time is not part of ButtonPressed;
-                    // use the last CursorMoved we saw for this surface.
-                    let cursor = c.last_cursor;
-                    self.drag = pointer::on_press(id, button, cursor, c.position, c.pinned);
+                if self.drag.is_some() {
+                    return Task::none();
                 }
-                Task::none()
+                let c = &self.clients[&handle];
+                // Position of the cursor at press time is not part of ButtonPressed;
+                // use the last CursorMoved we saw for this surface. The surface is
+                // still thumbnail-sized here, so local + position is absolute.
+                let cursor = c.last_cursor;
+                self.drag = pointer::on_press(id, button, cursor, c.position, c.pinned);
+                match &self.drag {
+                    // Pinned thumbnails only click; no need to enlarge.
+                    Some(d) if !d.pinned => {
+                        tracing::debug!(?id, press_abs = ?d.press_abs, "drag: arming canvas");
+                        Self::enter_canvas(id)
+                    }
+                    _ => Task::none(),
+                }
             }
             mouse::Event::CursorMoved { position } => {
                 if let Some(c) = self.clients.get_mut(&handle) {
                     c.last_cursor = position;
                 }
                 let Some(drag) = self.drag.as_mut().filter(|d| d.surface == id) else { return Task::none() };
-                let current = self.clients[&handle].position;
-                match pointer::on_move(drag, position, current) {
+                match pointer::on_move(drag, position) {
                     pointer::Outcome::Move(raw) => {
+                        let canvas = drag.canvas;
                         let me = self.rect_of(&self.clients[&handle]);
                         let others: Vec<Rect> = self
                             .clients
@@ -263,19 +311,12 @@ impl App {
                         let grid = self.config.snap_grid.then_some(32);
                         let edges = self.config.snap_edges.then_some(12);
                         let (x, y) = layout::snap(Rect { x: raw.0, y: raw.1, ..me }, &others, grid, edges);
-                        let (x, y) = (x.max(0), y.max(0));
-                        let (w, h) = (me.w, me.h);
-                        let output_size = self
-                            .output_for(&self.clients[&handle].info)
-                            .and_then(|o| self.outputs.iter().find(|out| out.handle == o).map(|out| out.logical_size));
-                        let (x, y) = match output_size {
-                            Some((ow, oh)) if ow > 0 && oh > 0 => {
-                                (x.min((ow - w).max(0)), y.min((oh - h).max(0)))
-                            }
-                            _ => (x, y),
-                        };
+                        // Keep the thumbnail fully inside the canvas (== the output).
+                        let x = x.clamp(0, (canvas.0 - me.w).max(0));
+                        let y = y.clamp(0, (canvas.1 - me.h).max(0));
                         self.clients.get_mut(&handle).unwrap().position = (x, y);
-                        set_margin(id, y, 0, 0, x)
+                        // No set_margin: the surface stays put; the view draws the offset.
+                        Task::none()
                     }
                     _ => Task::none(),
                 }
@@ -285,17 +326,24 @@ impl App {
                     return Task::none();
                 }
                 let drag = self.drag.take().unwrap();
+                let was_canvas = !drag.pinned;
                 match pointer::on_release(drag) {
                     pointer::Outcome::Click(mouse::Button::Left) => {
-                        self.send(Cmd::Activate(handle));
+                        self.send(Cmd::Activate(handle.clone()));
                     }
                     pointer::Outcome::Click(mouse::Button::Right) => {
-                        self.send(Cmd::Minimize(handle));
+                        self.send(Cmd::Minimize(handle.clone()));
                     }
                     pointer::Outcome::DragEnd => self.persist_position(&handle),
                     _ => {}
                 }
-                Task::none()
+                if was_canvas {
+                    let client = &self.clients[&handle];
+                    tracing::debug!(?id, pos = ?client.position, "drag: leaving canvas");
+                    self.leave_canvas(id, client)
+                } else {
+                    Task::none()
+                }
             }
             mouse::Event::CursorLeft => {
                 // Releasing outside is delivered to us anyway (implicit grab); nothing to do.
@@ -341,8 +389,13 @@ impl App {
                 let old = thumbnail::size(&self.config, client.image.as_ref());
                 let new = thumbnail::size(&self.config, Some(&image));
                 client.image = Some(image);
-                match client.surface {
-                    Some(id) if old != new => set_size(id, Some(new.0), Some(new.1)),
+                let surface = client.surface;
+                match surface {
+                    // While enlarged to a drag canvas the surface must keep its
+                    // size; `leave_canvas` applies the current size on release.
+                    Some(id) if old != new && !self.in_canvas(id) => {
+                        set_size(id, Some(new.0), Some(new.1))
+                    }
                     Some(_) => Task::none(),
                     None => self.create_surface(&handle),
                 }
@@ -431,10 +484,45 @@ impl Application for App {
         unreachable!("no main window")
     }
 
+    /// Layer-surface configures arrive here. A drag starts by enlarging the
+    /// surface to the output; only once that is confirmed are pointer
+    /// coordinates absolute and motion may be applied.
+    fn on_window_resize(&mut self, id: SurfaceId, width: f32, height: f32) {
+        let Some(drag) = self.drag.as_mut().filter(|d| d.surface == id) else { return };
+        if drag.phase != pointer::Phase::Arming || drag.pinned {
+            return;
+        }
+        let Some(client) = self.clients.values().find(|c| c.surface == Some(id)) else { return };
+        let (thumb_w, _) = thumbnail::size(&self.config, client.image.as_ref());
+        tracing::debug!(?id, width, height, thumb_w, "drag: resize while arming");
+        // Ignore configures that are not the enlargement (e.g. a late
+        // thumbnail-size ack); the canvas is at least twice a thumbnail wide.
+        if width >= 2.0 * thumb_w as f32 {
+            pointer::on_armed(drag, (width as i32, height as i32));
+            tracing::debug!(?id, canvas = ?drag.canvas, "drag: armed");
+        }
+    }
+
     fn view_window(&self, id: SurfaceId) -> Element<'_, Msg> {
-        match self.clients.iter().find(|(_, c)| c.surface == Some(id)) {
-            Some((_, client)) => thumbnail::view(client, &self.config),
-            None => cosmic::widget::text("").into(),
+        let Some((_, client)) = self.clients.iter().find(|(_, c)| c.surface == Some(id)) else {
+            return widget::text("").into();
+        };
+        if self.in_canvas(id) {
+            // Full-output canvas: draw the thumbnail at its position inside it.
+            let (w, h) = thumbnail::size(&self.config, client.image.as_ref());
+            let (x, y) = client.position;
+            widget::container(
+                widget::container(thumbnail::view(client, &self.config))
+                    .width(Length::Fixed(w as f32))
+                    .height(Length::Fixed(h as f32)),
+            )
+            // top, right, bottom, left
+            .padding([y as f32, 0.0, 0.0, x as f32])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+        } else {
+            thumbnail::view(client, &self.config)
         }
     }
 }
