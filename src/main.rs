@@ -1,4 +1,5 @@
 mod doctor;
+mod model;
 
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
