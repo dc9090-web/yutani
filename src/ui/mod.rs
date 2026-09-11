@@ -1,7 +1,7 @@
-//! libcosmic application: no main window. Floating mode: one overlay layer
-//! surface per EVE client, each showing that client's live captured frame.
-//! Dock mode: one strip per output along `dock_edge` holding every shown
-//! client's thumbnail (see `dock`).
+//! libcosmic application: no main window. One overlay layer surface per
+//! shown EVE client, each showing that client's live captured frame.
+//! Floating mode: the user places them (drag/pin/persist). Dock mode: the
+//! same surfaces, auto-arranged and centred along `dock_edge` (see `dock`).
 
 use cosmic::cctk::sctk::shell::wlr_layer::{Anchor, KeyboardInteractivity, Layer};
 use cosmic::cctk::wayland_client::{Connection, Proxy, protocol::wl_output::WlOutput};
@@ -19,7 +19,7 @@ use cosmic::iced::runtime::platform_specific::wayland::layer_surface::{
 use cosmic::iced::window::Id as SurfaceId;
 use cosmic::iced::{self, Length, Point, Subscription};
 use cosmic::{Application, Element, Task, widget};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::backend::{self, CaptureImage, ClientInfo, Cmd, Event, Handle};
 use crate::model::client::Login;
@@ -79,8 +79,9 @@ pub struct Client {
     /// Last size sent via `set_size` (or the surface's creation size), so a
     /// resize to the same size can be skipped.
     pub last_size: Option<(u32, u32)>,
-    /// Dock mode: this client is currently in a dock strip.
-    pub docked: bool,
+    /// The current `corner_radius` has been requested for this surface
+    /// (see `round_surface`).
+    pub rounded: bool,
     /// Backend capture is paused for this client (last command we sent).
     /// Pause/resume is an edge on this, not on whether a surface exists, so
     /// a client born hidden is paused too.
@@ -99,8 +100,6 @@ pub struct App {
     /// Tray-toggled visibility: when true, no thumbnail is shown regardless
     /// of `Visibility`/`hide_active`. Set by the tray icon (Task 3).
     pub hidden: bool,
-    /// Dock mode: one strip per output that has at least one shown client.
-    pub docks: Vec<dock::DockSurface>,
 }
 
 #[derive(Clone, Debug)]
@@ -110,7 +109,9 @@ pub enum Msg {
     Pointer(SurfaceId, mouse::Event),
     ConfigChanged(Config),
     Tray(tray::TrayEvent),
-    Dock(dock::DockMsg),
+    /// A surface is about to present a frame (`window::Event::RedrawRequested`);
+    /// only subscribed to while some surface still awaits its corner radius.
+    Redrawn(SurfaceId),
 }
 
 impl App {
@@ -176,58 +177,24 @@ impl App {
         }
     }
 
-    /// Make what is on screen match `config.mode` and `should_show`.
-    ///
-    /// Floating: every shown client has its own surface. Dock: no per-client
-    /// surfaces; every output with a shown client has a strip. Capture is
-    /// paused for a client when it should not be shown in either sense and
-    /// resumed when it should (see `sync_capture`); switching modes alone
-    /// never pauses, since the client stays shown — just somewhere else.
+    /// Make what is on screen match `should_show`: every shown client has a
+    /// surface, no other client does. Capture is paused for a client when it
+    /// should not be shown and resumed when it should (see `sync_capture`).
+    /// In dock mode the surviving surfaces are then re-laid out along the
+    /// edge, since the set on each output may have changed.
     fn reconcile_surfaces(&mut self) -> Task<cosmic::Action<Msg>> {
         let handles: Vec<Handle> = self.clients.keys().cloned().collect();
         let mut tasks = Vec::new();
-        match self.config.mode {
-            Mode::Floating => {
-                tasks.push(self.destroy_docks());
-                for h in handles {
-                    let show = self.should_show(&self.clients[&h]);
-                    let c = self.clients.get_mut(&h).unwrap();
-                    if c.docked {
-                        // Leaving dock mode: this thumbnail's strip widget is
-                        // gone and its `on_exit` never fires; don't let it
-                        // come back zoomed as a floating surface.
-                        c.hovered = false;
-                    }
-                    c.docked = false;
-                    self.sync_capture(&h, show);
-                    if show && self.clients[&h].surface.is_none() {
-                        tasks.push(self.create_surface(&h));
-                    } else if !show && self.clients[&h].surface.is_some() {
-                        tasks.push(self.destroy_surface(&h));
-                    }
-                }
-            }
-            Mode::Dock => {
-                let docked: HashSet<Handle> =
-                    self.outputs.iter().flat_map(|o| self.dock_order_for(&o.handle)).collect();
-                for h in handles {
-                    // Leaving floating mode: the per-client surface goes; the
-                    // client is still shown (in the strip), so `sync_capture`
-                    // sends nothing for it.
-                    tasks.push(self.destroy_surface(&h));
-                    let show = docked.contains(&h);
-                    let c = self.clients.get_mut(&h).unwrap();
-                    c.docked = show;
-                    if !show {
-                        // A thumbnail that vanishes from the strip never gets
-                        // its `on_exit`; don't let it come back zoomed.
-                        c.hovered = false;
-                    }
-                    self.sync_capture(&h, show);
-                }
-                tasks.push(self.reconcile_docks());
+        for h in handles {
+            let show = self.should_show(&self.clients[&h]);
+            self.sync_capture(&h, show);
+            if show && self.clients[&h].surface.is_none() {
+                tasks.push(self.create_surface(&h));
+            } else if !show && self.clients[&h].surface.is_some() {
+                tasks.push(self.destroy_surface(&h));
             }
         }
+        tasks.push(self.relayout_dock());
         Task::batch(tasks)
     }
 
@@ -258,38 +225,55 @@ impl App {
         thumbnail::zoomed_size(&self.config, client.image.as_ref(), client.hovered)
     }
 
+    /// Floating position for `handle`: this client's own previous placement
+    /// (destroy+recreate cycles like hide_active, EveFocusedOnly, or output
+    /// loss should put the thumbnail back where it was even if never
+    /// persisted); otherwise a saved position for this character; otherwise
+    /// the next free slot.
+    fn floating_position(&self, handle: &Handle) -> ((i32, i32), bool) {
+        let client = &self.clients[handle];
+        let saved = match &client.info.login {
+            Login::LoggedIn(name) => self.layout.thumbs.get(name).cloned(),
+            Login::LoggingIn => None,
+        };
+        rules::choose_position(
+            client.placed.then_some((client.position, client.pinned)),
+            saved.as_ref(),
+            self.next_position(),
+        )
+    }
+
     fn create_surface(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {
         let Some(client) = self.clients.get(handle) else { return Task::none() };
-        if client.surface.is_some() {
-            return Task::none();
-        }
-        if !self.should_show(client) || self.config.mode == Mode::Dock {
+        if client.surface.is_some() || !self.should_show(client) {
             return Task::none();
         }
         let Some(output) = self.output_for(&client.info) else {
             tracing::debug!("no outputs yet; deferring surface");
             return Task::none();
         };
-        // Prefer this client's own previous placement (destroy+recreate cycles
-        // like hide_active, EveFocusedOnly, or output loss should put the
-        // thumbnail back where it was even if never persisted); otherwise a
-        // saved position for this character; otherwise the next free slot.
-        let saved = match &client.info.login {
-            Login::LoggedIn(name) => self.layout.thumbs.get(name).cloned(),
-            Login::LoggingIn => None,
-        };
-        let (position, pinned) = rules::choose_position(
-            client.placed.then_some((client.position, client.pinned)),
-            saved.as_ref(),
-            self.next_position(),
-        );
         let (width, height) = self.surface_size(client);
         let id = SurfaceId::unique();
+        let position = match self.config.mode {
+            Mode::Floating => {
+                let (position, pinned) = self.floating_position(handle);
+                let client = self.clients.get_mut(handle).unwrap();
+                client.pinned = pinned;
+                client.placed = true;
+                position
+            }
+            Mode::Dock => {
+                // Register the surface first so the layout counts this
+                // client among its output's docked ones. `placed` stays
+                // false: dock coordinates must never be reused as floating
+                // ones.
+                self.clients.get_mut(handle).unwrap().surface = Some(id);
+                self.dock_position_of(handle)
+            }
+        };
         let client = self.clients.get_mut(handle).unwrap();
         client.surface = Some(id);
         client.position = position;
-        client.pinned = pinned;
-        client.placed = true;
         client.last_size = Some((width, height));
         tracing::info!(?id, x = position.0, y = position.1, width, height, "create_surface");
         let create = get_layer_surface(SctkLayerSurfaceSettings {
@@ -306,16 +290,36 @@ impl App {
             size_limits: Limits::NONE,
             ..Default::default()
         });
-        // Ask cosmic-comp to round the surface's corners like a window
-        // (cosmic_corner_radius_layer_v1). Whether the captured subsurface is
-        // clipped too is compositor behaviour — verified by eye.
+        // Corner rounding is requested later, once the surface has
+        // presented a frame: see `round_surface`.
+        create
+    }
+
+    /// Any surface still waiting for its corner radius (see `round_surface`).
+    fn awaiting_radius(&self) -> bool {
+        self.clients.values().any(|c| c.surface.is_some() && !c.rounded)
+    }
+
+    /// `id` has just presented a frame: ask cosmic-comp to round its corners
+    /// (cosmic_corner_radius_layer_v1) if not done yet at the current
+    /// `corner_radius`. Not at creation: cosmic-comp 1.7 validates the radius
+    /// against the surface's *current* bounding box at the next commit, which
+    /// is 0×0 until a buffer has landed, so a radius requested before the
+    /// first frame is a fatal `radius_too_large` protocol error. iced
+    /// broadcasts `RedrawRequested` right before it presents, and this
+    /// message is handled afterwards, so our request is ordered after that
+    /// commit on the wire. The captured subsurface is clipped too —
+    /// compositor behaviour, verified by eye.
+    fn round_surface(&mut self, id: SurfaceId) -> Task<cosmic::Action<Msg>> {
+        let Some(c) = self.clients.values_mut().find(|c| c.surface == Some(id)) else { return Task::none() };
+        if c.rounded {
+            return Task::none();
+        }
+        c.rounded = true;
         let r = self.config.corner_radius;
-        let round = corner_radius(
-            id,
-            Some(CornerRadius { top_left: r, top_right: r, bottom_left: r, bottom_right: r }),
-        )
-        .map(|_| unreachable!("oneshot corner_radius never produces output"));
-        Task::batch([create, round])
+        tracing::info!(?id, r, "corner_radius");
+        corner_radius(id, Some(CornerRadius { top_left: r, top_right: r, bottom_left: r, bottom_right: r }))
+            .map(|_| unreachable!("oneshot corner_radius never produces output"))
     }
 
     fn destroy_surface(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {
@@ -341,6 +345,7 @@ impl App {
         if let Some(c) = self.clients.get_mut(handle) {
             c.hovered = false;
             c.last_cursor = Point::ORIGIN;
+            c.rounded = false;
         }
         Some(id)
     }
@@ -359,8 +364,12 @@ impl App {
             .and_then(|o| self.outputs.iter().find(|k| k.handle == o).map(|k| k.name.clone()))
     }
 
-    /// Remember this client's position (and pin state) under its character name.
+    /// Remember this client's position (and pin state) under its character
+    /// name. Floating only: dock positions come from the layout.
     fn persist_position(&mut self, handle: &Handle) {
+        if self.config.mode == Mode::Dock {
+            return;
+        }
         let Some(client) = self.clients.get(handle) else { return };
         let Login::LoggedIn(name) = &client.info.login else {
             tracing::debug!("position not saved: character name not resolved yet");
@@ -376,8 +385,12 @@ impl App {
         }
     }
 
-    /// If we have a saved position for this character, move there.
+    /// If we have a saved position for this character, move there. Floating
+    /// only: in dock mode the saved spot applies when (if) the mode changes.
     fn apply_saved_position(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {
+        if self.config.mode == Mode::Dock {
+            return Task::none();
+        }
         let Some(client) = self.clients.get(handle) else { return Task::none() };
         let Login::LoggedIn(name) = &client.info.login else { return Task::none() };
         let Some(saved) = self.layout.thumbs.get(name).cloned() else { return Task::none() };
@@ -391,6 +404,29 @@ impl App {
             Some(id) if !self.in_canvas(id) => set_margin(id, saved.y, 0, 0, saved.x),
             _ => Task::none(),
         }
+    }
+
+    /// Leaving dock mode: every surface goes back to a floating spot — the
+    /// character's saved position, else the next free slot. `placed` was
+    /// cleared on entering dock mode, so dock coordinates are never reused.
+    /// Handles are visited in dock order so slot assignment is deterministic.
+    fn refloat_surfaces(&mut self) -> Task<cosmic::Action<Msg>> {
+        let with_surface = self.clients.iter().filter(|(_, c)| c.surface.is_some());
+        let handles = rules::dock_order(with_surface.map(|(h, c)| (h, c.info.login.label())));
+        let mut tasks = Vec::new();
+        for h in handles {
+            let (position, pinned) = self.floating_position(&h);
+            let c = self.clients.get_mut(&h).unwrap();
+            c.position = position;
+            c.pinned = pinned;
+            c.placed = true;
+            let id = c.surface.unwrap();
+            tracing::info!(?id, x = position.0, y = position.1, "leaving dock: floating position");
+            if !self.in_canvas(id) {
+                tasks.push(set_margin(id, position.1, 0, 0, position.0));
+            }
+        }
+        Task::batch(tasks)
     }
 
     /// Enlarge the surface to cover its whole output so that, while dragging,
@@ -446,6 +482,10 @@ impl App {
         let Some(handle) = self.client_for_surface(id) else { return Task::none() };
         match event {
             mouse::Event::ButtonPressed(mouse::Button::Middle) => {
+                // No pins in dock mode: positions come from the layout.
+                if self.config.mode == Mode::Dock {
+                    return Task::none();
+                }
                 if let Some(c) = self.clients.get_mut(&handle) {
                     c.pinned = !c.pinned;
                 }
@@ -461,7 +501,11 @@ impl App {
                 // use the last CursorMoved we saw for this surface. The surface is
                 // still thumbnail-sized here, so local + position is absolute.
                 let cursor = c.last_cursor;
-                self.drag = pointer::on_press(id, button, cursor, c.position, c.pinned);
+                // Dock mode: no dragging, but a release must still be a
+                // click — a pinned `DragState` never leaves `Idle` and yields
+                // `Click` on release.
+                let pinned = c.pinned || self.config.mode == Mode::Dock;
+                self.drag = pointer::on_press(id, button, cursor, c.position, pinned);
                 // Idle: the canvas isn't entered until motion crosses the
                 // threshold (see CursorMoved), so a plain click never
                 // touches the surface at all.
@@ -543,7 +587,8 @@ impl App {
                     return Task::none();
                 }
                 self.clients.get_mut(&handle).unwrap().hovered = true;
-                self.resize_if_needed(&handle)
+                // Dock mode: a zoomed thumbnail shifts its neighbours.
+                Task::batch([self.resize_if_needed(&handle), self.relayout_dock()])
             }
             mouse::Event::CursorLeft => {
                 // Releasing outside is delivered to us anyway (implicit grab); nothing
@@ -552,7 +597,7 @@ impl App {
                     return Task::none();
                 }
                 self.clients.get_mut(&handle).unwrap().hovered = false;
-                self.resize_if_needed(&handle)
+                Task::batch([self.resize_if_needed(&handle), self.relayout_dock()])
             }
             _ => Task::none(),
         }
@@ -576,7 +621,7 @@ impl App {
                     unavailable: false,
                     placed: false,
                     last_size: None,
-                    docked: false,
+                    rounded: false,
                     paused: false,
                 });
                 let was_named = matches!(entry.info.login, Login::LoggedIn(_));
@@ -598,36 +643,23 @@ impl App {
             Event::ClientRemoved(handle) => {
                 let task = self.destroy_surface(&handle);
                 self.clients.remove(&handle);
-                match self.config.mode {
-                    Mode::Floating => task,
-                    // Its strip may now be empty.
-                    Mode::Dock => Task::batch([task, self.reconcile_surfaces()]),
-                }
+                // Dock mode: its neighbours close the gap.
+                Task::batch([task, self.relayout_dock()])
             }
             Event::Frame(handle, image) => {
                 let Some(client) = self.clients.get_mut(&handle) else { return Task::none() };
                 client.image = Some(image);
                 client.unavailable = false;
-                if self.config.mode == Mode::Dock {
-                    // No per-client surface; the strip redraws from `view`,
-                    // but a first frame (or a new aspect) can change the
-                    // thumbnail's size and so the strip's thickness and
-                    // input region. Both are deduped against the last sent.
-                    if client.docked {
-                        match self.output_for(&self.clients[&handle].info) {
-                            Some(output) => self.refresh_dock(&output),
-                            None => Task::none(),
-                        }
-                    } else {
-                        Task::none()
-                    }
-                } else if client.surface.is_some() {
+                let task = if client.surface.is_some() {
                     // `resize_if_needed` skips a drag canvas and dedupes
                     // against the last size actually sent.
                     self.resize_if_needed(&handle)
                 } else {
                     self.create_surface(&handle)
-                }
+                };
+                // Dock mode: a first frame (or a new aspect) changes this
+                // thumbnail's size, which moves its neighbours.
+                Task::batch([task, self.relayout_dock()])
             }
             Event::CaptureUnavailable(handle) => {
                 if let Some(c) = self.clients.get_mut(&handle) {
@@ -654,24 +686,28 @@ impl App {
             self.send(Cmd::SetFps(new.fps));
         }
         let mode_changed = new.mode != self.config.mode;
-        let edge_changed = new.dock_edge != self.config.dock_edge;
-        if mode_changed || edge_changed {
-            // A strip teardown/re-anchor never fires each thumbnail's
-            // `on_exit`; don't let any of them come back zoomed.
-            for c in self.clients.values_mut() {
-                c.hovered = false;
-            }
+        if new.corner_radius != self.config.corner_radius {
+            // Re-request on every surface at its next frame (see `round_surface`).
+            self.clients.values_mut().for_each(|c| c.rounded = false);
         }
         self.config = new;
         let mut tasks = Vec::new();
         if mode_changed {
-            // Mode is baked into whether strips exist at all: drop them and
-            // let `reconcile_surfaces` rebuild whatever the new mode needs.
-            tasks.push(self.destroy_docks());
-        } else if edge_changed && self.config.mode == Mode::Dock {
-            // Edge alone: the same strips are still needed, just anchored
-            // (and sized) differently — cheaper than destroy+create.
-            tasks.push(self.reanchor_docks(self.config.dock_edge));
+            match self.config.mode {
+                // Positions now come from the layout; forget the floating
+                // ones so a later switch back doesn't reuse dock coordinates
+                // (`refloat_surfaces` falls back to saved/next-slot instead).
+                Mode::Dock => {
+                    self.clients.values_mut().for_each(|c| c.placed = false);
+                    // A button held down right now must not turn into a drag
+                    // (a canvas already entered is left alone: its release
+                    // path restores the surface at the dock position).
+                    if let Some(d) = self.drag.as_mut().filter(|d| d.phase == pointer::Phase::Idle) {
+                        d.pinned = true;
+                    }
+                }
+                Mode::Floating => tasks.push(self.refloat_surfaces()),
+            }
         }
         // Sizes and visibility may have changed.
         tasks.push(self.reconcile_surfaces());
@@ -682,8 +718,9 @@ impl App {
             // then) and dedupes against the last size actually sent.
             tasks.push(self.resize_if_needed(&h));
         }
-        // Dock strips: `reconcile_surfaces` → `reconcile_docks` already
-        // refreshed every surviving strip's thickness and input region.
+        // Dock mode: `reconcile_surfaces` already re-laid out every surface
+        // at its new size (the layout reads `surface_size`, not `last_size`)
+        // and along the new edge.
         Task::batch(tasks)
     }
 }
@@ -713,7 +750,6 @@ impl Application for App {
             layout: Layout::load(),
             drag: None,
             hidden: false,
-            docks: Vec::new(),
         };
         (app, Task::none())
     }
@@ -721,43 +757,19 @@ impl Application for App {
     fn update(&mut self, message: Msg) -> Task<cosmic::Action<Msg>> {
         match message {
             Msg::Wayland(WaylandEvent::Output(event, output)) => {
-                let had_outputs = !self.outputs.is_empty();
-                let removed = matches!(event, OutputEvent::Removed);
+                // The first output lets deferred surfaces be created; a
+                // removal does not itself recreate anything (the compositor
+                // sends Layer(Done, ..) for each surface on that output, and
+                // that handler recreates them via output_for); a size change
+                // moves the dock layout. `reconcile_surfaces` covers all.
                 self.on_output(event, output);
-                if self.config.mode == Mode::Dock {
-                    // Any output arrival, update, or removal can change which
-                    // outputs need a strip (or the strip's size); reconcile
-                    // on every event, not just the first output.
-                    return self.reconcile_surfaces();
-                }
-                if !had_outputs && !self.outputs.is_empty() {
-                    let pending: Vec<Handle> = self
-                        .clients
-                        .iter()
-                        .filter(|(_, c)| c.surface.is_none())
-                        .map(|(h, _)| h.clone())
-                        .collect();
-                    return Task::batch(pending.iter().map(|h| self.create_surface(h)));
-                }
-                if removed {
-                    // This does not itself recreate anything: the compositor
-                    // sends Layer(Done, ..) for each surface on the removed
-                    // output, and that handler is what actually recreates
-                    // them (on this or another output, via output_for).
-                    return self.reconcile_surfaces();
-                }
-                Task::none()
+                self.reconcile_surfaces()
             }
             Msg::Wayland(WaylandEvent::Layer(LayerEvent::Done, _, id)) => {
                 // The compositor closed this surface (its output went away).
                 if let Some(handle) = self.client_for_surface(id) {
                     tracing::info!("layer surface closed by compositor; recreating");
                     self.forget_surface(&handle);
-                    return self.reconcile_surfaces();
-                }
-                if let Some(pos) = self.docks.iter().position(|d| d.id == id) {
-                    tracing::info!(?id, "dock: strip closed by compositor; reconciling");
-                    self.docks.remove(pos);
                     return self.reconcile_surfaces();
                 }
                 Task::none()
@@ -780,7 +792,7 @@ impl Application for App {
                 }
             }
             Msg::Tray(tray::TrayEvent::Quit) => cosmic::iced::exit(),
-            Msg::Dock(msg) => self.on_dock(msg),
+            Msg::Redrawn(id) => self.round_surface(id),
         }
     }
 
@@ -799,6 +811,16 @@ impl Application for App {
             config_watch::subscription().map(Msg::ConfigChanged),
             tray::subscription().map(Msg::Tray),
         ];
+        if self.awaiting_radius() {
+            // Redraw events are only forwarded while needed: each one is a
+            // message, and a message schedules a redraw, so a permanent
+            // subscription would be a (frame-callback-paced) loop.
+            // (`listen_with` drops redraw events; `listen_raw` forwards them.)
+            subs.push(iced::event::listen_raw(|event, _status, id| match event {
+                iced::Event::Window(iced::window::Event::RedrawRequested(_)) => Some(Msg::Redrawn(id)),
+                _ => None,
+            }));
+        }
         if let Some(conn) = self.conn.clone() {
             subs.push(
                 backend::subscription(conn, self.config.app_ids.clone(), self.config.fps)
@@ -845,9 +867,6 @@ impl Application for App {
     }
 
     fn view_window(&self, id: SurfaceId) -> Element<'_, Msg> {
-        if let Some(d) = self.docks.iter().find(|d| d.id == id) {
-            return dock::view(self, &d.output);
-        }
         let Some((_, client)) = self.clients.iter().find(|(_, c)| c.surface == Some(id)) else {
             return widget::text("").into();
         };

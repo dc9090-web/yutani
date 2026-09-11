@@ -15,7 +15,8 @@ Goals
 
 - Live, low-latency thumbnails of each EVE client with zero-copy rendering.
 - Click a thumbnail (or press a hotkey) to focus that client.
-- Two layouts: free-floating draggable thumbnails, and a fixed dock strip.
+- Two layouts: free-floating draggable thumbnails, and a dock that
+  auto-arranges them centred along a screen edge.
 - Multi-monitor: thumbnails may live on any output; layouts remember which.
 - Look and behave like a native COSMIC app (libcosmic).
 - Sized for 2–3 clients; must not be a burden at 6.
@@ -113,9 +114,9 @@ event queues (the pattern System76's own cosmic-workspaces uses):
 │  2nd event queue on the     │                                   │  iced runtime, wgpu        │
 │  same wl connection, driven │ ◀──────────────────────────────── │  • settings window         │
 │  by calloop                 │   calloop channel: Cmd            │  • N thumbnail layer       │
-│  • toplevel_info  (list)    │   (Activate, Minimize,            │    surfaces (floating)     │
-│  • toplevel_mgmt  (focus)   │    SetAppIds, SetFps)             │  • 1 dock layer surface    │
-│  • screencopy     (capture) │                                   │    per output              │
+│  • toplevel_info  (list)    │   (Activate, Minimize,            │    surfaces (both modes;   │
+│  • toplevel_mgmt  (focus)   │    SetAppIds, SetFps)             │    dock = layout policy)   │
+│  • screencopy     (capture) │                                   │                            │
 │  • gbm buffer pools         │                                   │  • tray icon               │
 └─────────────────────────────┘                                   └────────────────────────────┘
 ```
@@ -151,7 +152,7 @@ yutani/
       mod.rs         — cosmic::Application impl, message routing
       thumbnail.rs   — one thumbnail (widget tree shared by both modes)
       floating.rs    — per-client layer surfaces, drag/snap/pin
-      dock.rs        — per-output strip layer surface
+      dock.rs        — dock layout policy (centred along an edge)
       settings.rs    — settings window pages
       tray.rs        — StatusNotifierItem (ksni)
     model/
@@ -233,11 +234,11 @@ submitted), not destroyed. *Implemented in plan 3* (`Cmd::PauseCapture` /
 ### Thumbnail widget (shared by both modes)
 
 ```
-container (border: border_px, colour = active ? active_border : inactive_border, radius 4)
+container (border: border_px, colour = active ? active_border : inactive_border, radius corner_radius)
   └ stack
       ├ Subsurface(frame, content_fit: Contain, alpha: opacity)
       ├ text(character_name | "Logging in…")  bottom-left pill, hidden if !show_names
-      └ pin glyph                              top-right, only when pinned
+      └ pin glyph                              top-right, only when pinned (floating mode)
 ```
 
 Width is `config.thumb_width`; height follows the captured window's aspect.
@@ -249,14 +250,26 @@ and the name.
 One `zwlr_layer_surface` per client: layer **Overlay**, anchor top-left,
 exclusive zone 0, keyboard interactivity **None**, positioned with margins,
 on the output the layout names (fallback: the output the client was first
-seen on; then the primary output).
+seen on; then the primary output). Every thumbnail surface asks cosmic-comp
+for rounded corners (`cosmic_corner_radius_layer_v1`, `corner_radius`), in
+both modes — this is why the dock is not one wide strip: the compositor
+rounds a whole layer surface, subsurfaces included, so per-thumbnail
+rounding needs per-thumbnail surfaces. The radius is requested only after
+the surface has presented its first frame: cosmic-comp 1.7 validates it
+against the surface's current (pre-commit) bounding box, which is 0×0
+before the first buffer, and a too-large radius is a fatal protocol error.
 
-### Dock mode
+### Dock mode (default)
 
-One layer surface per output that has ≥ 1 EVE client, anchored to
-`config.dock_edge` (default Bottom), exclusive zone 0, containing a
-`row` (Top/Bottom) or `column` (Left/Right) of thumbnail widgets in layout
-order. No dragging.
+The same per-client surfaces as floating mode, but their positions are a
+layout policy rather than the user's: on each output, the shown clients (in
+layout order — by character name) form a row (Top/Bottom) or column
+(Left/Right) centred along `config.dock_edge` (default Top), 8 px in from
+the edge, 8 px apart; Bottom/Right align each thumbnail's far side with the
+edge. The layout is recomputed and surfaces moved (`set_margin`) whenever
+the set of shown clients, a thumbnail's size (first frame, hover zoom —
+neighbours shift to make room), the edge or an output changes. No dragging,
+no pins, positions are not persisted; clicks still activate/minimise.
 
 ### Interaction
 
@@ -265,8 +278,8 @@ order. No dragging.
 | Left click, no drag | `Command::Activate(client)` |
 | Left or right drag > 4 px | Move (floating, unpinned only). Snap to 32 px grid if `snap_grid`; snap to other thumbnails' edges within 12 px if `snap_edges`. Save `current` layout on release. |
 | Right click (no drag) | `Command::Minimize(client)` — layer surfaces never receive modifier state, so Ctrl-click is not possible |
-| Middle click | Toggle pin |
-| Hover enter / leave | resize immediately (no animation) to `thumb_width × zoom_factor` and back, growing away from the anchored corner so the thumbnail stays on screen. Applies in both modes. |
+| Middle click | Toggle pin (floating mode; ignored in dock mode) |
+| Hover enter / leave | resize immediately (no animation) to `thumb_width × zoom_factor` and back (no-op at the default `zoom_factor: 1.0`), growing away from the anchored corner so the thumbnail stays on screen. Applies in both modes; in dock mode the row/column is re-laid out so neighbours move aside. |
 
 ### Visibility (re-evaluated on every focus change)
 
@@ -340,16 +353,17 @@ if the socket is absent it prints "yutani is not running" and exits 1.
 ```ron
 (
   app_ids: ["exefile.exe", "steam_app_8500"],
-  mode: Floating,            // Floating | Dock
-  dock_edge: Bottom,         // Top | Bottom | Left | Right
-  thumb_width: 320,
+  mode: Dock,                // Floating | Dock
+  dock_edge: Top,            // Top | Bottom | Left | Right
+  thumb_width: 480,
   opacity: 0.9,
   fps: 30,                   // 10 | 15 | 30 | 60
   active_border: "#ff8800",
   inactive_border: "#404040",
   border_px: 2,
   show_names: true,
-  zoom_factor: 1.5,
+  zoom_factor: 1.0,          // 1.0 = no hover zoom
+  corner_radius: 8,
   visibility: Always,        // Always | EveFocusedOnly
   hide_active: false,
   snap_grid: true,

@@ -43,7 +43,7 @@ pub struct Config {
     pub inactive_border: String,
     pub border_px: u32,
     pub show_names: bool,
-    /// Hover zoom multiplier, 1.0–4.0.
+    /// Hover zoom multiplier, 1.0–4.0 (1.0 = no hover zoom).
     pub zoom_factor: f32,
     pub visibility: Visibility,
     /// Hide the thumbnail of the client that currently has focus.
@@ -62,21 +62,21 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             app_ids: vec!["exefile.exe".to_string(), "steam_app_8500".to_string()],
-            thumb_width: 320,
+            thumb_width: 480,
             opacity: 0.9,
             fps: 30,
             active_border: "#ff8800".to_string(),
             inactive_border: "#404040".to_string(),
             border_px: 2,
             show_names: true,
-            zoom_factor: 1.5,
+            zoom_factor: 1.0,
             visibility: Visibility::Always,
             hide_active: false,
             snap_grid: true,
             snap_edges: true,
-            mode: Mode::Floating,
+            mode: Mode::Dock,
             corner_radius: 8,
-            dock_edge: Edge::Bottom,
+            dock_edge: Edge::Top,
         }
     }
 }
@@ -177,7 +177,7 @@ mod tests {
     fn defaults_match_spec() {
         let c = Config::default();
         assert_eq!(c.app_ids, vec!["exefile.exe".to_string(), "steam_app_8500".to_string()]);
-        assert_eq!(c.thumb_width, 320);
+        assert_eq!(c.thumb_width, 480);
         assert_eq!(c.opacity, 0.9);
         assert_eq!(c.fps, 30);
         assert_eq!(c.active_border, "#ff8800");
@@ -222,7 +222,7 @@ mod tests {
         std::fs::write(&path, "(fps: 60)").unwrap();
         let c = Config::load_from(&path);
         assert_eq!(c.fps, 60);
-        assert_eq!(c.thumb_width, 320);
+        assert_eq!(c.thumb_width, 480);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn plan2_defaults() {
         let c = Config::default();
-        assert_eq!(c.zoom_factor, 1.5);
+        assert_eq!(c.zoom_factor, 1.0);
         assert_eq!(c.visibility, Visibility::Always);
         assert!(!c.hide_active);
         assert!(c.snap_grid);
@@ -281,11 +281,12 @@ mod tests {
     #[test]
     fn plan3_defaults_and_validation() {
         let c = Config::default();
-        assert_eq!(c.mode, Mode::Floating);
-        assert_eq!(c.dock_edge, Edge::Bottom);
-        let text = "(mode: Dock, dock_edge: Left)";
-        let c: Config = ron::from_str(text).unwrap();
         assert_eq!(c.mode, Mode::Dock);
+        assert_eq!(c.dock_edge, Edge::Top);
+        assert_eq!(c.corner_radius, 8);
+        let text = "(mode: Floating, dock_edge: Left)";
+        let c: Config = ron::from_str(text).unwrap();
+        assert_eq!(c.mode, Mode::Floating);
         assert_eq!(c.dock_edge, Edge::Left);
     }
 
