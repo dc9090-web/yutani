@@ -1,4 +1,4 @@
-//! The thumbnail widget shared by floating (and, later, dock) modes.
+//! The thumbnail widget shared by floating and dock modes.
 
 use cosmic::iced::{Border, ContentFit, Length};
 use cosmic::iced::platform_specific::shell::subsurface_widget::Subsurface;
@@ -39,6 +39,25 @@ pub fn size_for(config: &Config, src_w: u32, src_h: u32) -> (u32, u32) {
 /// Smallest x along a top row (`origin`, step `pitch`) not already used.
 pub fn next_free_x(taken: &[i32], origin: i32, pitch: i32) -> i32 {
     (0..).map(|slot| origin + slot * pitch).find(|x| !taken.contains(x)).unwrap()
+}
+
+/// Messages a dock thumbnail emits from its `mouse_area`.
+pub struct Callbacks {
+    pub press: Msg,
+    pub right_press: Msg,
+    pub enter: Msg,
+    pub exit: Msg,
+}
+
+/// `view` wrapped in a `mouse_area` (dock mode only; floating keeps the raw
+/// widget and the surface-level pointer path).
+pub fn interactive<'a>(client: &'a Client, config: &Config, cb: Callbacks) -> Element<'a, Msg> {
+    widget::mouse_area(view(client, config))
+        .on_press(cb.press)
+        .on_right_press(cb.right_press)
+        .on_enter(cb.enter)
+        .on_exit(cb.exit)
+        .into()
 }
 
 pub fn view<'a>(client: &'a Client, config: &Config) -> Element<'a, Msg> {
