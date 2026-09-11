@@ -1,0 +1,164 @@
+//! User configuration: `~/.config/yutani/config.ron`.
+
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    /// Wayland app_ids that are EVE clients.
+    pub app_ids: Vec<String>,
+    /// Thumbnail width in logical pixels; height follows the window's aspect.
+    pub thumb_width: u32,
+    /// 0.0–1.0
+    pub opacity: f32,
+    /// Max capture rate: 10, 15, 30 or 60.
+    pub fps: u32,
+    /// "#rrggbb" or "#rrggbbaa"
+    pub active_border: String,
+    pub inactive_border: String,
+    pub border_px: u32,
+    pub show_names: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            app_ids: vec!["steam_app_8500".to_string()],
+            thumb_width: 320,
+            opacity: 0.9,
+            fps: 30,
+            active_border: "#ff8800".to_string(),
+            inactive_border: "#404040".to_string(),
+            border_px: 2,
+            show_names: true,
+        }
+    }
+}
+
+pub fn config_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("yutani")
+        .join("config.ron")
+}
+
+impl Config {
+    pub fn load() -> Self {
+        Self::load_from(&config_path())
+    }
+
+    /// Missing file → defaults. Unreadable/unparseable file → warn, defaults,
+    /// and the file is never touched.
+    pub fn load_from(path: &Path) -> Self {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(err) => {
+                tracing::warn!("cannot read {}: {err}; using defaults", path.display());
+                return Self::default();
+            }
+        };
+        match ron::from_str(&text) {
+            Ok(config) => config,
+            Err(err) => {
+                tracing::warn!("cannot parse {}: {err}; using defaults", path.display());
+                Self::default()
+            }
+        }
+    }
+
+    pub fn save(&self) -> anyhow::Result<()> {
+        self.save_to(&config_path())
+    }
+
+    pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default())?;
+        std::fs::write(path, text)?;
+        Ok(())
+    }
+}
+
+/// "#rrggbb" or "#rrggbbaa" → [r, g, b, a] in 0.0–1.0.
+pub fn parse_color(hex: &str) -> Option<[f32; 4]> {
+    let digits = hex.strip_prefix('#')?;
+    if digits.len() != 6 && digits.len() != 8 {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&digits[i..i + 2], 16).ok();
+    let r = byte(0)?;
+    let g = byte(2)?;
+    let b = byte(4)?;
+    let a = if digits.len() == 8 { byte(6)? } else { 255 };
+    Some([r, g, b, a].map(|v| v as f32 / 255.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_spec() {
+        let c = Config::default();
+        assert_eq!(c.app_ids, vec!["steam_app_8500".to_string()]);
+        assert_eq!(c.thumb_width, 320);
+        assert_eq!(c.opacity, 0.9);
+        assert_eq!(c.fps, 30);
+        assert_eq!(c.active_border, "#ff8800");
+        assert_eq!(c.inactive_border, "#404040");
+        assert_eq!(c.border_px, 2);
+        assert!(c.show_names);
+    }
+
+    #[test]
+    fn round_trips_through_ron() {
+        let dir = std::env::temp_dir().join(format!("yutani-test-{}", std::process::id()));
+        let path = dir.join("config.ron");
+        let mut c = Config::default();
+        c.thumb_width = 200;
+        c.app_ids.push("firefox".into());
+        c.save_to(&path).unwrap();
+        assert_eq!(Config::load_from(&path), c);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn missing_file_gives_defaults() {
+        assert_eq!(Config::load_from(Path::new("/nonexistent/yutani.ron")), Config::default());
+    }
+
+    #[test]
+    fn bad_file_gives_defaults_and_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("yutani-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.ron");
+        std::fs::write(&path, "(this is not ron").unwrap();
+        assert_eq!(Config::load_from(&path), Config::default());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "(this is not ron");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn partial_file_fills_in_defaults() {
+        let dir = std::env::temp_dir().join(format!("yutani-partial-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.ron");
+        std::fs::write(&path, "(fps: 60)").unwrap();
+        let c = Config::load_from(&path);
+        assert_eq!(c.fps, 60);
+        assert_eq!(c.thumb_width, 320);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parses_colors() {
+        assert_eq!(parse_color("#ff8800"), Some([1.0, 136.0 / 255.0, 0.0, 1.0]));
+        assert_eq!(parse_color("#00000080"), Some([0.0, 0.0, 0.0, 128.0 / 255.0]));
+        assert_eq!(parse_color("ff8800"), None);
+        assert_eq!(parse_color("#12"), None);
+        assert_eq!(parse_color("#gg0000"), None);
+    }
+}
