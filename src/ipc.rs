@@ -6,6 +6,12 @@ use std::path::PathBuf;
 /// Longest request line the server will read (bytes, including `\n`).
 pub const MAX_LINE: usize = 1024;
 
+/// Longest reply line the client will read (bytes, including `\n`). Replies
+/// carry JSON (e.g. `status`, which lists every EVE client) and can easily
+/// exceed a request-sized buffer, so this is much larger than `MAX_LINE`,
+/// which bounds only the request line the server reads.
+pub const MAX_REPLY: usize = 64 * 1024;
+
 /// `$XDG_RUNTIME_DIR/yutani.sock`, or `/tmp/yutani-<uid>.sock` without the
 /// variable (a bare TTY session).
 pub fn socket_path() -> PathBuf {

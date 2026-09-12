@@ -3,12 +3,18 @@
 //! the daemon-offline signal, not an error to show.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use crate::ipc::{MAX_LINE, Request, Response, socket_path};
+use crate::ipc::{MAX_REPLY, Request, Response, socket_path};
 use crate::tunnel::status::Status;
+
+/// Budget for one full round trip (connect + write + reply). A daemon that
+/// accepts the connection but never answers would otherwise hang the
+/// applet's poll task forever.
+pub const IPC_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IpcError {
@@ -30,6 +36,21 @@ impl std::fmt::Display for IpcError {
 /// One request, one reply. `Ok(None)` is a bare `ok`; `Ok(Some(data))` is
 /// `ok <data>` (plan A's `Response::OkData`).
 pub async fn send_to(path: &Path, request: &Request) -> Result<Option<String>, IpcError> {
+    send_to_with(path, request, IPC_TIMEOUT).await
+}
+
+/// `send_to`, but with an injectable round-trip budget so tests don't have
+/// to wait out the real `IPC_TIMEOUT`. On expiry this returns `Failed`, not
+/// `Offline`: the daemon accepted the connection, so it exists — it's just
+/// stuck.
+pub async fn send_to_with(path: &Path, request: &Request, timeout: Duration) -> Result<Option<String>, IpcError> {
+    match tokio::time::timeout(timeout, send_to_inner(path, request)).await {
+        Ok(result) => result,
+        Err(_) => Err(IpcError::Failed(format!("timeout after {}s", timeout.as_secs()))),
+    }
+}
+
+async fn send_to_inner(path: &Path, request: &Request) -> Result<Option<String>, IpcError> {
     let stream = match UnixStream::connect(path).await {
         Ok(stream) => stream,
         Err(err)
@@ -45,10 +66,13 @@ pub async fn send_to(path: &Path, request: &Request) -> Result<Option<String>, I
         .await
         .map_err(|err| IpcError::Failed(format!("send: {err}")))?;
     let mut line = String::new();
-    BufReader::new(read.take(MAX_LINE as u64))
+    BufReader::new(read.take(MAX_REPLY as u64))
         .read_line(&mut line)
         .await
         .map_err(|err| IpcError::Failed(format!("reply: {err}")))?;
+    if !line.ends_with('\n') && line.len() >= MAX_REPLY {
+        return Err(IpcError::Failed("reply too long".into()));
+    }
     match Response::parse(&line) {
         Response::Ok => Ok(None),
         Response::OkData(data) => Ok(Some(data)),
@@ -82,7 +106,12 @@ mod tests {
     /// A current-thread runtime; `#[tokio::test]` would need the `macros`
     /// feature (and a new lock entry), which this crate does not have.
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread().enable_io().build().unwrap().block_on(f)
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(f)
     }
 
     fn socket(tag: &str) -> std::path::PathBuf {
@@ -183,5 +212,67 @@ mod tests {
         });
         assert_eq!(got.0, "status\n");
         assert!(matches!(got.1.unwrap_err(), IpcError::Failed(m) if m.starts_with("status:")));
+    }
+
+    /// A daemon that accepts the connection and then never answers must not
+    /// hang the caller forever: the round trip has a budget, and blowing it
+    /// is a `Failed`, not a silent wait.
+    #[test]
+    fn a_daemon_that_accepts_but_never_replies_times_out() {
+        let path = socket("hang");
+        let _ = std::fs::remove_file(&path);
+        let got = block_on(async {
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let server = tokio::spawn(async move {
+                let (_stream, _) = listener.accept().await.unwrap();
+                // Accept, then sit forever without reading or replying.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            });
+            let r = send_to_with(&path, &Request::Status, Duration::from_millis(200)).await;
+            server.abort();
+            r
+        });
+        assert!(matches!(&got, Err(IpcError::Failed(m)) if m.contains("timeout")), "got {got:?}");
+    }
+
+    /// The reply cap is much larger than the request cap: a `status` line
+    /// listing many EVE clients can easily exceed 1 KiB and must not be
+    /// truncated into a parse failure.
+    #[test]
+    fn a_multi_kilobyte_status_reply_round_trips() {
+        let path = socket("big-status");
+        let clients: Vec<ClientStatus> = (0..100)
+            .map(|i| ClientStatus { name: format!("Client-{i:03}-with-a-longish-callsign"), active: i % 3 == 0 })
+            .collect();
+        let mut status = sample_status();
+        status.clients = clients;
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.len() > 5 * 1024, "fixture is only {} bytes, want >5KiB", json.len());
+        let reply: &'static str = Box::leak(format!("ok {json}\n").into_boxed_str());
+        let got = block_on(async {
+            let server = one_shot(&path, reply).await;
+            let status = status_from(path.clone()).await;
+            (server.await.unwrap(), status)
+        });
+        assert_eq!(got.0, "status\n");
+        let status = got.1.unwrap();
+        assert_eq!(status.clients.len(), 100);
+        assert_eq!(status.clients[42].name, "Client-042-with-a-longish-callsign");
+    }
+
+    /// A reply that blows straight through the cap without ever finding a
+    /// newline is rejected explicitly, not silently truncated into garbage.
+    #[test]
+    fn a_reply_past_the_cap_with_no_newline_is_reply_too_long() {
+        let path = socket("toolong");
+        let huge = "x".repeat(70 * 1024);
+        let reply: &'static str = Box::leak(huge.into_boxed_str());
+        let got = block_on(async {
+            let server = one_shot(&path, reply).await;
+            let r = send_to(&path, &Request::Status).await;
+            (server.await.unwrap(), r)
+        });
+        assert_eq!(got.0, "status\n");
+        assert!(matches!(got.1.unwrap_err(), IpcError::Failed(m) if m.contains("too long")));
     }
 }
