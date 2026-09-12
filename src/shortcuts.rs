@@ -148,12 +148,15 @@ fn read_existing(path: &std::path::Path) -> anyhow::Result<String> {
     }
 }
 
-fn write_atomic(path: &std::path::Path, text: &str) -> anyhow::Result<()> {
+/// Write the file in place. Deliberately *not* tmp+rename: cosmic-config's
+/// watcher (which cosmic-comp uses to reload shortcuts) ignores paired
+/// rename events and keys changes by the touched file's name, so a rename
+/// from `custom.tmp` never triggers a reload of `custom`. A direct write
+/// raises Create/Modify events on `custom` itself.
+fn write_in_place(path: &std::path::Path, text: &str) -> anyhow::Result<()> {
     let dir = path.parent().context("shortcuts path has no parent")?;
     std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension("yutani.tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)?;
+    std::fs::write(path, text)?;
     Ok(())
 }
 
@@ -163,7 +166,7 @@ pub fn install(cfg: &ShortcutsConfig) -> anyhow::Result<usize> {
     let ours = desired(cfg, &exe.to_string_lossy());
     let path = custom_path();
     let merged = merge(&read_existing(&path)?, &ours)?;
-    write_atomic(&path, &merged)?;
+    write_in_place(&path, &merged)?;
     Ok(ours.len())
 }
 
@@ -174,7 +177,7 @@ pub fn uninstall() -> anyhow::Result<usize> {
     let before = parse(&existing)?.len();
     let stripped = strip(&existing)?;
     let after = parse(&stripped)?.len();
-    write_atomic(&path, &stripped)?;
+    write_in_place(&path, &stripped)?;
     Ok(before - after)
 }
 
