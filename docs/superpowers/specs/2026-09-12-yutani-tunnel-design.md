@@ -61,8 +61,10 @@ Three pieces, all in the `yutani` binary:
 
 Constants: interface `yutani0`; fwmark `0x59`; routing table `51820`;
 slice `yutani-eve.slice` (cgroup path
-`user.slice/user-<uid>.slice/user@<uid>.service/yutani-eve.slice`, nft
-`level 4`); config `/etc/yutani/tunnel.conf`; status `/run/yutani/tunnel.json`.
+`user.slice/user-<uid>.slice/user@<uid>.service/yutani.slice/yutani-eve.slice`,
+nft `level 5`; systemd nests `yutani-eve.slice` under `yutani.slice` because
+of the dash, hence five components); config `/etc/yutani/tunnel.conf`;
+status `/run/yutani/tunnel.json`.
 
 ## 4. Root worker: `yutani tunnel run`
 
@@ -95,23 +97,25 @@ running the teardown for whatever was already created.
 table inet yutani {
     chain setmark {
         type route hook output priority mangle; policy accept;
-        socket cgroupv2 level 4 "user.slice/user-1000.slice/user@1000.service/yutani-eve.slice" meta mark set 0x59
+        socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" meta mark set 0x59
     }
     chain dns {
         type nat hook output priority dstnat; policy accept;
-        socket cgroupv2 level 4 "user.slice/user-1000.slice/user@1000.service/yutani-eve.slice" meta l4proto { tcp, udp } th dport 53 dnat ip to 10.2.0.1
+        socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" meta l4proto { tcp, udp } th dport 53 dnat ip to 10.2.0.1
     }
     chain killswitch {
         type filter hook output priority filter; policy accept;
-        socket cgroupv2 level 4 "user.slice/user-1000.slice/user@1000.service/yutani-eve.slice" oifname "lo" accept
-        socket cgroupv2 level 4 "user.slice/user-1000.slice/user@1000.service/yutani-eve.slice" oifname != "yutani0" counter drop
+        socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" oifname "lo" accept
+        socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" oifname != "yutani0" counter drop
     }
 }
 ```
 
-   (`level 4` = number of path components; the path is built from the uid.
-   `meta nfproto ipv6` from the cgroup falls under the last rule since v6
-   never routes via `yutani0`.) The encrypted UDP to the endpoint is emitted
+   (`level 5` = number of path components; the path is built from the uid.
+   Systemd nests `yutani-eve.slice` under `yutani.slice` because of the
+   dash, hence five components. `meta nfproto ipv6` from the cgroup falls
+   under the last rule since v6 never routes via `yutani0`.) The encrypted
+   UDP to the endpoint is emitted
    by the kernel's wg device, not from a cgroup socket, so it is unaffected.
 
 **Loop**: every second write `/run/yutani/tunnel.json` (0644, atomic

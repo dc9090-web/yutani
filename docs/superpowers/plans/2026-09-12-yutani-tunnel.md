@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Constants (verbatim from the spec): interface `yutani0`; fwmark `0x59`; routing table `51820`; slice `yutani-eve.slice`; cgroup path `user.slice/user-<uid>.slice/user@<uid>.service/yutani-eve.slice` (nft `socket cgroupv2 level 4`); conf `/etc/yutani/tunnel.conf` (0600 root); status `/run/yutani/tunnel.json` (0644, atomic rename); unit `/etc/systemd/system/yutani-tunnel.service`; polkit rule `/etc/polkit-1/rules.d/50-yutani-tunnel.rules`.
+- Constants (verbatim from the spec): interface `yutani0`; fwmark `0x59`; routing table `51820`; slice `yutani-eve.slice`; cgroup path `user.slice/user-<uid>.slice/user@<uid>.service/yutani.slice/yutani-eve.slice` (nft `socket cgroupv2 level 5`; systemd nests `yutani-eve.slice` under `yutani.slice` because of the dash, hence five components); conf `/etc/yutani/tunnel.conf` (0600 root); status `/run/yutani/tunnel.json` (0644, atomic rename); unit `/etc/systemd/system/yutani-tunnel.service`; polkit rule `/etc/polkit-1/rules.d/50-yutani-tunnel.rules`.
 - No shell scripts: the worker execs `ip`, `wg`, `nft`, `sysctl` with generated argv; any failure during *up* runs the full *down* and exits non-zero with the failing command and its stderr in the log.
 - The private key appears only in `/etc/yutani/tunnel.conf` and the transient 0600 `wg setconf` file; never in logs, `tunnel.json`, IPC replies or dry-run output (dry-run prints `PrivateKey = <redacted>`).
 - New direct deps: `serde_json = "1"`; `tokio` features become `["net", "io-util", "sync", "rt", "signal", "time"]`. No new `[[package]]` entries in `Cargo.lock`.
@@ -391,7 +391,7 @@ Claude-Session: https://claude.ai/code/session_01R66vpAiTLPkLmk4SuttcFH"
 **Interfaces (produced):**
 ```rust
 // rules.rs
-pub fn cgroup_path(uid: u32) -> String;                              // "user.slice/user-1000.slice/user@1000.service/yutani-eve.slice"
+pub fn cgroup_path(uid: u32) -> String;                              // "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice"
 pub fn nft_ruleset(uid: u32, dns: Option<Ipv4Addr>) -> String;
 pub fn up_commands(conf: &WgConf, wg_conf_path: &str) -> Vec<Vec<String>>;   // argv lists, in order
 pub fn down_commands() -> Vec<Vec<String>>;
@@ -422,7 +422,7 @@ mod tests {
 
     #[test]
     fn cgroup_path_uses_the_uid_and_slice() {
-        assert_eq!(cgroup_path(1000), "user.slice/user-1000.slice/user@1000.service/yutani-eve.slice");
+        assert_eq!(cgroup_path(1000), "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice");
     }
 
     #[test]
@@ -430,12 +430,12 @@ mod tests {
         let r = nft_ruleset(1000, Some("10.2.0.1".parse().unwrap()));
         assert!(r.starts_with("table inet yutani {\n"));
         assert!(r.contains("type route hook output priority mangle; policy accept;"));
-        assert!(r.contains(r#"socket cgroupv2 level 4 "user.slice/user-1000.slice/user@1000.service/yutani-eve.slice" meta mark set 0x59"#));
+        assert!(r.contains(r#"socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" meta mark set 0x59"#));
         assert!(r.contains("type nat hook output priority dstnat; policy accept;"));
-        assert!(r.contains(r#"socket cgroupv2 level 4 "user.slice/user-1000.slice/user@1000.service/yutani-eve.slice" meta l4proto { tcp, udp } th dport 53 dnat ip to 10.2.0.1"#));
+        assert!(r.contains(r#"socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" meta l4proto { tcp, udp } th dport 53 dnat ip to 10.2.0.1"#));
         assert!(r.contains("type filter hook output priority filter; policy accept;"));
-        assert!(r.contains(r#"socket cgroupv2 level 4 "user.slice/user-1000.slice/user@1000.service/yutani-eve.slice" oifname "lo" accept"#));
-        assert!(r.contains(r#"socket cgroupv2 level 4 "user.slice/user-1000.slice/user@1000.service/yutani-eve.slice" oifname != "yutani0" counter drop"#));
+        assert!(r.contains(r#"socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" oifname "lo" accept"#));
+        assert!(r.contains(r#"socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" oifname != "yutani0" counter drop"#));
     }
 
     #[test]
@@ -508,9 +508,9 @@ fn argv(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| s.to_string()).collect()
 }
 
-/// `socket cgroupv2 level 4 "<path>"` — level = number of path components.
+/// `socket cgroupv2 level 5 "<path>"` — level = number of path components.
 fn cgroup_match(uid: u32) -> String {
-    format!(r#"socket cgroupv2 level 4 "{}""#, cgroup_path(uid))
+    format!(r#"socket cgroupv2 level 5 "{}""#, cgroup_path(uid))
 }
 
 pub fn nft_ruleset(uid: u32, dns: Option<Ipv4Addr>) -> String {
@@ -1267,7 +1267,7 @@ Run: `cargo build -q 2>&1 | grep -E '^(warning|error)' -A5; cargo test -q 2>&1 |
 
 Dry run against Daniel's real conf (reads it, never writes):
 `./target/debug/yutani tunnel install --dry-run ~/Downloads/EVE-UK-455.conf | sed -n 1,80p`
-Expected: the redacted conf with `# yutani: label = UK#455` and `# yutani: uid = 1000`, the unit text with `ExecStart=/home/user/Yutani/target/debug/yutani tunnel run`, the polkit rule for `daniel`, then the command plan (`ip link add yutani0 …`, the nft ruleset with `level 4 "user.slice/user-1000.slice/user@1000.service/yutani-eve.slice"`, `dnat ip to 10.2.0.1`, the down list). The private key string must not appear anywhere: `./target/debug/yutani tunnel install --dry-run ~/Downloads/EVE-UK-455.conf | grep -c "$(grep PrivateKey ~/Downloads/EVE-UK-455.conf | cut -d= -f2- | tr -d ' ')"` → `0`.
+Expected: the redacted conf with `# yutani: label = UK#455` and `# yutani: uid = 1000`, the unit text with `ExecStart=/home/user/Yutani/target/debug/yutani tunnel run`, the polkit rule for `daniel`, then the command plan (`ip link add yutani0 …`, the nft ruleset with `level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice"`, `dnat ip to 10.2.0.1`, the down list). The private key string must not appear anywhere: `./target/debug/yutani tunnel install --dry-run ~/Downloads/EVE-UK-455.conf | grep -c "$(grep PrivateKey ~/Downloads/EVE-UK-455.conf | cut -d= -f2- | tr -d ' ')"` → `0`.
 
 `./target/debug/yutani tunnel status` → JSON with `"installed": false, "connected": false`.
 `./target/debug/yutani tunnel connect` → `yutani: tunnel is not installed; run …`, exit 1.
@@ -1443,6 +1443,11 @@ mod tests {
     fn detects_slice_membership_from_proc_cgroup() {
         assert!(in_slice("0::/user.slice/user-1000.slice/user@1000.service/yutani-eve.slice/yutani-eve-123.scope\n"));
         assert!(in_slice("0::/user.slice/user-1000.slice/user@1000.service/yutani-eve.slice/yutani-eve-adopt-9.scope\n"));
+        // systemd nests yutani-eve.slice under yutani.slice (dash-implied
+        // parent), so the real cgroup path has five components; a sibling
+        // scope directly under the parent slice must not count.
+        assert!(in_slice("0::/user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice/yutani-eve-adopt-9.scope\n"));
+        assert!(!in_slice("0::/user.slice/user-1000.slice/user@1000.service/yutani.slice/other.scope\n"));
         assert!(!in_slice("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-cosmic-x.scope\n"));
     }
 
@@ -1663,7 +1668,7 @@ fn run(patterns: &Vec<String>) -> iced::futures::stream::BoxStream<'static, Adop
 
 `cargo test -q 2>&1 | grep 'test result'` → `101 passed` (97 + 1 + 3). Smoke (EVE running):
 ```bash
-./target/debug/yutani launch -- /bin/sh -c 'cat /proc/self/cgroup'    # 0::/user.slice/user-1000.slice/user@1000.service/yutani-eve.slice/run-….scope
+./target/debug/yutani launch -- /bin/sh -c 'cat /proc/self/cgroup'    # 0::/user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice/run-….scope
 systemctl --user list-units 'yutani-eve*' --all | head -5
 (RUST_LOG=yutani=info setsid nohup ./target/debug/yutani >/tmp/claude-1000/-home-user-Yutani/eb30ce00-6f26-46d7-ad81-bfd5bce301f6/scratchpad/yutani_adopt.log 2>&1 &); sleep 6
 sed 's/\x1b\[[0-9;]*m//g' /tmp/claude-1000/-home-user-Yutani/eb30ce00-6f26-46d7-ad81-bfd5bce301f6/scratchpad/yutani_adopt.log | grep -E 'adopt|panic|error'   # "adopted into yutani-eve.slice pid=… name=exefile.exe"

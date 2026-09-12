@@ -7,17 +7,21 @@ use std::net::Ipv4Addr;
 use super::conf::WgConf;
 use super::{FWMARK, IFACE, SLICE, TABLE};
 
+/// systemd nests `yutani-eve.slice` under `yutani.slice` because of the
+/// dash in the name (a dash-separated slice name is automatically a child
+/// of the slice named by the part before the last dash), so the real
+/// cgroup path has five components, not four.
 pub fn cgroup_path(uid: u32) -> String {
-    format!("user.slice/user-{uid}.slice/user@{uid}.service/{SLICE}")
+    format!("user.slice/user-{uid}.slice/user@{uid}.service/yutani.slice/{SLICE}")
 }
 
 fn argv(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| s.to_string()).collect()
 }
 
-/// `socket cgroupv2 level 4 "<path>"` — level = number of path components.
+/// `socket cgroupv2 level 5 "<path>"` — level = number of path components.
 fn cgroup_match(uid: u32) -> String {
-    format!(r#"socket cgroupv2 level 4 "{}""#, cgroup_path(uid))
+    format!(r#"socket cgroupv2 level 5 "{}""#, cgroup_path(uid))
 }
 
 pub fn nft_ruleset(uid: u32, dns: Option<Ipv4Addr>) -> String {
@@ -109,7 +113,7 @@ mod tests {
     fn cgroup_path_uses_the_uid_and_slice() {
         assert_eq!(
             cgroup_path(1000),
-            "user.slice/user-1000.slice/user@1000.service/yutani-eve.slice"
+            "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice"
         );
     }
 
@@ -121,16 +125,16 @@ mod tests {
             "table inet yutani {\n\
              \x20   chain setmark {\n\
              \x20       type route hook output priority mangle; policy accept;\n\
-             \x20       socket cgroupv2 level 4 \"user.slice/user-1000.slice/user@1000.service/yutani-eve.slice\" meta mark set 0x59\n\
+             \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" meta mark set 0x59\n\
              \x20   }\n\
              \x20   chain dns {\n\
              \x20       type nat hook output priority dstnat; policy accept;\n\
-             \x20       socket cgroupv2 level 4 \"user.slice/user-1000.slice/user@1000.service/yutani-eve.slice\" meta l4proto { tcp, udp } th dport 53 dnat ip to 10.2.0.1\n\
+             \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" meta l4proto { tcp, udp } th dport 53 dnat ip to 10.2.0.1\n\
              \x20   }\n\
              \x20   chain killswitch {\n\
              \x20       type filter hook output priority filter; policy accept;\n\
-             \x20       socket cgroupv2 level 4 \"user.slice/user-1000.slice/user@1000.service/yutani-eve.slice\" oifname \"lo\" accept\n\
-             \x20       socket cgroupv2 level 4 \"user.slice/user-1000.slice/user@1000.service/yutani-eve.slice\" oifname != \"yutani0\" counter drop\n\
+             \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" oifname \"lo\" accept\n\
+             \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" oifname != \"yutani0\" counter drop\n\
              \x20   }\n\
              }\n"
         );
@@ -144,12 +148,12 @@ mod tests {
             "table inet yutani {\n\
              \x20   chain setmark {\n\
              \x20       type route hook output priority mangle; policy accept;\n\
-             \x20       socket cgroupv2 level 4 \"user.slice/user-1000.slice/user@1000.service/yutani-eve.slice\" meta mark set 0x59\n\
+             \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" meta mark set 0x59\n\
              \x20   }\n\
              \x20   chain killswitch {\n\
              \x20       type filter hook output priority filter; policy accept;\n\
-             \x20       socket cgroupv2 level 4 \"user.slice/user-1000.slice/user@1000.service/yutani-eve.slice\" oifname \"lo\" accept\n\
-             \x20       socket cgroupv2 level 4 \"user.slice/user-1000.slice/user@1000.service/yutani-eve.slice\" oifname != \"yutani0\" counter drop\n\
+             \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" oifname \"lo\" accept\n\
+             \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" oifname != \"yutani0\" counter drop\n\
              \x20   }\n\
              }\n"
         );

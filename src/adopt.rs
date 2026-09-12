@@ -144,6 +144,21 @@ mod tests {
         assert!(!in_slice("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-cosmic-x.scope\n"));
     }
 
+    /// systemd nests `yutani-eve.slice` under `yutani.slice` (the dash makes
+    /// it a child slice), so the real `/proc/<pid>/cgroup` line has five
+    /// path components, not four — verified with `systemd-run --user
+    /// --scope --slice=yutani-eve.slice -- cat /proc/self/cgroup`. A sibling
+    /// scope directly under the parent `yutani.slice` must not count.
+    #[test]
+    fn detects_slice_membership_under_the_real_nested_parent_slice() {
+        assert!(in_slice(
+            "0::/user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice/yutani-eve-adopt-9.scope\n"
+        ));
+        assert!(!in_slice(
+            "0::/user.slice/user-1000.slice/user@1000.service/yutani.slice/other.scope\n"
+        ));
+    }
+
     #[test]
     fn busctl_argv_moves_one_pid_into_a_scope_under_the_slice() {
         let a = busctl_adopt_argv(4242);
