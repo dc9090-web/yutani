@@ -9,9 +9,12 @@ use cosmic::iced::{Rectangle, Subscription};
 use cosmic::surface::action::{app_popup, destroy_popup};
 
 use yutani::applet::client::{self, IpcError};
-use yutani::applet::display::{Display, display};
+use yutani::applet::display::{Display, degrade, display};
 use yutani::applet::rate::{Rates, Sampler};
-use yutani::applet::{Action, PENDING_S, daemon_exe, note_visible, poll_interval};
+use yutani::applet::{
+    Action, PENDING_S, daemon_exe, note_visible, pending_done, poll_interval, should_poll,
+    still_pending,
+};
 use yutani::tunnel::status::Status;
 
 use crate::view;
@@ -26,8 +29,12 @@ pub struct Applet {
     pub sampler: Sampler,
     /// Monotonic base for the rate sampler and the note timer.
     pub started: Instant,
-    /// A `tunnel connect|disconnect` is in flight (icon shows sync).
-    pub pending_until: Option<Instant>,
+    /// A `tunnel connect|disconnect` is in flight (icon shows sync):
+    /// `(the state it asked for, the deadline it gives up at)`.
+    pub pending: Option<(bool, Instant)>,
+    /// A `status` request is outstanding. The poll timer skips a tick
+    /// rather than stack a second request on a slow daemon.
+    pub polling: bool,
     pub accounts_open: bool,
     /// `(message, set_at_ms)` — an `err …` reply, shown for 3 s.
     pub note: Option<(String, u64)>,
@@ -37,7 +44,6 @@ pub struct Applet {
 /// `ToggleAccounts`; `update` already handles all three, so the arms are
 /// written and tested against the protocol here rather than bolted on
 /// later.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum Msg {
     /// The poll timer fired.
@@ -45,9 +51,12 @@ pub enum Msg {
     /// A `status` request came back.
     Status(Result<Status, IpcError>),
     /// A menu row was pressed.
+    #[allow(dead_code)] // constructed by Task 4's menu
     Press(Action),
     /// A pressed action finished.
+    #[allow(dead_code)] // constructed by Task 4's menu
     Done(Action, Result<(), String>),
+    #[allow(dead_code)] // constructed by Task 4's menu
     ToggleAccounts,
     /// Popup create/destroy, handled by libcosmic.
     Surface(cosmic::surface::Action<Msg>),
@@ -59,16 +68,21 @@ impl Applet {
         self.started.elapsed().as_millis() as u64
     }
 
-    /// True while a connect/disconnect is still settling (spec §3).
+    /// True while a connect/disconnect is still settling (spec §3): until
+    /// the daemon reports the state that was asked for, or the deadline
+    /// runs out, whichever comes first.
     pub fn pending(&self) -> bool {
-        self.pending_until.is_some_and(|until| Instant::now() < until)
+        let observed = self.status.as_ref().is_some_and(|s| s.tunnel.connected);
+        self.pending
+            .is_some_and(|(want, until)| still_pending(until, Instant::now(), pending_done(want, observed)))
     }
 
     pub fn display(&self) -> Display {
         display(self.status.as_ref(), self.rates)
     }
 
-    fn poll(&self) -> Task<Msg> {
+    fn poll(&mut self) -> Task<Msg> {
+        self.polling = true;
         cosmic::task::future(async { Msg::Status(client::status().await) })
     }
 
@@ -119,7 +133,8 @@ impl cosmic::Application for Applet {
             rates: Rates::default(),
             sampler: Sampler::default(),
             started: Instant::now(),
-            pending_until: None,
+            pending: None,
+            polling: true,
             accounts_open: false,
             note: None,
         };
@@ -136,6 +151,11 @@ impl cosmic::Application for Applet {
     }
 
     fn update(&mut self, message: Msg) -> Task<Msg> {
+        // Whatever it says, the request this reply answers is no longer
+        // outstanding.
+        if matches!(message, Msg::Status(_)) {
+            self.polling = false;
+        }
         match message {
             Msg::Tick => {
                 if let Some((_, at)) = self.note
@@ -143,7 +163,7 @@ impl cosmic::Application for Applet {
                 {
                     self.note = None;
                 }
-                self.poll()
+                if should_poll(self.polling) { self.poll() } else { Task::none() }
             }
             Msg::Status(Ok(status)) => {
                 let live = status.tunnel.connected;
@@ -157,8 +177,12 @@ impl cosmic::Application for Applet {
                     self.sampler.reset();
                     self.rates = Rates::default();
                 }
-                if self.pending_until.is_some_and(|until| Instant::now() >= until) {
-                    self.pending_until = None;
+                // The deadline is the upper bound; the daemon agreeing ends
+                // it sooner, which is the common case.
+                if let Some((want, until)) = self.pending
+                    && !still_pending(until, Instant::now(), pending_done(want, live))
+                {
+                    self.pending = None;
                 }
                 self.status = Some(status);
                 Task::none()
@@ -167,12 +191,18 @@ impl cosmic::Application for Applet {
                 self.status = None;
                 self.sampler.reset();
                 self.rates = Rates::default();
-                self.pending_until = None;
+                self.pending = None;
                 Task::none()
             }
             Msg::Status(Err(IpcError::Failed(msg))) => {
                 // A failed poll after a success keeps the last totals
-                // (spec §7); only the note changes.
+                // (spec §7) — they are counters — but the reply is stale,
+                // so it must stop claiming a live tunnel and live rates.
+                if let Some(status) = self.status.as_mut() {
+                    degrade(status);
+                }
+                self.sampler.reset();
+                self.rates = Rates::default();
                 self.note(msg);
                 Task::none()
             }
@@ -195,7 +225,8 @@ impl cosmic::Application for Applet {
                     return Task::none();
                 };
                 if matches!(action, Action::Connect | Action::Disconnect) {
-                    self.pending_until = Some(Instant::now() + Duration::from_secs(PENDING_S));
+                    let want = matches!(action, Action::Connect);
+                    self.pending = Some((want, Instant::now() + Duration::from_secs(PENDING_S)));
                 }
                 cosmic::task::future(async move {
                     let result =
@@ -206,7 +237,7 @@ impl cosmic::Application for Applet {
             Msg::Done(_, Ok(())) => self.poll(),
             Msg::Done(action, Err(msg)) => {
                 if matches!(action, Action::Connect | Action::Disconnect) {
-                    self.pending_until = None;
+                    self.pending = None;
                 }
                 self.note(msg);
                 self.poll()

@@ -10,10 +10,12 @@ pub mod icon;
 pub mod rate;
 pub mod theme;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// How long after a `tunnel connect|disconnect` the icon shows the sync
-/// state even if the daemon has not caught up yet (spec §3).
+/// The longest the icon shows the sync state after a `tunnel
+/// connect|disconnect` (spec §3). It is the *upper bound* on the wait, not
+/// the wait: [`still_pending`] ends it the moment the daemon reports the
+/// state that was asked for.
 pub const PENDING_S: u64 = 10;
 
 /// How long an `err …` note stays under the menu (spec §7).
@@ -70,6 +72,26 @@ pub fn daemon_exe() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("yutani"))
 }
 
+/// A pending connect/disconnect has got what it asked for: the tunnel a
+/// Connect wanted up is up, or the one a Disconnect wanted down is down.
+pub fn pending_done(want_connected: bool, observed_connected: bool) -> bool {
+    want_connected == observed_connected
+}
+
+/// Whether a connect/disconnect armed with deadline `until` is still
+/// settling at `now`. The observed state ends it early (`satisfied`); the
+/// deadline only stops the sync icon spinning forever when the daemon never
+/// gets there.
+pub fn still_pending(until: Instant, now: Instant, satisfied: bool) -> bool {
+    !satisfied && now < until
+}
+
+/// Whether the poll timer should issue a `status` request. A daemon slower
+/// than the 1 s popup cadence would otherwise get a growing queue of them.
+pub fn should_poll(request_in_flight: bool) -> bool {
+    !request_in_flight
+}
+
 /// An error note is shown for [`NOTE_MS`] after it was set.
 pub fn note_visible(set_at_ms: u64, now_ms: u64) -> bool {
     now_ms.saturating_sub(set_at_ms) < NOTE_MS
@@ -104,6 +126,34 @@ mod tests {
         assert_eq!(exe.file_name().unwrap(), "yutani");
         // Either an absolute sibling that exists, or the bare name for PATH.
         assert!(exe.is_absolute() && exe.is_file() || exe == std::path::PathBuf::from("yutani"));
+    }
+
+    #[test]
+    fn a_pending_action_ends_when_the_daemon_agrees() {
+        // Connect is satisfied by a link that is up, Disconnect by one down.
+        assert!(pending_done(true, true));
+        assert!(pending_done(false, false));
+        assert!(!pending_done(true, false));
+        assert!(!pending_done(false, true));
+    }
+
+    #[test]
+    fn the_deadline_is_only_the_upper_bound_on_waiting() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(PENDING_S);
+        // Not there yet, and time to spare: still settling.
+        assert!(still_pending(deadline, now, false));
+        // The daemon caught up early — done, well inside the deadline.
+        assert!(!still_pending(deadline, now, true));
+        // The daemon never caught up — the deadline gives up for us.
+        assert!(!still_pending(now, now + Duration::from_secs(1), false));
+        assert!(!still_pending(now, now, false));
+    }
+
+    #[test]
+    fn a_poll_is_skipped_while_one_is_outstanding() {
+        assert!(should_poll(false));
+        assert!(!should_poll(true));
     }
 
     #[test]

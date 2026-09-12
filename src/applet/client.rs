@@ -46,7 +46,7 @@ pub async fn send_to(path: &Path, request: &Request) -> Result<Option<String>, I
 pub async fn send_to_with(path: &Path, request: &Request, timeout: Duration) -> Result<Option<String>, IpcError> {
     match tokio::time::timeout(timeout, send_to_inner(path, request)).await {
         Ok(result) => result,
-        Err(_) => Err(IpcError::Failed(format!("timeout after {}s", timeout.as_secs()))),
+        Err(_) => Err(IpcError::Failed(format!("timeout after {}ms", timeout.as_millis()))),
     }
 }
 
@@ -232,7 +232,12 @@ mod tests {
             server.abort();
             r
         });
-        assert!(matches!(&got, Err(IpcError::Failed(m)) if m.contains("timeout")), "got {got:?}");
+        // Milliseconds, not seconds: a sub-second budget must not report
+        // itself as "0s".
+        assert!(
+            matches!(&got, Err(IpcError::Failed(m)) if m == "timeout after 200ms"),
+            "got {got:?}"
+        );
     }
 
     /// The reply cap is much larger than the request cap: a `status` line

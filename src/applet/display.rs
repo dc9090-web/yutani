@@ -5,9 +5,8 @@
 use crate::applet::format;
 use crate::applet::icon::HANDSHAKE_STALE_S;
 use crate::applet::rate::Rates;
+use crate::applet::theme::DASH;
 use crate::tunnel::status::Status;
-
-const DASH: &str = "—";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Display {
@@ -32,6 +31,19 @@ pub struct Display {
     pub hidden: bool,
     /// A tunnel conf has been installed (a false disables Connect).
     pub installed: bool,
+}
+
+/// Stale the last good reply so it presents as Disconnected (spec §7).
+///
+/// A poll that fails after a success keeps the daemon's last `status` on
+/// screen — the totals are counters and must not jump back to zero — but
+/// that reply is now old news, so it may not go on claiming a live tunnel
+/// with a fresh handshake. Dropping the link and the handshake age is
+/// enough: [`display`] derives the status text, the dot, the address and
+/// the rates from them.
+pub fn degrade(status: &mut Status) {
+    status.tunnel.connected = false;
+    status.tunnel.handshake_age_s = None;
 }
 
 pub fn display(status: Option<&Status>, rates: Rates) -> Display {
@@ -152,6 +164,37 @@ mod tests {
         assert_eq!(d.handshake, "hs 180s ago");
         // The link really is up, so the address still shows.
         assert_eq!(d.address, "10.2.0.2");
+    }
+
+    /// Spec §7: a poll that fails after a success leaves the last reply on
+    /// screen, but that reply is now stale — it must not keep claiming a
+    /// live tunnel with live rates.
+    #[test]
+    fn a_failed_poll_degrades_the_last_reply_to_disconnected() {
+        let mut s = status(true, Some(21), 3);
+        degrade(&mut s);
+        let d = display(Some(&s), Rates { rx: 222_000.0, tx: 41_000.0 });
+        // The daemon still answered once, so this is not the offline state.
+        assert!(d.online && !d.connected);
+        assert_eq!(d.status_text, "Disconnected");
+        assert_eq!((d.address.as_str(), d.handshake.as_str()), ("—", "hs —"));
+        assert_eq!((d.up_rate.as_str(), d.down_rate.as_str()), ("0 KB/s", "0 KB/s"));
+        // Counters, not gauges: the totals stay where the last good poll
+        // left them, as do the accounts and the location.
+        assert_eq!((d.up_total.as_str(), d.down_total.as_str()), ("2.79 GB", "413.1 MB"));
+        assert_eq!((d.accounts, d.location.as_str()), (3, "London"));
+        assert!(d.installed);
+    }
+
+    /// Degrading twice is degrading once — `update` calls it on every failed
+    /// poll, not only the first.
+    #[test]
+    fn degrading_is_idempotent() {
+        let mut once = status(true, Some(21), 1);
+        degrade(&mut once);
+        let mut twice = once.clone();
+        degrade(&mut twice);
+        assert_eq!(once, twice);
     }
 
     #[test]

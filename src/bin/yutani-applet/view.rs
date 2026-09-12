@@ -2,7 +2,7 @@
 //! every string comes from `yutani::applet::display::Display`.
 
 use cosmic::iced::font::Weight;
-use cosmic::iced::{Alignment, Color, Length, Padding};
+use cosmic::iced::{Alignment, Color, Length};
 use cosmic::widget::{self, Column, Row};
 use cosmic::{Element, theme as cosmic_theme};
 
@@ -12,46 +12,6 @@ use yutani::applet::theme;
 use yutani::assets;
 
 use crate::app::{Applet, Msg, close_popup_message, open_popup_message};
-
-// ---- section geometry ----
-// The handoff's per-section `padding` / `margin` shorthands, in its own
-// order (top, right, bottom, left). They describe *this* arrangement of
-// sections rather than a reusable token, so they live next to the only
-// code that may use them; every value is on the handoff's 1·2·4·6·8·10·12
-// spacing scale.
-
-const fn pad(top: f32, right: f32, bottom: f32, left: f32) -> Padding {
-    Padding { top, right, bottom, left }
-}
-
-/// Header — `10px 10px 2px`.
-const HEADER_PAD: Padding = pad(10.0, 10.0, 2.0, 10.0);
-/// The divider above the accounts band — `6px 10px 2px`.
-const DIVIDER_ABOVE_BAND: Padding = pad(6.0, 10.0, 2.0, 10.0);
-/// Accounts band — `4px 12px 6px`.
-const BAND_PAD: Padding = pad(4.0, 12.0, 6.0, 12.0);
-/// The divider above the traffic tiles — `2px 10px 4px`.
-const DIVIDER_ABOVE_TILES: Padding = pad(2.0, 10.0, 4.0, 10.0);
-/// Traffic tiles — `2px 10px`.
-const TILES_PAD: Padding = pad(2.0, 10.0, 2.0, 10.0);
-/// The interface chip — `4px 8px`.
-const CHIP_PAD: Padding = pad(4.0, 8.0, 4.0, 8.0);
-/// One traffic tile — `11px 13px`.
-const TILE_PAD: Padding = pad(11.0, 13.0, 11.0, 13.0);
-/// Between the accounts count and its label.
-const COUNT_GAP: u16 = 8;
-/// Between a tile's arrow glyph and its label.
-const TILE_LABEL_GAP: u16 = 6;
-/// The map pin is the one non-square glyph (handoff: 10×12).
-const PIN_SIZE: (u16, u16) = (10, 12);
-
-/// Line box as a factor of the font size. libcosmic's `monotext` preset
-/// pins an *absolute* 20 px line height, which at 10.5–22 px text would
-/// wreck every gap in the popup, so each helper sets its own.
-const LINE: f32 = 1.3;
-/// The accounts count is `line-height: 1` in the handoff — its 22 px
-/// digits set the height of the whole band.
-const LINE_TIGHT: f32 = 1.0;
 
 /// The handoff's "500" weight (Space Grotesk / JetBrains Mono Medium) for
 /// the title, the accounts count and the tile labels.
@@ -67,7 +27,7 @@ fn ui<'a>(
 ) -> Element<'a, Msg> {
     widget::text(content)
         .size(size)
-        .line_height(LINE)
+        .line_height(theme::LINE_HEIGHT)
         .class(cosmic_theme::Text::Color(color))
         .into()
 }
@@ -80,7 +40,7 @@ fn ui_medium<'a>(
 ) -> Element<'a, Msg> {
     widget::text(content)
         .size(size)
-        .line_height(LINE)
+        .line_height(theme::LINE_HEIGHT)
         .font(medium(cosmic::font::default()))
         .class(cosmic_theme::Text::Color(color))
         .into()
@@ -95,7 +55,7 @@ fn mono<'a>(
 ) -> Element<'a, Msg> {
     widget::text::monotext(content)
         .size(size)
-        .line_height(LINE)
+        .line_height(theme::LINE_HEIGHT)
         .class(cosmic_theme::Text::Color(color))
         .into()
 }
@@ -104,7 +64,7 @@ fn mono<'a>(
 fn count<'a>(content: String, color: Color) -> Element<'a, Msg> {
     widget::text::monotext(content)
         .size(theme::COUNT_SIZE)
-        .line_height(LINE_TIGHT)
+        .line_height(theme::LINE_HEIGHT_TIGHT)
         .font(medium(cosmic::font::mono()))
         .class(cosmic_theme::Text::Color(color))
         .into()
@@ -119,7 +79,7 @@ fn glyph<'a>(bytes: &'static [u8], w: u16, h: u16) -> Element<'a, Msg> {
 
 /// A hairline rule with the handoff's margins. `theme::hairline` fills its
 /// container, so the container has to be told to fill the popup.
-fn divider<'a>(padding: Padding) -> Element<'a, Msg> {
+fn divider<'a>(padding: cosmic::iced::Padding) -> Element<'a, Msg> {
     widget::container(theme::hairline::<Msg>())
         .width(Length::Fill)
         .padding(padding)
@@ -169,26 +129,30 @@ fn header<'a>(d: &Display) -> Element<'a, Msg> {
         .align_y(Alignment::Center)
         .push(dot)
         .push(mono(d.status_text, theme::STATUS_SIZE, dot_color))
-        .push(mono("·", theme::STATUS_SIZE, theme::SEPARATOR))
-        .push(glyph(assets::PIN, PIN_SIZE.0, PIN_SIZE.1))
+        .push(mono(theme::MIDDOT, theme::STATUS_SIZE, theme::SEPARATOR))
+        .push(glyph(assets::PIN, theme::PIN_W, theme::PIN_H))
         .push(mono(d.location.clone(), theme::STATUS_SIZE, theme::TEXT_SECONDARY));
 
     let titles = Column::new()
         .spacing(theme::HEADER_COLUMN_GAP)
-        .push(ui_medium("WireGuard", theme::TITLE_SIZE, theme::TEXT_PRIMARY))
+        .push(ui_medium(theme::TITLE, theme::TITLE_SIZE, theme::TEXT_PRIMARY))
         .push(status_row);
 
     let chip = widget::container(mono(d.iface.clone(), theme::CHIP_SIZE, theme::TEXT_FAINT))
-        .padding(CHIP_PAD)
+        .padding(theme::CHIP_PAD)
         .class(theme::chip_class());
 
     Row::new()
         .width(Length::Fill)
         .spacing(theme::HEADER_GAP)
         .align_y(Alignment::Center)
-        .padding(HEADER_PAD)
+        .padding(theme::HEADER_PAD)
+        // Explicit `#E6E8EC`, not `symbolic(true)`: the mark sits on the
+        // popup's own dark surface, so it must not follow the COSMIC
+        // theme's icon colour the way the panel button does.
         .push(
-            widget::icon(widget::icon::from_svg_bytes(assets::Y_SYMBOLIC).symbolic(true))
+            widget::icon(widget::icon::from_svg_bytes(assets::Y_SYMBOLIC))
+                .class(theme::svg_class(theme::TEXT_ON_SURFACE))
                 .width(Length::Fixed(f32::from(theme::MARK_PX)))
                 .height(Length::Fixed(f32::from(theme::MARK_PX))),
         )
@@ -202,7 +166,7 @@ fn header<'a>(d: &Display) -> Element<'a, Msg> {
 /// the handshake age on the right.
 fn accounts_band<'a>(d: &Display) -> Element<'a, Msg> {
     let left = Row::new()
-        .spacing(COUNT_GAP)
+        .spacing(theme::COUNT_GAP)
         .align_y(Alignment::Center)
         .push(count(d.accounts.to_string(), theme::TEXT_PRIMARY))
         .push(ui(d.accounts_label, theme::COUNT_LABEL_SIZE, theme::TEXT_SECONDARY));
@@ -213,7 +177,7 @@ fn accounts_band<'a>(d: &Display) -> Element<'a, Msg> {
         .push(mono(d.handshake.clone(), theme::BAND_RIGHT_SIZE, theme::TEXT_FAINT));
     Row::new()
         .width(Length::Fill)
-        .padding(BAND_PAD)
+        .padding(theme::BAND_PAD)
         .align_y(Alignment::Center)
         .push(left)
         .push(widget::space().width(Length::Fill))
@@ -230,7 +194,7 @@ fn tile<'a>(
     rate: String,
 ) -> Element<'a, Msg> {
     let label_row = Row::new()
-        .spacing(TILE_LABEL_GAP)
+        .spacing(theme::TILE_LABEL_GAP)
         .align_y(Alignment::Center)
         .push(glyph(arrow, theme::GLYPH_PX, theme::GLYPH_PX))
         .push(ui_medium(label, theme::TILE_LABEL_SIZE, theme::TEXT_FAINT));
@@ -241,7 +205,7 @@ fn tile<'a>(
             .push(mono(total, theme::TILE_TOTAL_SIZE, theme::TEXT_PRIMARY))
             .push(mono(rate, theme::TILE_RATE_SIZE, accent)),
     )
-    .padding(TILE_PAD)
+    .padding(theme::TILE_PAD)
     .width(Length::FillPortion(1))
     .class(theme::tile_class())
     .into()
@@ -251,16 +215,16 @@ fn tiles<'a>(d: &Display) -> Element<'a, Msg> {
     Row::new()
         .width(Length::Fill)
         .spacing(theme::TILE_GAP)
-        .padding(TILES_PAD)
+        .padding(theme::TILES_PAD)
         .push(tile(
-            "UPLOAD",
+            theme::UPLOAD_LABEL,
             assets::ARROW_UP,
             theme::ACCENT_UP,
             d.up_total.clone(),
             d.up_rate.clone(),
         ))
         .push(tile(
-            "DOWNLOAD",
+            theme::DOWNLOAD_LABEL,
             assets::ARROW_DOWN,
             theme::ACCENT_DOWN,
             d.down_total.clone(),
@@ -269,18 +233,22 @@ fn tiles<'a>(d: &Display) -> Element<'a, Msg> {
         .into()
 }
 
-/// The popup's contents. libcosmic's `popup_container` supplies the
-/// surface, blur, radius and shadow around this.
+/// The popup's contents, on the handoff's own surface.
+///
+/// libcosmic's `popup_container` supplies the shell surface, the blur and
+/// the shadow, but it paints the *COSMIC theme's* background — which under
+/// a light theme would leave this dark-only palette unreadable. So the
+/// content sits on `popup_surface_class()`, which covers it.
 pub fn popup(state: &Applet) -> Element<'_, Msg> {
     let d = state.display();
-    Column::new()
+    let content = Column::new()
         .width(Length::Fill)
         .spacing(theme::POPUP_PADDING)
         .padding(theme::POPUP_PADDING)
         .push(header(&d))
-        .push(divider(DIVIDER_ABOVE_BAND))
+        .push(divider(theme::DIVIDER_ABOVE_BAND))
         .push(accounts_band(&d))
-        .push(divider(DIVIDER_ABOVE_TILES))
-        .push(tiles(&d))
-        .into()
+        .push(divider(theme::DIVIDER_ABOVE_TILES))
+        .push(tiles(&d));
+    widget::container(content).width(Length::Fill).class(theme::popup_surface_class()).into()
 }
