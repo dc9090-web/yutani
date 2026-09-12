@@ -9,7 +9,7 @@
 //! `systemd-run --scope` would exit non-zero *without ever starting the
 //! game* — indistinguishable, from the exit code alone, from the game
 //! itself failing. So before wrapping we preflight the manager with a short
-//! `busctl --user --timeout=2 status`, run under [`crate::proc`]'s
+//! `busctl --user --timeout=2 status`, run under [`yutani::proc`]'s
 //! process-level timeout.
 //!
 //! The two bounds are not the same thing. `busctl`'s own `--timeout` bounds
@@ -76,7 +76,7 @@ pub fn should_wrap(preflight: Option<&Output>) -> bool {
 /// message.
 fn run_preflight() -> io::Result<Option<Output>> {
     let argv = preflight_argv();
-    crate::proc::output_with_timeout(Command::new(&argv[0]).args(&argv[1..]), PREFLIGHT_TIMEOUT)
+    yutani::proc::output_with_timeout(Command::new(&argv[0]).args(&argv[1..]), PREFLIGHT_TIMEOUT)
 }
 
 /// What to print when [`should_wrap`] said no. The three causes look
@@ -166,7 +166,7 @@ mod tests {
         // `output_with_timeout` reports a timeout as `Ok(None)`, which
         // `run_preflight` flattens to `None` — the same "run directly" path
         // as a missing `busctl`.
-        let timed_out: Option<Output> = crate::proc::output_with_timeout(
+        let timed_out: Option<Output> = yutani::proc::output_with_timeout(
             Command::new("sleep").arg("10"),
             Duration::from_millis(100),
         )

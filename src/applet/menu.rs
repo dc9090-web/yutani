@@ -118,6 +118,8 @@ mod tests {
                 address: None,
                 endpoint: None,
                 handshake_age_s: None,
+                up_for_s: None,
+                failed: false,
                 rx_bytes: 0,
                 tx_bytes: 0,
             },

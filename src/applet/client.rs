@@ -149,6 +149,8 @@ mod tests {
                 address: Some("10.2.0.2".into()),
                 endpoint: Some("198.51.100.10:51820".into()),
                 handshake_age_s: Some(21),
+                up_for_s: None,
+                failed: false,
                 rx_bytes: 413_100_000,
                 tx_bytes: 2_790_000_000,
             },

@@ -2,8 +2,8 @@
 //! tunnel's state without root.
 
 use anyhow::{Context as _, ensure};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Output};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::status::{TunnelFile, TunnelStatus, assemble};
 use super::{IFACE, STATUS_PATH, UNIT_NAME, UNIT_PATH};
@@ -49,9 +49,42 @@ pub fn sysfs_counters() -> Option<(u64, u64)> {
     Some((read("rx_bytes")?, read("tx_bytes")?))
 }
 
+/// How long `systemctl is-failed` may take before its answer is discarded.
+/// `current_tunnel_status` runs on every IPC `status` request — once a
+/// second while the applet's popup is open — so a systemd or dbus that
+/// accepts the call and then stalls must not stall the daemon with it.
+pub const UNIT_FAILED_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Read `systemctl is-failed`'s verdict off its exit status.
+///
+/// `is-failed` exits **0 only for a unit in the failed state**; 3 for an
+/// inactive one, 4 for a unit that does not exist, non-zero for everything
+/// else. So nothing but a clean exit counts — and `None` (the call timed
+/// out and was killed) is not evidence of anything, least of all failure.
+fn failed_from(out: Option<&Output>) -> bool {
+    out.is_some_and(|o| o.status.success())
+}
+
+/// Whether systemd calls the unit failed. Read-only and unprivileged: no
+/// polkit prompt, no state change.
+pub fn unit_failed() -> bool {
+    let argv = systemctl_argv("is-failed");
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    let out = crate::proc::output_with_timeout(&mut cmd, UNIT_FAILED_TIMEOUT).ok().flatten();
+    failed_from(out.as_ref())
+}
+
 pub fn current_tunnel_status(location: &str) -> TunnelStatus {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    assemble(read_tunnel_file().as_ref(), iface_present(), sysfs_counters(), installed(), location, now)
+    let installed = installed();
+    let iface = iface_present();
+    // Spec §3: a unit that is installed and simply stopped is the ordinary
+    // disconnected state — only systemd calling it *failed* is the attention
+    // state. Short-circuited so the common paths (nothing installed, or the
+    // link happily up) never spawn `systemctl` at all.
+    let failed = installed && !iface && unit_failed();
+    assemble(read_tunnel_file().as_ref(), iface, sysfs_counters(), installed, failed, location, now)
 }
 
 #[cfg(test)]
@@ -62,5 +95,32 @@ mod tests {
     fn systemctl_never_waits_on_an_authentication_agent() {
         assert_eq!(systemctl_argv("start"), vec!["systemctl", "--no-ask-password", "start", "yutani-tunnel.service"]);
         assert_eq!(systemctl_argv("stop"), vec!["systemctl", "--no-ask-password", "stop", "yutani-tunnel.service"]);
+        assert_eq!(systemctl_argv("is-failed"), vec!["systemctl", "--no-ask-password", "is-failed", "yutani-tunnel.service"]);
+    }
+
+    /// Only a clean exit 0 is the failed state, and a timed-out `systemctl`
+    /// (`None`) says nothing at all — it must not be read as "failed", which
+    /// would park the attention badge in the panel whenever systemd is slow.
+    #[test]
+    fn only_a_zero_exit_from_is_failed_counts_as_failed() {
+        let run = |program: &str| {
+            crate::proc::output_with_timeout(&mut Command::new(program), UNIT_FAILED_TIMEOUT).unwrap()
+        };
+        let zero = run("true");
+        let nonzero = run("false");
+        assert!(failed_from(zero.as_ref()), "exit 0 is the failed state");
+        assert!(!failed_from(nonzero.as_ref()), "any non-zero exit is not");
+        assert!(!failed_from(None), "a timeout is not evidence of failure");
+    }
+
+    /// Read-only and unprivileged, so the real command may run here. With
+    /// no unit installed `systemctl is-failed` prints `inactive` and exits
+    /// 4, which is emphatically not the failed state.
+    #[test]
+    fn a_unit_that_is_not_installed_is_not_failed() {
+        if installed() {
+            return; // a live install could legitimately be in any state
+        }
+        assert!(!unit_failed());
     }
 }

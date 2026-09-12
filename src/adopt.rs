@@ -98,7 +98,7 @@ pub const ADOPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// stay wherever they are unless they are themselves scanned and matched.
 pub fn adopt(c: &Candidate) -> anyhow::Result<()> {
     let argv = busctl_adopt_argv(c.pid);
-    let out = crate::proc::output_with_timeout(Command::new(&argv[0]).args(&argv[1..]), ADOPT_TIMEOUT)?
+    let out = yutani::proc::output_with_timeout(Command::new(&argv[0]).args(&argv[1..]), ADOPT_TIMEOUT)?
         .ok_or_else(|| anyhow::anyhow!("busctl did not answer within {ADOPT_TIMEOUT:?}"))?;
     anyhow::ensure!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr).trim());
     Ok(())

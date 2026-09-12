@@ -3,7 +3,6 @@ mod backend;
 mod cli;
 mod doctor;
 mod launch;
-mod proc;
 mod shortcuts;
 mod ui;
 

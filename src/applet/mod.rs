@@ -127,7 +127,7 @@ mod tests {
         let exe = daemon_exe();
         assert_eq!(exe.file_name().unwrap(), "yutani");
         // Either an absolute sibling that exists, or the bare name for PATH.
-        assert!(exe.is_absolute() && exe.is_file() || exe == std::path::PathBuf::from("yutani"));
+        assert!(exe.is_absolute() && exe.is_file() || exe == std::path::Path::new("yutani"));
     }
 
     #[test]
