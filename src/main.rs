@@ -4,6 +4,7 @@ mod doctor;
 mod ipc;
 mod model;
 mod shortcuts;
+mod tunnel;
 mod ui;
 
 use clap::{Parser, Subcommand};

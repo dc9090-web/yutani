@@ -48,6 +48,28 @@ impl Default for ShortcutsConfig {
     }
 }
 
+/// EVE-only WireGuard tunnel (spec 2026-09-12-yutani-tunnel-design.md).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TunnelConfig {
+    /// Label shown for the exit ("London").
+    pub location: String,
+    /// Move running EVE processes into the tunnel cgroup automatically.
+    pub auto_adopt: bool,
+    /// Executable names (case-insensitive) that count as EVE.
+    pub adopt_processes: Vec<String>,
+}
+
+impl Default for TunnelConfig {
+    fn default() -> Self {
+        Self {
+            location: "London".into(),
+            auto_adopt: true,
+            adopt_processes: vec!["exefile.exe".into(), "eve-online.exe".into(), "evelauncher.exe".into()],
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -84,6 +106,8 @@ pub struct Config {
     pub dock_edge: Edge,
     /// Keyboard shortcuts written by `yutani shortcuts install`.
     pub shortcuts: ShortcutsConfig,
+    /// EVE-only WireGuard tunnel.
+    pub tunnel: TunnelConfig,
 }
 
 impl Default for Config {
@@ -105,6 +129,7 @@ impl Default for Config {
             corner_radius: 8,
             dock_edge: Edge::Top,
             shortcuts: ShortcutsConfig::default(),
+            tunnel: TunnelConfig::default(),
         }
     }
 }
@@ -444,5 +469,17 @@ mod tests {
         let mut c = Config::default();
         c.shortcuts.focus_prefix = vec![Modifier::Super];
         assert_eq!(c.clone().validate(), c);
+    }
+
+    #[test]
+    fn tunnel_defaults_and_parse() {
+        let c = Config::default();
+        assert_eq!(c.tunnel.location, "London");
+        assert!(c.tunnel.auto_adopt);
+        assert_eq!(c.tunnel.adopt_processes, vec!["exefile.exe", "eve-online.exe", "evelauncher.exe"]);
+        let c: Config = ron::from_str("(tunnel: (location: \"Amsterdam\", auto_adopt: false))").unwrap();
+        assert_eq!(c.tunnel.location, "Amsterdam");
+        assert!(!c.tunnel.auto_adopt);
+        assert_eq!(c.tunnel.adopt_processes.len(), 3);
     }
 }
