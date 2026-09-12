@@ -66,7 +66,7 @@ pub struct ScreencopySession {
     session: CaptureSession,
     release: Option<SubsurfaceBufferRelease>,
     /// GL thumbnail targets, allocated on the first processed frame.
-    pub thumb: Option<ThumbPool>,
+    thumb: Option<ThumbPool>,
     last_submit: Instant,
     consecutive_failures: u32,
     /// At most one `ext_image_copy_capture_frame` may be outstanding per
@@ -155,6 +155,7 @@ impl AppData {
         if let Some(capture) = self.captures.remove(handle) {
             capture.stop();
         }
+        self.thumb_sizes.remove(handle);
     }
 
     /// Pause (or resume) capture for a client whose thumbnail the UI has
@@ -255,7 +256,14 @@ impl ScreencopyHandler for AppData {
         let front_size = buffers[0].size;
         let mut processed: Option<(Arc<BufferSource>, (u32, u32))> = None;
         let mut gl_error = None;
-        if let Some(size) = thumb_size {
+        // GL only works on dmabuf backings; a shm capture (fallback when the
+        // compositor has no usable gbm device) or a not-yet-sized/zero-sized
+        // thumbnail must silently take the raw path below without touching
+        // the failure counter, so no `Err` is produced for either case.
+        let can_gl = thumb_size.is_some_and(|(w, h)| w > 0 && h > 0)
+            && matches!(*buffers[0].backing, BufferSource::Dma(_));
+        if can_gl {
+            let size = thumb_size.unwrap();
             let ScreencopySession { buffers: bufs, thumb, .. } = state;
             let front = &mut bufs.as_mut().unwrap()[0];
             match self.gl_process(front, thumb, size, transform) {

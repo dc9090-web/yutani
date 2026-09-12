@@ -125,9 +125,9 @@ pub fn subscription(conn: Connection, app_ids: Vec<String>, fps: u32) -> iced::S
     iced::Subscription::run_with(Key { conn, app_ids, fps }, run)
 }
 
-/// The GL thumbnail pass is created lazily on the first dmabuf frame (it
-/// needs the compositor's main device) and disabled for good after
-/// repeated failures.
+/// The GL thumbnail pass is created lazily on the first frame for which the
+/// UI has sent a thumbnail size (it needs the compositor's main device) and
+/// disabled for good after repeated failures.
 pub enum GlState {
     Untried,
     Ready { gl: gl::Gl, consecutive_failures: u32 },
@@ -218,6 +218,10 @@ impl AppData {
                 self.set_paused(&handle, false, conn);
             }
             Cmd::SetThumbSize(handle, size) => {
+                if size.0 == 0 || size.1 == 0 {
+                    tracing::debug!("ignoring zero-sized thumb size {size:?} for {handle:?}");
+                    return;
+                }
                 self.thumb_sizes.insert(handle, size);
             }
             Cmd::SetCornerRadius(px) => {
@@ -231,6 +235,9 @@ impl AppData {
         if !matches!(self.gl, GlState::Untried) {
             return matches!(self.gl, GlState::Ready { .. });
         }
+        // No feedback yet (or the compositor never sent one): stay `Untried`
+        // rather than `Disabled` so a later frame, once feedback arrives,
+        // retries this instead of being stuck without GL for the session.
         let Some(dev) = self.dmabuf_feedback.as_ref().map(|f| f.main_device()) else { return false };
         let gbm = match self.gbm_devices.gbm_device(dev) {
             Ok(Some((_, gbm))) => gbm,
@@ -293,14 +300,18 @@ impl AppData {
         if !self.gl_init() {
             anyhow::bail!("GL pass unavailable");
         }
-        let modifiers = self.thumb_modifiers();
+        // Only (re)computed when the pool is about to be (re)allocated: this
+        // walks the compositor's whole format table/tranches, which is
+        // wasted work on the common per-frame path where the pool is reused.
+        let needs_pool = thumb.as_ref().is_none_or(|t| t.size != size);
+        let modifiers = if needs_pool { self.thumb_modifiers() } else { Vec::new() };
         let dev = self.dmabuf_feedback.as_ref().map(|f| f.main_device()).context("no dmabuf feedback")?;
         let radius = self.corner_radius_px;
         let AppData { gl, gbm_devices, .. } = self;
-        let GlState::Ready { gl, .. } = gl else { anyhow::bail!("GL pass unavailable") };
+        let GlState::Ready { gl, consecutive_failures } = gl else { anyhow::bail!("GL pass unavailable") };
         let (_, gbm) = gbm_devices.gbm_device(dev)?.context("gbm device vanished")?;
 
-        if thumb.as_ref().is_none_or(|t| t.size != size) {
+        if needs_pool {
             *thumb = Some(capture::ThumbPool {
                 size,
                 targets: [gl.create_target(gbm, &modifiers, size)?, gl.create_target(gbm, &modifiers, size)?],
@@ -314,6 +325,7 @@ impl AppData {
         // Render into the back target, then make it the front.
         gl.render(front.source.as_ref().unwrap(), &pool.targets[1], transform, radius)?;
         pool.targets.rotate_left(1);
+        *consecutive_failures = 0;
         Ok(pool.targets[0].backing.clone())
     }
 }
