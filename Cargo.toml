@@ -31,6 +31,9 @@ ron = "0.10"
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Same version and (default) features libcosmic already pulls in via
+# smithay-client-toolkit, so this adds no new dependency to the build.
+xkbcommon = "0.8"
 
 [profile.dev]
 opt-level = 1

@@ -177,13 +177,27 @@ impl Config {
             self.app_ids = d.app_ids.clone();
         }
         {
-            let (next, prev) = (self.shortcuts.next.trim(), self.shortcuts.prev.trim());
+            // Trimmed, because what is left here is what gets written to the
+            // shortcuts file verbatim, and " Right " is no keysym name.
+            let (next, prev) = (self.shortcuts.next.trim().to_string(), self.shortcuts.prev.trim().to_string());
+            let (next, prev) = (next.as_str(), prev.as_str());
             // Two bindings on one key would silently overwrite each other in
             // the shortcuts file; the digits are taken by `focus 1..9`.
             let is_digit = |k: &str| k.len() == 1 && k.as_bytes()[0].is_ascii_digit() && k != "0";
             if next.is_empty() || prev.is_empty() || next.eq_ignore_ascii_case(prev) || is_digit(next) || is_digit(prev) {
                 tracing::warn!("config: shortcuts.next/prev must be distinct, non-empty and not 1-9; using defaults");
                 self.shortcuts = ShortcutsConfig::default();
+            } else if resolve_keysym(next).is_none() || resolve_keysym(prev).is_none() {
+                // cosmic-settings-config reads `key` through
+                // `xkb::keysym_from_name`; a name that is not a keysym fails
+                // the whole `custom` map in cosmic-comp, which would silently
+                // disable *every* custom shortcut the user has, not just ours.
+                tracing::warn!(
+                    "config: shortcuts.next {next:?} / prev {prev:?} must be xkb keysym names (\"Right\", \"Tab\", \"a\", \"F12\"); using defaults"
+                );
+                self.shortcuts = ShortcutsConfig::default();
+            } else {
+                (self.shortcuts.next, self.shortcuts.prev) = (next.to_string(), prev.to_string());
             }
         }
         {
@@ -197,6 +211,19 @@ impl Config {
         }
         self
     }
+}
+
+/// Resolve an xkb keysym name the way cosmic-comp does: the exact name
+/// first, then a case-insensitive retry (so "right" finds `Right`). `None`
+/// for a name that is no keysym at all.
+pub fn resolve_keysym(name: &str) -> Option<xkbcommon::xkb::Keysym> {
+    use xkbcommon::xkb;
+    let exact = xkb::keysym_from_name(name, xkb::KEYSYM_NO_FLAGS);
+    if exact != xkb::Keysym::NoSymbol {
+        return Some(exact);
+    }
+    let lax = xkb::keysym_from_name(name, xkb::KEYSYM_CASE_INSENSITIVE);
+    (lax != xkb::Keysym::NoSymbol).then_some(lax)
 }
 
 /// "#rrggbb" or "#rrggbbaa" → [r, g, b, a] in 0.0–1.0.
@@ -383,6 +410,27 @@ mod tests {
         c.shortcuts.next = "Tab".into();
         c.shortcuts.prev = "grave".into();
         assert_eq!(c.clone().validate(), c);
+    }
+
+    #[test]
+    fn validate_rejects_keys_that_are_not_keysym_names() {
+        // cosmic-settings-config parses `key` with xkb::keysym_from_name; an
+        // unknown name fails the whole custom map and would silently disable
+        // every custom shortcut the user has.
+        let mut c = Config::default();
+        c.shortcuts.next = "Rihgt".into();
+        assert_eq!(c.validate().shortcuts.next, "Right");
+        let mut c = Config::default();
+        c.shortcuts.prev = "Ctrl+Left".into();
+        assert_eq!(c.validate().shortcuts.prev, "Left");
+        // Real keysym names survive, including ones that only differ in case.
+        let c = Config { shortcuts: ShortcutsConfig { next: "bracketright".into(), prev: "F12".into(), ..ShortcutsConfig::default() }, ..Config::default() };
+        assert_eq!(c.clone().validate(), c);
+        // Surrounding whitespace is what gets written to the shortcuts file,
+        // and " Right " is no keysym; keep the trimmed name, not the default.
+        let mut c = Config::default();
+        c.shortcuts.next = " Tab ".into();
+        assert_eq!(c.validate().shortcuts.next, "Tab");
     }
 
     #[test]

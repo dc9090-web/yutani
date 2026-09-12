@@ -8,8 +8,9 @@ use ron::value::RawValue;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use xkbcommon::xkb;
 
-use crate::model::config::{Modifier, ShortcutsConfig};
+use crate::model::config::{Modifier, ShortcutsConfig, resolve_keysym};
 
 /// cosmic-settings-daemon's `Binding`, field-for-field (it deserialises
 /// with `deny_unknown_fields`, so nothing may be added here). Upstream
@@ -88,20 +89,10 @@ pub fn is_ours(action_ron: &str) -> bool {
     word == "yutani" || word.ends_with("/yutani")
 }
 
-/// Undo `shell_word`'s single-quoting: collect characters up to the
-/// unescaped closing `'`, treating an embedded `'` as a literal character
-/// rather than the end of the word.
-///
-/// `shell_word` encodes an embedded `'` as the 4-byte sequence `'\''`
-/// (close-quote, backslash, escaped-quote, reopen-quote). That is what a
-/// RON file we wrote ourselves round-trips back to (RON escapes the `\` on
-/// write and restores it on read), so the first branch below handles the
-/// common case directly. But some RON decoders treat `\'` itself as an
-/// escape for a literal `'`, in which case the same source text decodes to
-/// a bare run of 3 quote characters instead (the backslash is consumed) —
-/// the second branch undoes that: an odd run of more than one quote is a
-/// close/escaped-quote/reopen group repeated (one literal `'` per pair),
-/// while a lone quote is a genuine closing quote.
+/// Undo `shell_word`'s single-quoting: collect characters up to the closing
+/// `'`, but read the 4-character sequence `'\''` (close-quote, backslash,
+/// escaped-quote, reopen-quote — how `shell_word` writes an embedded quote,
+/// and what RON gives back verbatim) as one literal `'`.
 fn unquote_word(rest: &str) -> String {
     let chars: Vec<char> = rest.chars().collect();
     let mut word = String::new();
@@ -113,18 +104,10 @@ fn unquote_word(rest: &str) -> String {
                 i += 4;
                 continue;
             }
-            let run = chars[i..].iter().take_while(|&&c| c == '\'').count();
-            if run == 1 || run % 2 == 0 {
-                break;
-            }
-            for _ in 0..(run - 1) / 2 {
-                word.push('\'');
-            }
-            i += run;
-        } else {
-            word.push(chars[i]);
-            i += 1;
+            break;
         }
+        word.push(chars[i]);
+        i += 1;
     }
     word
 }
@@ -161,16 +144,35 @@ fn render(entries: &Entries) -> anyhow::Result<String> {
 /// cosmic-comp identifies a binding by its (modifiers, key-or-keycode)
 /// chord alone — `description` plays no part, and modifier order doesn't
 /// matter (`[Alt, Ctrl]` == `[Ctrl, Alt]`).
-type Chord = (BTreeSet<Modifier>, Option<String>, Option<u32>);
+type Chord = (BTreeSet<Modifier>, Option<ChordKey>, Option<u32>);
+
+/// A binding's key as cosmic-comp sees it. Key *names* are not compared as
+/// text: cosmic resolves them through xkb, falling back to a
+/// case-insensitive lookup, so `key: "right"` and `key: "Right"` are one and
+/// the same chord. A name that resolves to no keysym at all keeps its raw
+/// spelling, so foreign entries we cannot interpret still round-trip and
+/// only ever collide with an identical spelling.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ChordKey {
+    Sym(u32),
+    Unresolved(String),
+}
 
 fn chord_of(binding: &Binding) -> Chord {
-    (binding.modifiers.iter().copied().collect(), binding.key.clone(), binding.keycode)
+    let key = binding.key.as_ref().map(|k| match resolve_keysym(k) {
+        Some(sym) => ChordKey::Sym(sym.raw()),
+        None => ChordKey::Unresolved(k.clone()),
+    });
+    (binding.modifiers.iter().copied().collect(), key, binding.keycode)
 }
 
 fn chord_display((modifiers, key, keycode): &Chord) -> String {
     let mods = modifiers.iter().map(|m| format!("{m:?}")).collect::<Vec<_>>().join("+");
     match (key, keycode) {
-        (Some(k), _) => format!("{mods}+{k}"),
+        // The canonical keysym name, which may differ in case from either
+        // spelling that produced the collision.
+        (Some(ChordKey::Sym(sym)), _) => format!("{mods}+{}", xkb::keysym_get_name(xkb::Keysym::new(*sym))),
+        (Some(ChordKey::Unresolved(k)), _) => format!("{mods}+{k}"),
         (None, Some(kc)) => format!("{mods}+keycode {kc}"),
         (None, None) => mods,
     }
@@ -178,10 +180,11 @@ fn chord_display((modifiers, key, keycode): &Chord) -> String {
 
 /// `existing` with every yutani entry removed and `ours` added, except any
 /// of `ours` whose chord collides with a surviving foreign entry — writing
-/// both would leave two entries in the file keyed on the same chord, and
-/// cosmic-comp (and RON map parsing generally) only keeps the last one, so
-/// one binding would silently vanish. Colliding entries are skipped
-/// instead; the second return value describes each one skipped.
+/// both would leave two entries in the file on the same chord (they differ
+/// in `description`, so both survive parsing) and cosmic-comp would pick one
+/// of them non-deterministically, silently shadowing the other. Colliding
+/// entries are skipped instead; the second return value describes each one
+/// skipped.
 pub fn merge(existing: &str, ours: &[(Binding, String)]) -> anyhow::Result<(String, Vec<String>)> {
     let mut entries = parse(existing)?;
     entries.retain(|_, action| !is_ours(action.get_ron()));
@@ -234,10 +237,10 @@ fn write_in_place(path: &std::path::Path, text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Write our bindings; returns how many were actually written (fewer than
-/// `desired`'s count when some collided with a foreign binding and were
-/// skipped — see `merge`).
-pub fn install(cfg: &ShortcutsConfig) -> anyhow::Result<usize> {
+/// Write our bindings; returns (written, wanted). Fewer are written than
+/// wanted when some collided with a foreign binding and were skipped — see
+/// `merge`.
+pub fn install(cfg: &ShortcutsConfig) -> anyhow::Result<(usize, usize)> {
     let exe = std::env::current_exe().context("current_exe")?;
     let ours = desired(cfg, &exe.to_string_lossy());
     let path = custom_path();
@@ -245,8 +248,11 @@ pub fn install(cfg: &ShortcutsConfig) -> anyhow::Result<usize> {
     for reason in &skipped {
         eprintln!("warning: skipped {reason}");
     }
+    // Never hand cosmic-comp a file we cannot read back ourselves: a `custom`
+    // file it fails to parse disables every custom shortcut the user has.
+    parse(&merged).context("refusing to write a shortcuts file that does not parse back")?;
     write_in_place(&path, &merged)?;
-    Ok(ours.len() - skipped.len())
+    Ok((ours.len() - skipped.len(), ours.len()))
 }
 
 /// Remove our bindings; returns how many were removed.
@@ -370,6 +376,36 @@ mod tests {
     }
 
     #[test]
+    fn merge_skips_chord_bound_under_a_differently_cased_key_name() {
+        // cosmic-comp resolves a keysym name case-insensitively when the
+        // exact name misses, so a foreign `right` is the very same chord as
+        // our `Right` and must be treated as a collision.
+        let foreign = r#"{
+    (modifiers: [Ctrl, Alt], key: "right", description: Some("mine")): Spawn("foo"),
+}"#;
+        let (out, skipped) = merge(foreign, &desired(&cfg(), "yutani")).unwrap();
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(skipped[0].contains("Ctrl+Alt+Right"), "{skipped:?}");
+        assert!(out.contains(r#"Spawn("foo")"#));
+        assert!(!out.contains(r#"Spawn("yutani next")"#));
+        // 1 foreign entry + 10 of ours (11 desired, minus the 1 skipped).
+        let map: Entries = ron::from_str(&out).unwrap();
+        assert_eq!(map.len(), 11);
+    }
+
+    #[test]
+    fn merge_keeps_foreign_entries_whose_key_is_not_a_keysym_name() {
+        // A key that resolves to nothing is compared by its raw name, so such
+        // a foreign entry neither collides with ours nor is dropped.
+        let foreign = r#"{ (modifiers: [Ctrl, Alt], key: "Nonsense"): Spawn("foo") }"#;
+        let (out, skipped) = merge(foreign, &desired(&cfg(), "yutani")).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(out.contains(r#"key: "Nonsense""#));
+        let map: Entries = ron::from_str(&out).unwrap();
+        assert_eq!(map.len(), 12);
+    }
+
+    #[test]
     fn shell_quotes_paths_with_spaces() {
         let d = desired(&cfg(), "/home/me/My Apps/yutani");
         assert_eq!(d[0].1, "'/home/me/My Apps/yutani' focus 1");
@@ -377,12 +413,20 @@ mod tests {
     }
 
     #[test]
-    fn is_ours_unquotes_embedded_apostrophes_in_exe_path() {
+    fn embedded_apostrophe_in_exe_path_round_trips_through_the_file() {
         // shell_word encodes an embedded `'` as `'\''`; is_ours must undo
-        // that instead of stopping at the first `'` it finds.
+        // that instead of stopping at the first `'` it finds. Checked on our
+        // own rendered output rather than a hand-written literal, so it can
+        // only pass if the whole write/read cycle agrees.
         let exe = "/home/me/it's/yutani";
         let d = desired(&cfg(), exe);
         assert_eq!(d[9].1, r"'/home/me/it'\''s/yutani' next");
-        assert!(is_ours(r#"Spawn("'/home/me/it'\''s/yutani' focus 1")"#));
+        let (out, skipped) = merge("", &d).unwrap();
+        assert!(skipped.is_empty());
+        let map: Entries = ron::from_str(&out).unwrap();
+        assert_eq!(map.len(), 11);
+        assert!(map.values().all(|action| is_ours(action.get_ron())), "{out}");
+        // …and being ours, a following uninstall takes them all away again.
+        assert_eq!(strip(&out).unwrap().trim(), "{}");
     }
 }

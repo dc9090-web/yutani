@@ -6586,6 +6586,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "xkbcommon 0.8.0",
 ]
 
 [[package]]

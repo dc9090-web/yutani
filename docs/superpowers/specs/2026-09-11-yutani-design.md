@@ -344,7 +344,7 @@ goes to the first.
 
 *Status after plan 4:* implemented as `yutani shortcuts install|uninstall`
 (CLI; the settings-window buttons come with plan 5). Commands are written
-with the absolute path of the installed binary. The file is written in place (not tmp+rename): cosmic-config's watcher ignores paired rename events and keys changes by the touched file's name, so only a direct write makes cosmic-comp reload `custom` (verified live 2026-09-12). The window in which a concurrent reader could see a partial file is accepted for this rare, interactive operation.
+with the absolute path of the installed binary. The file is written in place (not tmp+rename): cosmic-config's watcher ignores paired rename events and keys changes by the touched file's name, so only a direct write makes cosmic-comp reload `custom` (verified live 2026-09-12). The window in which a concurrent reader could see a partial file is accepted for this rare, interactive operation. Any of our chords that another custom shortcut already binds is skipped rather than written (a second entry on the same chord would silently shadow one of them), and each skip is reported on stderr, with the summary line reading `installed N of M shortcuts`. The `[shortcuts]` config is validated before use: `focus_prefix` must be non-empty with no duplicate modifiers, and `next`/`prev` must be valid xkb keysym names, distinct from each other and not the digits 1-9 (which `focus` takes) — an invalid name would make cosmic-comp fail the whole `custom` map and silently disable every custom shortcut the user has; invalid values fall back to the defaults with a warning.
 
 ## 8. IPC
 

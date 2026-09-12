@@ -73,8 +73,12 @@ fn main() -> ExitCode {
         Some(Command::Quit) => Ok(cli::send(&ipc::Request::Quit)),
         Some(Command::Shortcuts { action: ShortcutsAction::Install }) => {
             let config = model::config::Config::load();
-            shortcuts::install(&config.shortcuts).map(|n| {
-                println!("installed {n} shortcuts into {}", shortcuts::custom_path().display());
+            shortcuts::install(&config.shortcuts).map(|(installed, wanted)| {
+                let path = shortcuts::custom_path();
+                // Say "N of M" when some were skipped, so the summary line on
+                // its own shows that something was left out.
+                let count = if installed == wanted { installed.to_string() } else { format!("{installed} of {wanted}") };
+                println!("installed {count} shortcuts into {}", path.display());
                 ExitCode::SUCCESS
             })
         }
