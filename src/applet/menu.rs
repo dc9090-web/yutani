@@ -71,7 +71,9 @@ pub fn rows(status: Option<&Status>, accounts_open: bool) -> Vec<MenuRow> {
 
     let mut accounts = MenuRow::new("Accounts…", None);
     accounts.trailing = Some(s.clients.len().to_string());
-    accounts.toggles_accounts = true;
+    // With nothing to list there is nothing to expand: the header still
+    // shows the count (0) but is disabled like any other actionless row.
+    accounts.toggles_accounts = !s.clients.is_empty();
     out.push(accounts);
     if accounts_open {
         for (i, client) in s.clients.iter().enumerate() {
@@ -215,5 +217,41 @@ mod tests {
             assert_eq!(rows.last().unwrap().label, "Quit");
             assert_eq!(rows.iter().filter(|r| r.kind == RowKind::Danger).count(), 1);
         }
+    }
+
+    /// A header with nothing under it must not pretend to expand: no
+    /// clients means no expansion rows even while `accounts_open` is true,
+    /// and the header itself reads as disabled — the trailing count still
+    /// shows the truthful `0`.
+    #[test]
+    fn accounts_with_no_clients_cannot_be_expanded() {
+        let s = status(true, true, false, &[]);
+        let rows = rows(Some(&s), true);
+        assert_eq!(
+            labels(&rows),
+            vec!["Disconnect tunnel", "Accounts…", "Preferences…", "Hide thumbnails", "Quit"]
+        );
+        assert_eq!(rows[1].trailing.as_deref(), Some("0"));
+        assert!(!rows[1].toggles_accounts, "an empty list has nothing to expand");
+        assert!(rows[1].action.is_none());
+        assert!(rows[1].disabled());
+    }
+
+    /// Every combination of `action` and `toggles_accounts`:
+    /// [`MenuRow::disabled`] is true only when neither can fire a message.
+    #[test]
+    fn disabled_covers_every_combination_of_action_and_toggle() {
+        let mut row = MenuRow::new("x", None);
+        assert!(row.disabled(), "no action, no toggle: pressing it does nothing");
+
+        row.toggles_accounts = true;
+        assert!(!row.disabled(), "a toggle presses even with no action (Accounts…)");
+
+        row.toggles_accounts = false;
+        row.action = Some(Action::Quit);
+        assert!(!row.disabled(), "an action presses even with no toggle");
+
+        row.toggles_accounts = true;
+        assert!(!row.disabled(), "either an action or a toggle is enough to enable a row");
     }
 }

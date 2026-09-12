@@ -121,10 +121,10 @@ pub const TILES_PAD: Padding = pad(2.0, 10.0, 2.0, 10.0);
 pub const CHIP_PAD: Padding = pad(4.0, 8.0, 4.0, 8.0);
 /// One traffic tile — `11px 13px`.
 pub const TILE_PAD: Padding = pad(11.0, 13.0, 11.0, 13.0);
-/// The divider above the menu group — `2px 10px`.
+/// The divider above the menu group *and* the one above Quit — both
+/// `2px 10px` in the handoff (§6, §8), and so byte-identical: one token
+/// for both rather than two consts that could only ever agree by luck.
 pub const DIVIDER_ABOVE_MENU: Padding = pad(2.0, 10.0, 2.0, 10.0);
-/// The divider above Quit — `2px 10px`.
-pub const DIVIDER_ABOVE_QUIT: Padding = pad(2.0, 10.0, 2.0, 10.0);
 /// One menu row — `9px 10px`, so its label lines up with the header's.
 pub const MENU_ROW_PAD: Padding = pad(9.0, 10.0, 9.0, 10.0);
 /// A client row under an expanded Accounts…. The extra 2 px of left
@@ -250,11 +250,13 @@ fn row_style(text: Color, fill: Option<Color>) -> button::Style {
 /// A menu row: radius 8, transparent at rest, `hover` under the pointer,
 /// `pressed` while held, and [`DISABLED_ALPHA`] text when disabled.
 ///
-/// `held` paints the hover fill at rest — the expanded Accounts… header,
-/// which stays lit for as long as its list is open. (The handoff has no
-/// chevron glyph, so the fill is the affordance.)
+/// `held` paints the *Active fill* (`pressed`) at rest — the expanded
+/// Accounts… header, which stays lit for as long as its list is open. (The
+/// handoff has no chevron glyph, so the fill is the affordance.) `hovered`
+/// is untouched by `held`, so moving the pointer over the open header still
+/// darkens it a step further to the ordinary hover fill.
 pub fn menu_row_class(text: Color, hover: Color, pressed: Color, held: bool) -> cosmic::theme::Button {
-    let rest = held.then_some(hover);
+    let rest = held.then_some(pressed);
     cosmic::theme::Button::Custom {
         active: Box::new(move |_focused, _theme| row_style(text, rest)),
         disabled: Box::new(move |_theme| row_style(dimmed(text), None)),
@@ -317,7 +319,6 @@ mod tests {
         assert_eq!(CHIP_PAD, pad(4.0, 8.0, 4.0, 8.0));
         assert_eq!(TILE_PAD, pad(11.0, 13.0, 11.0, 13.0));
         assert_eq!(DIVIDER_ABOVE_MENU, pad(2.0, 10.0, 2.0, 10.0));
-        assert_eq!(DIVIDER_ABOVE_QUIT, pad(2.0, 10.0, 2.0, 10.0));
         assert_eq!(MENU_ROW_PAD, pad(9.0, 10.0, 9.0, 10.0));
         assert_eq!(NOTE_PAD, pad(2.0, 10.0, 4.0, 10.0));
         // A client row only differs from a normal one on the left.

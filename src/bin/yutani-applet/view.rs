@@ -34,6 +34,20 @@ fn ui<'a>(
         .into()
 }
 
+/// A menu row's label. Unlike [`ui`], it clips rather than wraps: a client
+/// name is arbitrary user text, and a header like "Accounts…" is fixed
+/// English that never needs a second line either — so no row label should
+/// ever grow the popup's height by wrapping. It clips instead, at whatever
+/// width the trailing hint/count leaves it.
+fn row_label<'a>(content: impl Into<std::borrow::Cow<'a, str>> + 'a, color: Color) -> Element<'a, Msg> {
+    widget::text(content)
+        .size(theme::MENU_SIZE)
+        .line_height(theme::LINE_HEIGHT)
+        .class(cosmic_theme::Text::Color(color))
+        .wrapping(cosmic::iced::widget::text::Wrapping::None)
+        .into()
+}
+
 /// UI-font text at the handoff's 500 weight.
 fn ui_medium<'a>(
     content: impl Into<std::borrow::Cow<'a, str>> + 'a,
@@ -269,7 +283,7 @@ fn menu_row<'a>(row: MenuRow, held: bool) -> Element<'a, Msg> {
         content = content.push(dot(marker, false));
     }
     content = content
-        .push(ui(row.label, theme::MENU_SIZE, label_ink))
+        .push(row_label(row.label, label_ink))
         // Hints and counts are right-aligned against the row's far edge.
         .push(widget::space().width(Length::Fill));
     if let Some(hint) = row.hint {
@@ -307,7 +321,10 @@ fn note_line<'a>(note: &Note) -> Element<'a, Msg> {
 
 /// The menu group: the rows for the current state, the hairline the handoff
 /// puts above Quit, and the error note under whichever row earned it
-/// (spec §7). A note from a failed poll belongs to no row, so it goes last.
+/// (spec §7). A note from a failed poll belongs to no row — it goes above
+/// the Quit divider, at the foot of the ordinary rows, rather than under
+/// the danger row it has nothing to do with. (If there is no Quit row to
+/// anchor to — the offline state — it falls back to the very end.)
 fn menu(state: &Applet) -> Element<'_, Msg> {
     let rows = yutani::applet::menu::rows(state.status.as_ref(), state.accounts_open);
     let note = state.note.as_ref().filter(|n| note_visible(n.at_ms, state.now_ms()));
@@ -315,7 +332,11 @@ fn menu(state: &Applet) -> Element<'_, Msg> {
     let mut placed = false;
     for row in rows {
         if row.kind == RowKind::Danger {
-            group = group.push(divider(theme::DIVIDER_ABOVE_QUIT));
+            if let Some(note) = note.filter(|n| n.action.is_none()) {
+                group = group.push(note_line(note));
+                placed = true;
+            }
+            group = group.push(divider(theme::DIVIDER_ABOVE_MENU));
         }
         // The Accounts… header stays lit while its list is open.
         let held = row.toggles_accounts && state.accounts_open;

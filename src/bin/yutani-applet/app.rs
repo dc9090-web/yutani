@@ -1,6 +1,9 @@
 //! The applet's `cosmic::Application`: poll `status`, keep the last reply,
 //! render it, send actions back. No domain state of its own.
 
+use std::io;
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use cosmic::app::{Core, Task};
@@ -66,6 +69,22 @@ pub enum Msg {
     PopupClosed(Id),
 }
 
+/// Spawn `cmd` fully detached from the applet: no inherited stdio (so a
+/// noisy child cannot write to whatever the applet's own stdio happens to
+/// be), its own process group (so a signal aimed at the applet's process
+/// group — the panel's, at logout — does not also reach it), and reaped on
+/// a dedicated thread so a finished child never sits as a zombie under the
+/// applet's pid for as long as the applet keeps running. Used for both
+/// fire-and-forget spawns: `xdg-open` and `Start Yutani`.
+fn spawn_detached(cmd: &mut Command) -> io::Result<()> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0);
+    let mut child = cmd.spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 impl Applet {
     pub fn now_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
@@ -104,11 +123,19 @@ impl Applet {
         {
             return Err(format!("{err:#}"));
         }
-        std::process::Command::new("xdg-open")
-            .arg(&path)
-            .spawn()
-            .map(|_| ())
-            .map_err(|_| format!("open {} manually", path.display()))
+        let mut cmd = Command::new("xdg-open");
+        cmd.arg(&path);
+        spawn_detached(&mut cmd).map_err(|err| {
+            // The note never spells the expanded path (that leaks the
+            // user's home directory into a UI string); it always says
+            // exactly what a person would type.
+            let reason = if err.kind() == io::ErrorKind::NotFound {
+                "xdg-open is missing".to_string()
+            } else {
+                format!("could not run xdg-open: {err}")
+            };
+            format!("{reason}: open ~/.config/yutani/config.ron manually")
+        })
     }
 }
 
@@ -215,14 +242,16 @@ impl cosmic::Application for Applet {
                 }
                 Task::none()
             }
-            Msg::Press(Action::StartDaemon) => match std::process::Command::new(daemon_exe()).spawn()
-            {
-                Ok(_) => self.poll(),
-                Err(err) => {
-                    self.note(format!("cannot start yutani: {err}"), Some(Action::StartDaemon));
-                    Task::none()
+            Msg::Press(Action::StartDaemon) => {
+                let mut cmd = Command::new(daemon_exe());
+                match spawn_detached(&mut cmd) {
+                    Ok(()) => self.poll(),
+                    Err(err) => {
+                        self.note(format!("cannot start yutani: {err}"), Some(Action::StartDaemon));
+                        Task::none()
+                    }
                 }
-            },
+            }
             Msg::Press(action) => {
                 let Some(request) = action.request() else {
                     return Task::none();
@@ -309,4 +338,63 @@ pub fn open_popup_message(bounds: Rectangle, offset: cosmic::iced::Vector) -> Ms
 /// Close the open popup.
 pub fn close_popup_message(id: Id) -> Msg {
     Msg::Surface(destroy_popup(id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// How many of this process's children `/proc` currently lists as
+    /// zombies (state `Z`) — i.e. exited but not yet `wait`ed on.
+    fn zombie_children_of(parent: u32) -> usize {
+        let Ok(entries) = std::fs::read_dir("/proc") else { return 0 };
+        entries
+            .flatten()
+            .filter(|entry| {
+                let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                    return false;
+                };
+                // `pid (comm) state ppid ...` — `comm` may itself contain
+                // spaces or parens, so split after its closing `)`.
+                let Some(after_comm) = stat.rsplit_once(')') else { return false };
+                let fields: Vec<&str> = after_comm.1.split_whitespace().collect();
+                let (Some(&state), Some(ppid)) =
+                    (fields.first(), fields.get(1).and_then(|p| p.parse::<u32>().ok()))
+                else {
+                    return false;
+                };
+                state == "Z" && ppid == parent
+            })
+            .count()
+    }
+
+    /// `/bin/true` exits immediately; a well-behaved detached spawn leaves
+    /// no trace of it once its reaper thread has had a moment to run.
+    #[test]
+    fn spawn_detached_runs_the_child_and_reaps_it_without_blocking() {
+        let before = zombie_children_of(std::process::id());
+
+        let mut cmd = Command::new("/bin/true");
+        let result = spawn_detached(&mut cmd);
+        assert!(result.is_ok(), "{result:?}");
+
+        // spawn_detached must not itself block on the child, so this line
+        // is reached immediately; give the background reaper thread a
+        // moment to run before checking for a zombie.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            zombie_children_of(std::process::id()),
+            before,
+            "the detached child must be reaped, not left as a zombie"
+        );
+    }
+
+    /// A command that cannot even start (no such binary) is a plain
+    /// `spawn` error, not a panic or a hang.
+    #[test]
+    fn spawn_detached_reports_a_missing_binary_as_an_error() {
+        let mut cmd = Command::new("/no/such/binary-yutani-test");
+        let err = spawn_detached(&mut cmd).expect_err("must not exist");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
 }
