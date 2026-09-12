@@ -171,12 +171,28 @@ impl Config {
     }
 
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let text = ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default())?;
-        std::fs::write(path, text)?;
+        super::write_atomic(path, &text)?;
         Ok(())
+    }
+
+    /// Strict load, for the settings window's "is the user's file broken?"
+    /// check: `Ok(None)` = no file yet (defaults are in force and saving is
+    /// fine), `Ok(Some(config))` = it parsed (and was validated), `Err` =
+    /// it exists but cannot be read or parsed, in which case nothing may
+    /// overwrite it (spec §9/§10).
+    pub fn try_load_from(path: &Path) -> Result<Option<Config>, String> {
+        match std::fs::read_to_string(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+            Ok(text) => ron::from_str::<Config>(&text)
+                .map(|c| Some(c.validate()))
+                .map_err(|e| format!("cannot parse {}: {e}", path.display())),
+        }
+    }
+
+    pub fn try_load() -> Result<Option<Config>, String> {
+        Self::try_load_from(&config_path())
     }
 
     /// Replace out-of-range values with defaults, warning about each.
@@ -506,5 +522,24 @@ mod tests {
         let mut c = Config::default();
         c.tunnel.adopt_processes = vec!["".into(), "   ".into()];
         assert_eq!(c.validate().tunnel.adopt_processes, Config::default().tunnel.adopt_processes);
+    }
+
+    #[test]
+    fn try_load_from_distinguishes_missing_from_broken() {
+        let dir = std::env::temp_dir().join(format!("yutani-try-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.ron");
+        assert_eq!(Config::try_load_from(&path), Ok(None));
+        std::fs::write(&path, "(fps: 60)").unwrap();
+        assert_eq!(Config::try_load_from(&path).unwrap().unwrap().fps, 60);
+        // Out-of-range values are still repaired, not an error.
+        std::fs::write(&path, "(fps: 17)").unwrap();
+        assert_eq!(Config::try_load_from(&path).unwrap().unwrap().fps, 30);
+        std::fs::write(&path, "(this is not ron").unwrap();
+        assert!(Config::try_load_from(&path).unwrap_err().contains("cannot parse"));
+        // A broken file is never rewritten by a failed read.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "(this is not ron");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
