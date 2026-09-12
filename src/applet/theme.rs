@@ -44,6 +44,9 @@ pub const TILE_FILL: Color = rgba(0xFF, 0xFF, 0xFF, 0x08 as f32 / 255.0);
 pub const CHIP_FILL: Color = rgba(0xFF, 0xFF, 0xFF, 0x0F as f32 / 255.0);
 /// `#FFFFFF12` — hairline dividers and menu hover.
 pub const HAIRLINE: Color = rgba(0xFF, 0xFF, 0xFF, 0x12 as f32 / 255.0);
+/// `#FFFFFF1F` — the handoff's "Active fill": a menu row under the
+/// pointer's press, and the Accounts… header while its list is open.
+pub const ACTIVE_FILL: Color = rgba(0xFF, 0xFF, 0xFF, 0x1F as f32 / 255.0);
 /// `#1A1D21F5` — the popup's own surface.
 ///
 /// The handoff is a dark-only design: every colour above it is light ink on
@@ -84,6 +87,14 @@ pub const GLYPH_PX: u16 = 10;
 pub const MENU_SIZE: f32 = 13.5;
 pub const MENU_HINT_SIZE: f32 = 10.5;
 pub const MENU_RADIUS: f32 = 8.0;
+/// The menu group's 1 px row rhythm (handoff §7 `gap: 1px`).
+pub const MENU_GAP: u16 = 1;
+/// Between a row's dot, label, hint and trailing value.
+pub const MENU_ROW_GAP: u16 = 8;
+/// What a row's label, hint and trailing value fade to when the row cannot
+/// be pressed. The labels carry explicit colours, so libcosmic's own
+/// `disabled` button style never reaches them — [`dimmed`] does.
+pub const DISABLED_ALPHA: f32 = 0.4;
 /// The panel icon's opacity in the daemon-offline / not-installed state.
 pub const DIM_OPACITY: f32 = 0.38;
 
@@ -110,6 +121,19 @@ pub const TILES_PAD: Padding = pad(2.0, 10.0, 2.0, 10.0);
 pub const CHIP_PAD: Padding = pad(4.0, 8.0, 4.0, 8.0);
 /// One traffic tile — `11px 13px`.
 pub const TILE_PAD: Padding = pad(11.0, 13.0, 11.0, 13.0);
+/// The divider above the menu group — `2px 10px`.
+pub const DIVIDER_ABOVE_MENU: Padding = pad(2.0, 10.0, 2.0, 10.0);
+/// The divider above Quit — `2px 10px`.
+pub const DIVIDER_ABOVE_QUIT: Padding = pad(2.0, 10.0, 2.0, 10.0);
+/// One menu row — `9px 10px`, so its label lines up with the header's.
+pub const MENU_ROW_PAD: Padding = pad(9.0, 10.0, 9.0, 10.0);
+/// A client row under an expanded Accounts…. The extra 2 px of left
+/// padding plus the dot and its gap indent the label one step (17 px)
+/// under its header, which is what reads as a sub-list.
+pub const MENU_ACCOUNT_PAD: Padding = pad(9.0, 10.0, 9.0, 12.0);
+/// An `err …` note, under the row it belongs to (spec §7). Its left edge
+/// is the row label's.
+pub const NOTE_PAD: Padding = pad(2.0, 10.0, 4.0, 10.0);
 /// Between the accounts count and its label.
 pub const COUNT_GAP: u16 = 8;
 /// Between a tile's arrow glyph and its label.
@@ -208,6 +232,11 @@ pub fn tile_class() -> cosmic::theme::Container<'static> {
     })
 }
 
+/// A colour faded to [`DISABLED_ALPHA`].
+pub fn dimmed(color: Color) -> Color {
+    Color { a: color.a * DISABLED_ALPHA, ..color }
+}
+
 fn row_style(text: Color, fill: Option<Color>) -> button::Style {
     button::Style {
         background: fill.map(Background::Color),
@@ -218,15 +247,19 @@ fn row_style(text: Color, fill: Option<Color>) -> button::Style {
     }
 }
 
-/// A menu row: transparent, radius 8, `hover` fill on hover and press, and
-/// 40 % text when disabled.
-pub fn menu_row_class(text: Color, hover: Color) -> cosmic::theme::Button {
-    let dim = Color { a: 0.4, ..text };
+/// A menu row: radius 8, transparent at rest, `hover` under the pointer,
+/// `pressed` while held, and [`DISABLED_ALPHA`] text when disabled.
+///
+/// `held` paints the hover fill at rest — the expanded Accounts… header,
+/// which stays lit for as long as its list is open. (The handoff has no
+/// chevron glyph, so the fill is the affordance.)
+pub fn menu_row_class(text: Color, hover: Color, pressed: Color, held: bool) -> cosmic::theme::Button {
+    let rest = held.then_some(hover);
     cosmic::theme::Button::Custom {
-        active: Box::new(move |_focused, _theme| row_style(text, None)),
-        disabled: Box::new(move |_theme| row_style(dim, None)),
+        active: Box::new(move |_focused, _theme| row_style(text, rest)),
+        disabled: Box::new(move |_theme| row_style(dimmed(text), None)),
         hovered: Box::new(move |_focused, _theme| row_style(text, Some(hover))),
-        pressed: Box::new(move |_focused, _theme| row_style(text, Some(hover))),
+        pressed: Box::new(move |_focused, _theme| row_style(text, Some(pressed))),
     }
 }
 
@@ -258,6 +291,7 @@ mod tests {
         expect(TILE_FILL, "#FFFFFF08");
         expect(CHIP_FILL, "#FFFFFF0F");
         expect(HAIRLINE, "#FFFFFF12");
+        expect(ACTIVE_FILL, "#FFFFFF1F");
         expect(POPUP_SURFACE, "#1A1D21F5");
         expect(POPUP_BORDER, "#FFFFFF1A");
     }
@@ -271,6 +305,7 @@ mod tests {
         assert_eq!((COUNT_SIZE, COUNT_LABEL_SIZE, BAND_RIGHT_SIZE), (22.0, 13.0, 10.5));
         assert_eq!((TILE_LABEL_SIZE, TILE_TOTAL_SIZE, TILE_RATE_SIZE), (10.0, 16.0, 11.0));
         assert_eq!((MENU_SIZE, MENU_HINT_SIZE, MENU_RADIUS), (13.5, 10.5, 8.0));
+        assert_eq!((MENU_GAP, MENU_ROW_GAP, DISABLED_ALPHA), (1, 8, 0.4));
         assert_eq!(DIM_OPACITY, 0.38);
         // The handoff's per-section padding shorthands, in its own order
         // (top, right, bottom, left).
@@ -281,6 +316,16 @@ mod tests {
         assert_eq!(TILES_PAD, pad(2.0, 10.0, 2.0, 10.0));
         assert_eq!(CHIP_PAD, pad(4.0, 8.0, 4.0, 8.0));
         assert_eq!(TILE_PAD, pad(11.0, 13.0, 11.0, 13.0));
+        assert_eq!(DIVIDER_ABOVE_MENU, pad(2.0, 10.0, 2.0, 10.0));
+        assert_eq!(DIVIDER_ABOVE_QUIT, pad(2.0, 10.0, 2.0, 10.0));
+        assert_eq!(MENU_ROW_PAD, pad(9.0, 10.0, 9.0, 10.0));
+        assert_eq!(NOTE_PAD, pad(2.0, 10.0, 4.0, 10.0));
+        // A client row only differs from a normal one on the left.
+        assert_eq!(MENU_ACCOUNT_PAD.left - MENU_ROW_PAD.left, 2.0);
+        assert_eq!(
+            (MENU_ACCOUNT_PAD.top, MENU_ACCOUNT_PAD.right, MENU_ACCOUNT_PAD.bottom),
+            (MENU_ROW_PAD.top, MENU_ROW_PAD.right, MENU_ROW_PAD.bottom)
+        );
         assert_eq!((COUNT_GAP, TILE_LABEL_GAP), (8, 6));
         assert_eq!((PIN_W, PIN_H), (10, 12));
         assert_eq!((LINE_HEIGHT, LINE_HEIGHT_TIGHT), (1.3, 1.0));
@@ -294,6 +339,8 @@ mod tests {
             f32::from(TILE_COLUMN_GAP),
             f32::from(COUNT_GAP),
             f32::from(TILE_LABEL_GAP),
+            f32::from(MENU_GAP),
+            f32::from(MENU_ROW_GAP),
         ] {
             assert!([1.0, 2.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 11.0, 12.0].contains(&step), "{step}");
         }
@@ -304,6 +351,16 @@ mod tests {
 
     /// "Copy is final as written" — the handoff. The view may not spell any
     /// of these itself.
+    /// A disabled row's ink is the live ink at 40 %, whatever colour it is.
+    #[test]
+    fn dimming_fades_a_colour_without_shifting_its_hue() {
+        let dim = dimmed(TEXT_ON_SURFACE);
+        assert_eq!((dim.r, dim.g, dim.b), (TEXT_ON_SURFACE.r, TEXT_ON_SURFACE.g, TEXT_ON_SURFACE.b));
+        assert!((dim.a - DISABLED_ALPHA).abs() < 1e-6);
+        // Already-translucent ink fades from where it was, not to 40 % flat.
+        assert!((dimmed(HAIRLINE).a - HAIRLINE.a * DISABLED_ALPHA).abs() < 1e-6);
+    }
+
     #[test]
     fn copy_matches_the_handoff() {
         assert_eq!(TITLE, "WireGuard");

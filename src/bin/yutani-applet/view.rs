@@ -8,10 +8,12 @@ use cosmic::{Element, theme as cosmic_theme};
 
 use yutani::applet::display::Display;
 use yutani::applet::icon::icon_state;
+use yutani::applet::menu::{MenuRow, RowKind};
+use yutani::applet::note_visible;
 use yutani::applet::theme;
 use yutani::assets;
 
-use crate::app::{Applet, Msg, close_popup_message, open_popup_message};
+use crate::app::{Applet, Msg, Note, close_popup_message, open_popup_message};
 
 /// The handoff's "500" weight (Space Grotesk / JetBrains Mono Medium) for
 /// the title, the accounts count and the tile labels.
@@ -70,6 +72,18 @@ fn count<'a>(content: String, color: Color) -> Element<'a, Msg> {
         .into()
 }
 
+/// A round status dot. It glows only where the handoff says it does — the
+/// header while connected — so the menu's account dots stay quiet.
+fn dot<'a>(color: Color, glow: bool) -> Element<'a, Msg> {
+    widget::container(
+        widget::space()
+            .width(Length::Fixed(theme::DOT_PX))
+            .height(Length::Fixed(theme::DOT_PX)),
+    )
+    .class(theme::dot_class(color, glow))
+    .into()
+}
+
 fn glyph<'a>(bytes: &'static [u8], w: u16, h: u16) -> Element<'a, Msg> {
     widget::icon(widget::icon::from_svg_bytes(bytes))
         .width(Length::Fixed(f32::from(w)))
@@ -116,18 +130,11 @@ pub fn panel_button(state: &Applet) -> Element<'_, Msg> {
 /// these clones away — they are what makes the returned element `'a`-free.
 fn header<'a>(d: &Display) -> Element<'a, Msg> {
     let dot_color = if d.connected { theme::ACCENT_UP } else { theme::TEXT_MUTED };
-    // The dot only glows while connected (handoff: no glow when down).
-    let dot = widget::container(
-        widget::space()
-            .width(Length::Fixed(theme::DOT_PX))
-            .height(Length::Fixed(theme::DOT_PX)),
-    )
-    .class(theme::dot_class(dot_color, d.connected));
-
     let status_row = Row::new()
         .spacing(theme::STATUS_GAP)
         .align_y(Alignment::Center)
-        .push(dot)
+        // The dot only glows while connected (handoff: no glow when down).
+        .push(dot(dot_color, d.connected))
         .push(mono(d.status_text, theme::STATUS_SIZE, dot_color))
         .push(mono(theme::MIDDOT, theme::STATUS_SIZE, theme::SEPARATOR))
         .push(glyph(assets::PIN, theme::PIN_W, theme::PIN_H))
@@ -233,6 +240,98 @@ fn tiles<'a>(d: &Display) -> Element<'a, Msg> {
         .into()
 }
 
+/// One menu row. It is taken by value: its strings become the element's, so
+/// nothing borrows the list `menu` built them from.
+///
+/// A row with no action gets no message, which is what makes libcosmic
+/// treat the button as disabled — but every label here carries an explicit
+/// colour, so libcosmic's `disabled` text style never reaches it and the
+/// row has to be dimmed here as well as declared inert.
+fn menu_row<'a>(row: MenuRow, held: bool) -> Element<'a, Msg> {
+    let (ink, hover, pressed) = match row.kind {
+        RowKind::Danger => (theme::DANGER_TEXT, theme::DANGER_HOVER, theme::DANGER_HOVER),
+        _ => (theme::TEXT_ON_SURFACE, theme::HAIRLINE, theme::ACTIVE_FILL),
+    };
+    let (label_ink, hint_ink) = if row.disabled() {
+        (theme::dimmed(ink), theme::dimmed(theme::TEXT_FAINT))
+    } else {
+        (ink, theme::TEXT_FAINT)
+    };
+
+    let mut content = Row::new()
+        .width(Length::Fill)
+        .spacing(theme::MENU_ROW_GAP)
+        .align_y(Alignment::Center);
+    if let RowKind::Account { active } = row.kind {
+        // The focused account's dot is the accent; the others are muted.
+        // No glow — that belongs to the header's connected state alone.
+        let marker = if active { theme::ACCENT_UP } else { theme::TEXT_MUTED };
+        content = content.push(dot(marker, false));
+    }
+    content = content
+        .push(ui(row.label, theme::MENU_SIZE, label_ink))
+        // Hints and counts are right-aligned against the row's far edge.
+        .push(widget::space().width(Length::Fill));
+    if let Some(hint) = row.hint {
+        content = content.push(mono(hint, theme::MENU_HINT_SIZE, hint_ink));
+    }
+    if let Some(trailing) = row.trailing {
+        content = content.push(mono(trailing, theme::MENU_HINT_SIZE, hint_ink));
+    }
+
+    // Client rows are indented under their header; everything else keeps
+    // the header's left edge.
+    let padding = if matches!(row.kind, RowKind::Account { .. }) {
+        theme::MENU_ACCOUNT_PAD
+    } else {
+        theme::MENU_ROW_PAD
+    };
+    let message =
+        if row.toggles_accounts { Some(Msg::ToggleAccounts) } else { row.action.map(Msg::Press) };
+    widget::button::custom(content)
+        .width(Length::Fill)
+        .padding(padding)
+        .class(theme::menu_row_class(ink, hover, pressed, held))
+        .on_press_maybe(message)
+        .into()
+}
+
+/// The last `err …` reply as a one-line note, in the danger ink at the hint
+/// size so it reads as an aside rather than another row.
+fn note_line<'a>(note: &Note) -> Element<'a, Msg> {
+    widget::container(mono(note.text.clone(), theme::MENU_HINT_SIZE, theme::DANGER_TEXT))
+        .width(Length::Fill)
+        .padding(theme::NOTE_PAD)
+        .into()
+}
+
+/// The menu group: the rows for the current state, the hairline the handoff
+/// puts above Quit, and the error note under whichever row earned it
+/// (spec §7). A note from a failed poll belongs to no row, so it goes last.
+fn menu(state: &Applet) -> Element<'_, Msg> {
+    let rows = yutani::applet::menu::rows(state.status.as_ref(), state.accounts_open);
+    let note = state.note.as_ref().filter(|n| note_visible(n.at_ms, state.now_ms()));
+    let mut group = Column::new().width(Length::Fill).spacing(theme::MENU_GAP);
+    let mut placed = false;
+    for row in rows {
+        if row.kind == RowKind::Danger {
+            group = group.push(divider(theme::DIVIDER_ABOVE_QUIT));
+        }
+        // The Accounts… header stays lit while its list is open.
+        let held = row.toggles_accounts && state.accounts_open;
+        let owns_note = note.is_some_and(|n| n.action.is_some() && n.action == row.action);
+        group = group.push(menu_row(row, held));
+        if let Some(note) = note.filter(|_| owns_note) {
+            group = group.push(note_line(note));
+            placed = true;
+        }
+    }
+    if let Some(note) = note.filter(|_| !placed) {
+        group = group.push(note_line(note));
+    }
+    group.into()
+}
+
 /// The popup's contents, on the handoff's own surface.
 ///
 /// libcosmic's `popup_container` supplies the shell surface, the blur and
@@ -241,14 +340,21 @@ fn tiles<'a>(d: &Display) -> Element<'a, Msg> {
 /// content sits on `popup_surface_class()`, which covers it.
 pub fn popup(state: &Applet) -> Element<'_, Msg> {
     let d = state.display();
-    let content = Column::new()
+    let mut content = Column::new()
         .width(Length::Fill)
         .spacing(theme::POPUP_PADDING)
         .padding(theme::POPUP_PADDING)
-        .push(header(&d))
-        .push(divider(theme::DIVIDER_ABOVE_BAND))
-        .push(accounts_band(&d))
-        .push(divider(theme::DIVIDER_ABOVE_TILES))
-        .push(tiles(&d));
+        .push(header(&d));
+    // With no daemon there is nothing to read: the header still identifies
+    // the applet, then straight to the single "Start Yutani" row. The band
+    // and the tiles would be a screenful of dashes and zeroes.
+    if d.online {
+        content = content
+            .push(divider(theme::DIVIDER_ABOVE_BAND))
+            .push(accounts_band(&d))
+            .push(divider(theme::DIVIDER_ABOVE_TILES))
+            .push(tiles(&d));
+    }
+    content = content.push(divider(theme::DIVIDER_ABOVE_MENU)).push(menu(state));
     widget::container(content).width(Length::Fill).class(theme::popup_surface_class()).into()
 }

@@ -36,14 +36,19 @@ pub struct Applet {
     /// rather than stack a second request on a slow daemon.
     pub polling: bool,
     pub accounts_open: bool,
-    /// `(message, set_at_ms)` — an `err …` reply, shown for 3 s.
-    pub note: Option<(String, u64)>,
+    /// The last `err …` reply, shown for 3 s.
+    pub note: Option<Note>,
 }
 
-/// The menu rows Task 4 adds are what construct `Press`, `Done` and
-/// `ToggleAccounts`; `update` already handles all three, so the arms are
-/// written and tested against the protocol here rather than bolted on
-/// later.
+/// A one-line error note (spec §7): what went wrong, when it was said, and
+/// which menu row it belongs under. `action` is `None` for a failed poll,
+/// which belongs to no row and sits at the foot of the menu instead.
+pub struct Note {
+    pub text: String,
+    pub at_ms: u64,
+    pub action: Option<Action>,
+}
+
 #[derive(Clone, Debug)]
 pub enum Msg {
     /// The poll timer fired.
@@ -51,12 +56,10 @@ pub enum Msg {
     /// A `status` request came back.
     Status(Result<Status, IpcError>),
     /// A menu row was pressed.
-    #[allow(dead_code)] // constructed by Task 4's menu
     Press(Action),
     /// A pressed action finished.
-    #[allow(dead_code)] // constructed by Task 4's menu
     Done(Action, Result<(), String>),
-    #[allow(dead_code)] // constructed by Task 4's menu
+    /// The Accounts… header was pressed: expand or collapse its list.
     ToggleAccounts,
     /// Popup create/destroy, handled by libcosmic.
     Surface(cosmic::surface::Action<Msg>),
@@ -86,9 +89,9 @@ impl Applet {
         cosmic::task::future(async { Msg::Status(client::status().await) })
     }
 
-    fn note(&mut self, message: String) {
-        let at = self.now_ms();
-        self.note = Some((message, at));
+    fn note(&mut self, text: String, action: Option<Action>) {
+        let at_ms = self.now_ms();
+        self.note = Some(Note { text, at_ms, action });
     }
 
     /// Open `~/.config/yutani/config.ron`, creating it with defaults first
@@ -158,8 +161,8 @@ impl cosmic::Application for Applet {
         }
         match message {
             Msg::Tick => {
-                if let Some((_, at)) = self.note
-                    && !note_visible(at, self.now_ms())
+                if let Some(note) = self.note.as_ref()
+                    && !note_visible(note.at_ms, self.now_ms())
                 {
                     self.note = None;
                 }
@@ -203,12 +206,12 @@ impl cosmic::Application for Applet {
                 }
                 self.sampler.reset();
                 self.rates = Rates::default();
-                self.note(msg);
+                self.note(msg, None);
                 Task::none()
             }
             Msg::Press(Action::Preferences) => {
                 if let Err(msg) = Self::open_preferences() {
-                    self.note(msg);
+                    self.note(msg, Some(Action::Preferences));
                 }
                 Task::none()
             }
@@ -216,7 +219,7 @@ impl cosmic::Application for Applet {
             {
                 Ok(_) => self.poll(),
                 Err(err) => {
-                    self.note(format!("cannot start yutani: {err}"));
+                    self.note(format!("cannot start yutani: {err}"), Some(Action::StartDaemon));
                     Task::none()
                 }
             },
@@ -239,7 +242,7 @@ impl cosmic::Application for Applet {
                 if matches!(action, Action::Connect | Action::Disconnect) {
                     self.pending = None;
                 }
-                self.note(msg);
+                self.note(msg, Some(action));
                 self.poll()
             }
             Msg::ToggleAccounts => {

@@ -7,6 +7,7 @@ pub mod client;
 pub mod display;
 pub mod format;
 pub mod icon;
+pub mod menu;
 pub mod rate;
 pub mod theme;
 
