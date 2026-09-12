@@ -3,7 +3,10 @@
 //! lives here and is unit-tested; `src/bin/yutani-applet/` only renders it.
 //! See docs/superpowers/specs/2026-09-12-yutani-applet-design.md.
 
-// Each later task adds its own module here; Task 1 ships only `theme`.
+pub mod client;
+pub mod format;
+pub mod icon;
+pub mod rate;
 pub mod theme;
 
 use std::time::Duration;
