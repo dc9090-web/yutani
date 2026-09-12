@@ -74,7 +74,8 @@ enum TunnelAction {
     /// Install the tunnel from a wg-quick .conf (asks for your password once)
     Install {
         conf: std::path::PathBuf,
-        /// Print what would be installed instead of installing (no root needed)
+        /// Print what would be installed instead of installing (no root
+        /// needed); exits 1 if the real install would be refused
         #[arg(long)]
         dry_run: bool,
     },
@@ -148,15 +149,15 @@ fn main() -> ExitCode {
                 // install passes to `install-root`.
                 tunnel::install::whoami().and_then(|(uid, user)| {
                     let exe = tunnel::install::current_exe().unwrap_or_default();
-                    tunnel::install::install_root(&conf.canonicalize().unwrap_or(conf.clone()), uid, &user, &exe, true)
-                        .and_then(|report| {
-                            print!("{report}");
-                            tunnel::worker::dry_run(&conf, uid)
-                        })
-                        .map(|plan| {
-                            print!("\n{plan}");
-                            ExitCode::SUCCESS
-                        })
+                    let report =
+                        tunnel::install::install_root(&conf.canonicalize().unwrap_or(conf.clone()), uid, &user, &exe, true)?;
+                    print!("{report}");
+                    let plan = tunnel::worker::dry_run(&conf, uid)?;
+                    print!("\n{plan}");
+                    // The whole report is printed either way; the exit
+                    // status is what lets a script tell "would install
+                    // clean" from "would be refused" without parsing it.
+                    Ok(if tunnel::install::report_has_failure(&report) { ExitCode::from(1) } else { ExitCode::SUCCESS })
                 })
             }
             TunnelAction::Install { conf, dry_run: false } => tunnel::install::install(&conf).map(|()| ExitCode::SUCCESS),

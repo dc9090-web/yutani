@@ -3,7 +3,7 @@
 
 use anyhow::{Context as _, anyhow, bail, ensure};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::conf::WgConf;
@@ -45,6 +45,18 @@ polkit.addRule(function(action, subject) {{\n\
 /// binary was invoked through a symlink.
 pub fn current_exe() -> anyhow::Result<String> {
     Ok(std::env::current_exe()?.canonicalize()?.to_string_lossy().into_owned())
+}
+
+/// The path `exe` will actually run as, once every symlink and `.`/`..`
+/// component is resolved. `install_root` must check *and* write this same
+/// value: checking the canonicalised path but writing the raw `--exe`
+/// string into `ExecStart=` would let a symlink component the user
+/// controls pass the trust check while systemd execs whatever the link
+/// points to. Errors when `exe` cannot be resolved (missing, dangling
+/// symlink, etc.) — the caller treats that the same as a failed trust
+/// check.
+fn resolved_exe(exe: &str) -> anyhow::Result<PathBuf> {
+    Path::new(exe).canonicalize().with_context(|| format!("cannot resolve {exe}"))
 }
 
 /// Invariant behind every check in this file: **nothing the user can write is
@@ -168,6 +180,15 @@ fn ensure_dir(dir: &Path, mode: u32) -> anyhow::Result<()> {
         trusted_path(dir).map_err(|why| anyhow!("refusing to use {}: {why}", dir.display()))?;
         return Ok(());
     }
+    // `dir` does not exist yet, so `trusted_path(dir)` can't be run on it —
+    // but creating it under an untrusted parent is exactly as dangerous as
+    // using an untrusted existing directory: whoever controls the parent
+    // controls what ends up at `dir` too (a pre-placed symlink, a race
+    // against the `create_dir_all` below, ...).
+    if let Some(parent) = dir.parent() {
+        trusted_path(parent)
+            .map_err(|why| anyhow!("refusing to create {} under untrusted {}: {why}", dir.display(), parent.display()))?;
+    }
     create_dir_with_mode(dir, mode)
 }
 
@@ -215,6 +236,18 @@ fn check_pkexec_uid(pkexec_uid: Option<&str>, uid: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Marks a failed check in a dry-run report (see `install_root`'s `refuse`
+/// closure). Shared with [`report_has_failure`] so the two can never drift.
+const CHECK_FAILED_MARKER: &str = "# check FAILED — the real install would stop here:";
+
+/// Whether a dry-run report (from [`install_root`]) recorded a check that
+/// would make the real install refuse. Lets a caller that only sees the
+/// printed text (e.g. `main`'s `--dry-run` arm) exit non-zero without
+/// re-running any of the checks itself.
+pub fn report_has_failure(report: &str) -> bool {
+    report.contains(CHECK_FAILED_MARKER)
+}
+
 /// Root side. With `dry_run`, returns what would be written instead of writing.
 pub fn install_root(conf: &Path, uid: u32, username: &str, exe: &str, dry_run: bool) -> anyhow::Result<String> {
     ensure!(conf.is_absolute() && Path::new(exe).is_absolute(), "paths must be absolute");
@@ -224,7 +257,16 @@ pub fn install_root(conf: &Path, uid: u32, username: &str, exe: &str, dry_run: b
     let label = conf.file_stem().and_then(|s| s.to_str()).unwrap_or("tunnel");
     let parsed = WgConf::parse(&text, label).map_err(|e| anyhow!("{}: {e}", conf.display()))?;
     let stored = format!("# yutani: label = {}\n# yutani: uid = {uid}\n{text}", parsed.label);
-    let unit = unit_text(exe);
+    // Resolve once, up front: `unit_text` and the trust check must agree on
+    // the same path (see `resolved_exe`). When resolution itself fails, fall
+    // back to the raw `--exe` string for display purposes only — the check
+    // below still refuses the install (or reports the refusal, in a dry run).
+    let resolved = resolved_exe(exe);
+    let exe_for_unit = match &resolved {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(_) => exe.to_string(),
+    };
+    let unit = unit_text(&exe_for_unit);
     let rule = polkit_text(username);
     // Both checks are hard errors for a real install and *reported* by a dry
     // run, which is unprivileged and exists to tell the user what is wrong.
@@ -233,12 +275,15 @@ pub fn install_root(conf: &Path, uid: u32, username: &str, exe: &str, dry_run: b
         if !dry_run {
             bail!("{msg}");
         }
-        checks.push_str(&format!("# check FAILED — the real install would stop here:\n{msg}\n\n"));
+        checks.push_str(&format!("{CHECK_FAILED_MARKER}\n{msg}\n\n"));
         Ok(())
     };
-    match trusted_path(Path::new(exe)) {
-        Ok(()) => checks.push_str(&format!("# {exe} is root-owned and not writable by others: OK\n\n")),
-        Err(why) => refuse(untrusted_exe_message(exe, conf, &why), &mut checks)?,
+    match &resolved {
+        Ok(p) => match trusted_path(p) {
+            Ok(()) => checks.push_str(&format!("# {} is root-owned and not writable by others: OK\n\n", p.display())),
+            Err(why) => refuse(untrusted_exe_message(&p.to_string_lossy(), conf, why.as_str()), &mut checks)?,
+        },
+        Err(e) => refuse(format!("cannot resolve {exe}: {e:#}"), &mut checks)?,
     }
     match check_username(uid, username, username_for_uid(uid).as_deref()) {
         Ok(()) => checks.push_str(&format!("# uid {uid} is {username:?}: OK\n\n")),
@@ -507,6 +552,68 @@ mod tests {
     }
 
     #[test]
+    fn resolved_exe_returns_the_canonical_path_for_a_real_file() {
+        let dir = temp_dir("resolve-plain");
+        let exe = dir.join("yutani");
+        std::fs::write(&exe, "#!/bin/true\n").unwrap();
+        let resolved = resolved_exe(exe.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, exe.canonicalize().unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolved_exe_follows_a_symlink_to_its_target() {
+        let dir = temp_dir("resolve-symlink");
+        let target = dir.join("real-yutani");
+        std::fs::write(&target, "#!/bin/true\n").unwrap();
+        let link = dir.join("yutani");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let resolved = resolved_exe(link.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, target.canonicalize().unwrap());
+        assert_ne!(resolved, link, "must resolve past the symlink, not just accept it");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolved_exe_errors_on_a_path_that_does_not_exist() {
+        let e = resolved_exe("/nonexistent-yutani-path").unwrap_err().to_string();
+        assert!(e.contains("cannot resolve"), "got {e}");
+    }
+
+    #[test]
+    fn install_root_writes_the_resolved_path_not_the_symlink_it_was_given() {
+        // The trust check canonicalises `exe`; if `unit_text` were built from
+        // the raw `--exe` string instead, a symlink under the user's control
+        // could pass the check while systemd execs a different, redirectable
+        // target.
+        let dir = temp_dir("resolve-unit");
+        let conf = dir.join("EVE.conf");
+        std::fs::write(&conf, GOOD_CONF).unwrap();
+        let target = dir.join("real-yutani");
+        std::fs::write(&target, "#!/bin/true\n").unwrap();
+        let link = dir.join("yutani-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let resolved_target = target.canonicalize().unwrap();
+        // The temp dir is owned by the test user, so the real install would
+        // still refuse this — but the dry run must report the *resolved*
+        // path, not the symlink path it was handed.
+        let r = install_root(&conf, 1000, "daniel", link.to_str().unwrap(), true).unwrap();
+        assert!(r.contains("refusing"), "a user-owned exe must still be refused: {r}");
+        assert!(
+            r.contains(&format!("ExecStart={} tunnel run", resolved_target.display())),
+            "ExecStart must show the resolved path: {r}"
+        );
+        assert!(!r.contains(&format!("ExecStart={}", link.display())), "must not write the symlink path into the unit: {r}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn report_has_failure_detects_the_check_failed_marker() {
+        assert!(report_has_failure("some text\n# check FAILED — the real install would stop here:\nrefusing ...\n"));
+        assert!(!report_has_failure("some text\n# /opt/y is root-owned and not writable by others: OK\n"));
+    }
+
+    #[test]
     fn the_root_side_refuses_a_user_name_that_is_not_the_uids_own() {
         assert!(check_username(1000, "daniel", Some("daniel")).is_ok());
         let e = check_username(1000, "root", Some("daniel")).unwrap_err().to_string();
@@ -522,6 +629,20 @@ mod tests {
         let e = ensure_dir(&dir, 0o700).unwrap_err().to_string();
         assert!(e.contains("refusing"), "got {e}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ensure_dir_refuses_to_create_a_directory_under_an_untrusted_parent() {
+        // `dir` itself does not exist, so only the create path is exercised:
+        // a user-owned parent must not be allowed to dictate what a
+        // freshly-created directory becomes.
+        let parent = temp_dir("ensure-dir-parent");
+        let dir = parent.join("etc-yutani-child");
+        assert!(!dir.exists());
+        let e = ensure_dir(&dir, 0o700).unwrap_err().to_string();
+        assert!(e.contains("refusing"), "got {e}");
+        assert!(!dir.exists(), "must not create the directory when the parent is untrusted");
+        std::fs::remove_dir_all(&parent).unwrap();
     }
 
     #[test]

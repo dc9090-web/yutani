@@ -30,6 +30,7 @@
 //! found" code (1), which then looks exactly like a game that exited 1 — we
 //! cannot tell those apart from here.
 
+use std::io;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitCode, ExitStatus, Output};
 use std::time::Duration;
@@ -66,9 +67,34 @@ pub fn should_wrap(preflight: Option<&Output>) -> bool {
     preflight.is_some_and(|o| o.status.success() && !o.stdout.is_empty())
 }
 
-fn run_preflight() -> Option<Output> {
+/// `Err` means `busctl` itself could not even be spawned (missing binary,
+/// permission denied, ...); `Ok(None)` means it ran but did not answer
+/// within [`PREFLIGHT_TIMEOUT`]; `Ok(Some(_))` means it exited within the
+/// timeout (whether or not [`should_wrap`] then likes the result). Kept
+/// distinct from a plain `Option` so [`preflight_warning`] can tell a
+/// missing tool from a wedged manager instead of blurring both into one
+/// message.
+fn run_preflight() -> io::Result<Option<Output>> {
     let argv = preflight_argv();
-    crate::proc::output_with_timeout(Command::new(&argv[0]).args(&argv[1..]), PREFLIGHT_TIMEOUT).ok().flatten()
+    crate::proc::output_with_timeout(Command::new(&argv[0]).args(&argv[1..]), PREFLIGHT_TIMEOUT)
+}
+
+/// What to print when [`should_wrap`] said no. The three causes look
+/// different to someone staring at this after a game failed to launch, so
+/// they get different words: `busctl` missing/unspawnable is a local setup
+/// problem, a timeout is a wedged or unreachable manager, and an answer
+/// `should_wrap` still rejected (non-zero exit or empty stdout) is neither.
+fn preflight_warning(preflight: &io::Result<Option<Output>>) -> String {
+    match preflight {
+        Err(e) => format!("yutani launch: could not run busctl ({e}); running without the tunnel cgroup"),
+        Ok(None) => format!(
+            "yutani launch: user systemd/D-Bus manager not reachable within {PREFLIGHT_TIMEOUT:?}; running without the tunnel cgroup"
+        ),
+        Ok(Some(_)) => {
+            "yutani launch: user systemd/D-Bus manager did not answer busctl status; running without the tunnel cgroup"
+                .to_string()
+        }
+    }
 }
 
 /// Exit code for a finished child, POSIX-shell style: the process's own
@@ -90,7 +116,9 @@ pub fn run(command: Vec<String>) -> ExitCode {
         eprintln!("yutani launch: nothing to run (usage: yutani launch -- <command…>)");
         return ExitCode::from(2);
     }
-    if should_wrap(run_preflight().as_ref()) {
+    let preflight = run_preflight();
+    let answer = preflight.as_ref().ok().and_then(|o| o.as_ref());
+    if should_wrap(answer) {
         let argv = systemd_run_argv(&command);
         match Command::new(&argv[0]).args(&argv[1..]).status() {
             Ok(status) => return ExitCode::from(exit_code(status)),
@@ -99,9 +127,7 @@ pub fn run(command: Vec<String>) -> ExitCode {
             }
         }
     } else {
-        eprintln!(
-            "yutani launch: user systemd/D-Bus manager not reachable within {PREFLIGHT_TIMEOUT:?}; running without the tunnel cgroup"
-        );
+        eprintln!("{}", preflight_warning(&preflight));
     }
     match Command::new(&command[0]).args(&command[1..]).status() {
         Ok(status) => ExitCode::from(exit_code(status)),
@@ -147,6 +173,22 @@ mod tests {
         .ok()
         .flatten();
         assert!(!should_wrap(timed_out.as_ref()), "a wedged manager must not wrap the game");
+    }
+
+    #[test]
+    fn the_preflight_warning_distinguishes_a_missing_busctl_from_a_timeout_from_a_bad_answer() {
+        let spawn_failed = preflight_warning(&Err(io::Error::new(io::ErrorKind::NotFound, "No such file or directory")));
+        assert!(spawn_failed.contains("could not run busctl"), "got {spawn_failed}");
+
+        let timed_out = preflight_warning(&Ok(None));
+        assert!(timed_out.contains("not reachable within"), "got {timed_out}");
+
+        let bad_answer = preflight_warning(&Ok(Some(output(1, b"nope"))));
+        assert!(bad_answer.contains("did not answer"), "got {bad_answer}");
+
+        assert_ne!(spawn_failed, timed_out);
+        assert_ne!(timed_out, bad_answer);
+        assert_ne!(spawn_failed, bad_answer);
     }
 
     #[test]

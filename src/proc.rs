@@ -8,7 +8,7 @@
 //! a game launch) waits on therefore needs a timeout around the process, not
 //! inside the protocol.
 
-use std::io;
+use std::io::{self, Read as _};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -19,7 +19,16 @@ const POLL: Duration = Duration::from_millis(25);
 
 /// Wait for `child` for at most `timeout`; `SIGKILL` it if it outlives that.
 /// Returns whether it was killed. The child is left un-reaped either way —
-/// the caller still has to `wait`/`wait_with_output` it.
+/// the caller still has to `wait` it (not `wait_with_output`: that also
+/// tries to drain the pipes, which is exactly what `output_with_timeout`
+/// must not do blindly on the timeout path — see its doc comment).
+///
+/// `try_wait` is polled rather than watched, so there is a boundary race: a
+/// child that happens to exit in the instant between one poll and the
+/// deadline can still be reported as killed (`Ok(true)`) even though it was
+/// already on its way out. Harmless — `kill` on an already-exited pid is a
+/// no-op as far as the caller is concerned, since the child is dead either
+/// way.
 fn wait_or_kill(child: &mut Child, timeout: Duration) -> io::Result<bool> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -35,18 +44,57 @@ fn wait_or_kill(child: &mut Child, timeout: Duration) -> io::Result<bool> {
 }
 
 /// `Command::output`, bounded: `Ok(None)` means the child was still running
-/// after `timeout` and has been killed and reaped.
+/// after `timeout` and has been killed.
 ///
-/// The child's pipes are only drained after it exits, so a command that
-/// writes more than a pipe buffer (64 KiB) without exiting blocks and is
-/// then killed by the timeout — which is the same outcome the caller wants
-/// from a command that will not finish. Every caller here produces a few
-/// hundred bytes at most.
+/// Stdout and stderr are drained on two background threads started right
+/// after spawn, not after the child exits — reading only after exit is
+/// `std::process::Command::output`'s own well-known pipe-buffer trap: a
+/// child that writes more than one pipe buffer (64 KiB on Linux) before
+/// exiting would block on the write, never exit, and just run out the
+/// timeout instead of completing.
+///
+/// The two paths out of this function treat those reader threads
+/// differently, and that difference is the point:
+///
+/// - On the **success** path, both threads are `join`ed. The pipe's write
+///   end closes when the child (and anything that inherited the fd) exits,
+///   so the reads reach EOF and the joins return promptly in the ordinary
+///   case. A child that forks a descendant which keeps the inherited fd
+///   open past the child's own exit can still delay this join — that is
+///   inherent to inherited file descriptors and invisible from here.
+/// - On the **timeout** path, the threads are *not* joined: after `kill`,
+///   a descendant that inherited the pipe can still hold it open
+///   indefinitely, and a reader blocked reading from it would never return
+///   — joining it would turn a bounded timeout into an unbounded wait,
+///   defeating the entire point of this function. Instead we reap the
+///   child with a plain `wait()` (no pipe I/O) and return `Ok(None)` at
+///   once, leaving the reader threads to finish whenever their pipe end
+///   finally closes; they hold nothing but that fd, so an abandoned one
+///   costs nothing.
 pub fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> io::Result<Option<Output>> {
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let mut stdout = child.stdout.take().expect("stdout was requested as piped");
+    let mut stderr = child.stderr.take().expect("stderr was requested as piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
     let killed = wait_or_kill(&mut child, timeout)?;
-    let output = child.wait_with_output()?;
-    Ok((!killed).then_some(output))
+    let status = child.wait()?;
+    if killed {
+        // Do not join: a surviving descendant could hold the pipe open
+        // forever. Let the readers finish on their own time.
+        return Ok(None);
+    }
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(Some(Output { status, stdout, stderr }))
 }
 
 #[cfg(test)]
@@ -90,5 +138,20 @@ mod tests {
     fn a_command_that_does_not_exist_is_an_error_not_a_timeout() {
         let err = output_with_timeout(&mut Command::new("/nonexistent-yutani-binary"), Duration::from_secs(1));
         assert!(err.is_err(), "a spawn failure must stay distinguishable from a timeout");
+    }
+
+    #[test]
+    fn a_child_writing_more_than_one_pipe_buffer_does_not_deadlock() {
+        // 200 KiB comfortably exceeds a 64 KiB pipe buffer: if stdout were
+        // only drained after `wait_or_kill` returns, the child would block on
+        // the write, never exit, and this would time out instead of
+        // finishing well within it.
+        let started = Instant::now();
+        let out = output_with_timeout(Command::new("head").args(["-c", "200000", "/dev/zero"]), Duration::from_secs(10))
+            .unwrap()
+            .expect("must complete, not look like a timeout");
+        assert!(out.status.success());
+        assert_eq!(out.stdout.len(), 200_000);
+        assert!(started.elapsed() < Duration::from_secs(5), "concurrent draining must not wait out the timeout");
     }
 }
