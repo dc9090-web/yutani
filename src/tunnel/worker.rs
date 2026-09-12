@@ -3,7 +3,6 @@
 //! down on SIGTERM/SIGINT (and on any failure while coming up).
 
 use anyhow::{Context as _, anyhow};
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -123,11 +122,10 @@ fn write_status(conf: &WgConf, since: u64) -> anyhow::Result<()> {
         tx_bytes: tx,
         since_unix: since,
     };
-    let tmp = format!("{STATUS_PATH}.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(&file)?)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
-    std::fs::rename(&tmp, STATUS_PATH)?;
-    Ok(())
+    // `write_with_mode` creates the temporary with 0644 from the start and
+    // renames it into place, so the file is never briefly unreadable and a
+    // failed write leaves the previous status intact.
+    write_with_mode(STATUS_PATH, &serde_json::to_string(&file)?, 0o644)
 }
 
 pub fn run() -> anyhow::Result<()> {
@@ -159,6 +157,10 @@ pub fn run() -> anyhow::Result<()> {
         }
         Ok(())
     });
+    // Drop the guard before logging: teardown runs on drop, so logging first
+    // would put "tunnel down" in the journal ahead of the commands that take
+    // it down (and ahead of any failure among them).
+    drop(_teardown);
     tracing::info!("tunnel down");
     result
 }

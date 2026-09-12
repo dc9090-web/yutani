@@ -45,6 +45,7 @@ enum Command {
     Status,
     /// Run a command (Steam's %command%) inside the tunnel cgroup
     Launch {
+        /// The game command, e.g. Steam's %command%
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
@@ -79,7 +80,7 @@ enum TunnelAction {
     },
     /// Remove the tunnel unit, conf and polkit rule
     Uninstall,
-    /// Start the tunnel (EVE traffic goes via London)
+    /// Start the tunnel (EVE traffic goes via the configured exit)
     Connect,
     /// Stop the tunnel (EVE traffic goes direct)
     Disconnect,
