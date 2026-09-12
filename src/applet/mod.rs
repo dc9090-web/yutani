@@ -88,10 +88,55 @@ pub fn still_pending(until: Instant, now: Instant, satisfied: bool) -> bool {
     !satisfied && now < until
 }
 
-/// Whether the poll timer should issue a `status` request. A daemon slower
-/// than the 1 s popup cadence would otherwise get a growing queue of them.
-pub fn should_poll(request_in_flight: bool) -> bool {
-    !request_in_flight
+/// The applet's `status` poll guard.
+///
+/// At most one `status` request is ever outstanding: a daemon slower than
+/// the 1 s popup cadence would otherwise collect a growing queue of them,
+/// and two in flight can land out of order and leave the popup showing the
+/// older reply.
+///
+/// The two ways to ask for a poll differ in what happens when the socket is
+/// busy, and that is the whole point of the type:
+///
+/// - [`Poll::tick`] — the timer. It *skips*: the next tick is only 1–5 s
+///   away and nothing is waiting on this one.
+/// - [`Poll::request`] — an action's follow-up. It *defers*: this poll is
+///   the only thing that will show the action's result before the next
+///   tick, so it is remembered and issued by [`Poll::replied`] the moment
+///   the outstanding one comes back. One flag, not a queue — five presses
+///   in a row still cost exactly one follow-up poll.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Poll {
+    in_flight: bool,
+    deferred: bool,
+}
+
+impl Poll {
+    /// Ask for a poll. `true` means "send it now"; `false` means one was
+    /// already outstanding and this one has been remembered.
+    pub fn request(&mut self) -> bool {
+        if self.in_flight {
+            self.deferred = true;
+            return false;
+        }
+        self.in_flight = true;
+        true
+    }
+
+    /// The timer's form of [`Poll::request`]: skip instead of deferring.
+    pub fn tick(&mut self) -> bool {
+        !self.in_flight && self.request()
+    }
+
+    /// A reply landed. `true` means a deferred request is going out now.
+    pub fn replied(&mut self) -> bool {
+        self.in_flight = false;
+        std::mem::take(&mut self.deferred) && self.request()
+    }
+
+    pub fn in_flight(&self) -> bool {
+        self.in_flight
+    }
 }
 
 /// An error note is shown for [`NOTE_MS`] after it was set.
@@ -152,10 +197,53 @@ mod tests {
         assert!(!still_pending(now, now, false));
     }
 
+    /// The timer skips rather than queues: another tick is 1–5 s away and a
+    /// second concurrent `status` would only race the first.
     #[test]
-    fn a_poll_is_skipped_while_one_is_outstanding() {
-        assert!(should_poll(false));
-        assert!(!should_poll(true));
+    fn a_timer_poll_is_skipped_while_one_is_outstanding() {
+        let mut poll = Poll::default();
+        assert!(poll.tick(), "nothing outstanding: it goes out");
+        assert!(poll.in_flight());
+        assert!(!poll.tick(), "one is already outstanding");
+        assert!(!poll.replied(), "a skipped tick is not remembered");
+        assert!(!poll.in_flight());
+    }
+
+    /// M5: an action's follow-up poll is the only thing that will show its
+    /// result before the next tick, so it may not be dropped just because
+    /// the timer's own poll happens to be in flight — it waits its turn.
+    #[test]
+    fn a_poll_wanted_while_one_is_outstanding_is_issued_when_that_one_lands() {
+        let mut poll = Poll::default();
+        assert!(poll.request(), "the first request goes out at once");
+        assert!(!poll.request(), "the second is deferred, not sent");
+        assert!(poll.replied(), "and goes out when the first comes back");
+        assert!(poll.in_flight(), "which makes it the outstanding one");
+        assert!(!poll.replied(), "nothing is left behind it");
+        assert!(!poll.in_flight());
+    }
+
+    /// However many presses land while one poll is out, exactly one poll
+    /// follows it — the guard is a flag, not a queue.
+    #[test]
+    fn many_deferred_polls_collapse_into_one() {
+        let mut poll = Poll::default();
+        assert!(poll.request());
+        for _ in 0..5 {
+            assert!(!poll.request());
+        }
+        assert!(poll.replied());
+        assert!(!poll.replied());
+    }
+
+    /// A reply to a request that was never made (a late duplicate) must not
+    /// leave the guard thinking one is still in flight.
+    #[test]
+    fn a_reply_with_nothing_outstanding_changes_nothing() {
+        let mut poll = Poll::default();
+        assert!(!poll.replied());
+        assert!(!poll.in_flight());
+        assert!(poll.request(), "and the guard is still usable");
     }
 
     #[test]

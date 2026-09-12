@@ -15,8 +15,7 @@ use yutani::applet::client::{self, IpcError};
 use yutani::applet::display::{Display, degrade, display};
 use yutani::applet::rate::{Rates, Sampler};
 use yutani::applet::{
-    Action, PENDING_S, daemon_exe, note_visible, pending_done, poll_interval, should_poll,
-    still_pending,
+    Action, PENDING_S, Poll, daemon_exe, note_visible, pending_done, poll_interval, still_pending,
 };
 use yutani::tunnel::status::Status;
 
@@ -35,9 +34,9 @@ pub struct Applet {
     /// A `tunnel connect|disconnect` is in flight (icon shows sync):
     /// `(the state it asked for, the deadline it gives up at)`.
     pub pending: Option<(bool, Instant)>,
-    /// A `status` request is outstanding. The poll timer skips a tick
-    /// rather than stack a second request on a slow daemon.
-    pub polling: bool,
+    /// At most one `status` request outstanding, with at most one deferred
+    /// behind it. See [`Poll`].
+    pub poll: Poll,
     pub accounts_open: bool,
     /// The last `err …` reply, shown for 3 s.
     pub note: Option<Note>,
@@ -103,9 +102,22 @@ impl Applet {
         display(self.status.as_ref(), self.rates)
     }
 
+    /// Ask for a `status` now, or — if one is already outstanding — leave
+    /// it to [`Applet::replied`] to issue when that one comes back. This is
+    /// the *action* path (press, or an action's reply), which may not drop
+    /// its poll: nothing else will show the result before the next tick.
     fn poll(&mut self) -> Task<Msg> {
-        self.polling = true;
+        if self.poll.request() { Self::status_task() } else { Task::none() }
+    }
+
+    fn status_task() -> Task<Msg> {
         cosmic::task::future(async { Msg::Status(client::status().await) })
+    }
+
+    /// A `status` reply landed: release the guard, and issue whatever was
+    /// deferred behind it.
+    fn replied(&mut self) -> Task<Msg> {
+        if self.poll.replied() { Self::status_task() } else { Task::none() }
     }
 
     fn note(&mut self, text: String, action: Option<Action>) {
@@ -156,7 +168,7 @@ impl cosmic::Application for Applet {
     }
 
     fn init(core: Core, _flags: ()) -> (Self, Task<Msg>) {
-        let applet = Applet {
+        let mut applet = Applet {
             core,
             popup: None,
             status: None,
@@ -164,11 +176,13 @@ impl cosmic::Application for Applet {
             sampler: Sampler::default(),
             started: Instant::now(),
             pending: None,
-            polling: true,
+            poll: Poll::default(),
             accounts_open: false,
             note: None,
         };
-        let first = cosmic::task::future(async { Msg::Status(client::status().await) });
+        // Through the guard like every other poll, so the very first reply
+        // releases it instead of finding it never armed.
+        let first = applet.poll();
         (applet, first)
     }
 
@@ -182,10 +196,9 @@ impl cosmic::Application for Applet {
 
     fn update(&mut self, message: Msg) -> Task<Msg> {
         // Whatever it says, the request this reply answers is no longer
-        // outstanding.
-        if matches!(message, Msg::Status(_)) {
-            self.polling = false;
-        }
+        // outstanding — and anything deferred behind it goes out now.
+        let after_reply =
+            if matches!(message, Msg::Status(_)) { self.replied() } else { Task::none() };
         match message {
             Msg::Tick => {
                 if let Some(note) = self.note.as_ref()
@@ -193,7 +206,7 @@ impl cosmic::Application for Applet {
                 {
                     self.note = None;
                 }
-                if should_poll(self.polling) { self.poll() } else { Task::none() }
+                if self.poll.tick() { Self::status_task() } else { Task::none() }
             }
             Msg::Status(Ok(status)) => {
                 let live = status.tunnel.connected;
@@ -215,14 +228,14 @@ impl cosmic::Application for Applet {
                     self.pending = None;
                 }
                 self.status = Some(status);
-                Task::none()
+                after_reply
             }
             Msg::Status(Err(IpcError::Offline)) => {
                 self.status = None;
                 self.sampler.reset();
                 self.rates = Rates::default();
                 self.pending = None;
-                Task::none()
+                after_reply
             }
             Msg::Status(Err(IpcError::Failed(msg))) => {
                 // A failed poll after a success keeps the last totals
@@ -234,7 +247,7 @@ impl cosmic::Application for Applet {
                 self.sampler.reset();
                 self.rates = Rates::default();
                 self.note(msg, None);
-                Task::none()
+                after_reply
             }
             Msg::Press(Action::Preferences) => {
                 if let Err(msg) = Self::open_preferences() {
@@ -313,13 +326,14 @@ pub fn open_popup_message(bounds: Rectangle, offset: cosmic::iced::Vector) -> Ms
         move |state: &mut Applet| {
             let new_id = Id::unique();
             state.popup = Some(new_id);
-            let mut settings = state.core.applet.get_popup_settings(
-                state.core.main_window_id().unwrap(),
-                new_id,
-                None,
-                None,
-                None,
-            );
+            // Never `unwrap`: this closure has to return popup settings, so
+            // a panel applet whose main surface has not been announced yet
+            // cannot bail out — it falls back to the very id libcosmic gives
+            // an applet's own window (`app/mod.rs` sets `main_window_id` to
+            // `Id::RESERVED`), which is what its internals fall back to too.
+            let parent = state.core.main_window_id().unwrap_or(Id::RESERVED);
+            let mut settings =
+                state.core.applet.get_popup_settings(parent, new_id, None, None, None);
             settings.positioner.anchor_rect = Rectangle {
                 x: (bounds.x - offset.x) as i32,
                 y: (bounds.y - offset.y) as i32,

@@ -47,6 +47,15 @@ pub const HAIRLINE: Color = rgba(0xFF, 0xFF, 0xFF, 0x12 as f32 / 255.0);
 /// `#FFFFFF1F` — the handoff's "Active fill": a menu row under the
 /// pointer's press, and the Accounts… header while its list is open.
 pub const ACTIVE_FILL: Color = rgba(0xFF, 0xFF, 0xFF, 0x1F as f32 / 255.0);
+/// `#FFFFFF29` — **derived: one step above the handoff's active fill.**
+///
+/// The handoff has no token for this because it has no row that is held
+/// *and* hovered. Ours does: the Accounts… header wears [`ACTIVE_FILL`] at
+/// rest for as long as its list is open, so handing it the ordinary
+/// [`HAIRLINE`] hover would make it go visibly *darker* as the pointer
+/// arrived. Hover must always brighten, so it continues the ladder
+/// (`0x12 → 0x1F → 0x29`) by the same step the handoff took to get there.
+pub const HELD_HOVER_FILL: Color = rgba(0xFF, 0xFF, 0xFF, 0x29 as f32 / 255.0);
 /// `#1A1D21F5` — the popup's own surface.
 ///
 /// The handoff is a dark-only design: every colour above it is light ink on
@@ -66,6 +75,11 @@ pub const POPUP_RADIUS: f32 = 14.0;
 pub const POPUP_BORDER_PX: f32 = 1.0;
 pub const HEADER_GAP: u16 = 11;
 pub const HEADER_COLUMN_GAP: u16 = 5;
+/// The accounts band's own column gap. Deliberately the header's value: the
+/// band's right-hand column (IP over handshake) sits directly under the
+/// header's (title over status) and has to share its rhythm, so this is an
+/// alias rather than a second 5 that could drift.
+pub const BAND_COLUMN_GAP: u16 = HEADER_COLUMN_GAP;
 pub const MARK_PX: u16 = 24;
 pub const TITLE_SIZE: f32 = 14.0;
 pub const STATUS_SIZE: f32 = 11.5;
@@ -148,6 +162,19 @@ pub const LINE_HEIGHT: f32 = 1.3;
 /// The accounts count is `line-height: 1` in the handoff — its 22 px digits
 /// set the height of the whole band.
 pub const LINE_HEIGHT_TIGHT: f32 = 1.0;
+/// How tall the expanded Accounts… list may grow before it scrolls.
+///
+/// libcosmic's `popup_container` caps the whole popup at 1000 px, and it
+/// caps by *clipping* the tail: with enough EVE clients the rows below the
+/// list — Preferences…, the thumbnails row and Quit — would simply be cut
+/// off. So the list scrolls instead and everything below it always
+/// survives.
+///
+/// Eight rows, which is more accounts than the layouts multibox: one row is
+/// `MENU_ROW_PAD` top + bottom (9 + 9) + the `MENU_SIZE` × `LINE_HEIGHT`
+/// line box (13.5 × 1.3 = 17.55) + the group's 1 px gap = 36.55 px, and
+/// 8 × 36.55 = 292.4.
+pub const ACCOUNTS_LIST_MAX_PX: f32 = 292.0;
 
 // ---- copy (handoff: "Copy is final as written") ----
 /// The popup's title.
@@ -189,15 +216,32 @@ pub fn dot_class(color: Color, glow: bool) -> cosmic::theme::Container<'static> 
     })
 }
 
-/// The popup's own surface: `#1A1D21F5`, radius 14, 1 px `#FFFFFF1A`.
-/// Goes *inside* `popup_container`, whose theme-coloured ground it covers.
+/// The radius the popup's own surface must take: whatever libcosmic's
+/// `popup_container` rounded its outer container to, which is the COSMIC
+/// theme's `radius_m` (16 px standard, 8 px compact, 2 px spacious). Two
+/// stacked rounded rectangles that disagree leave a bright sliver of the
+/// outer one showing through each corner.
+///
+/// [`POPUP_RADIUS`] — the handoff's own 14 — is the fallback for a theme
+/// that reports nothing, and the value the sizes test pins.
+pub fn popup_radius(theme_radius: [f32; 4]) -> Radius {
+    if theme_radius.iter().all(|corner| *corner <= 0.0) {
+        Radius::from(POPUP_RADIUS)
+    } else {
+        Radius::from(theme_radius)
+    }
+}
+
+/// The popup's own surface: `#1A1D21F5`, the theme's radius, 1 px
+/// `#FFFFFF1A`. Goes *inside* `popup_container`, whose theme-coloured
+/// ground it covers.
 pub fn popup_surface_class() -> cosmic::theme::Container<'static> {
-    cosmic::theme::Container::custom(|_| container::Style {
+    cosmic::theme::Container::custom(|theme| container::Style {
         background: Some(Background::Color(POPUP_SURFACE)),
         border: cosmic::iced::Border {
             color: POPUP_BORDER,
             width: POPUP_BORDER_PX,
-            radius: Radius::from(POPUP_RADIUS),
+            radius: popup_radius(theme.cosmic().corner_radii.radius_m),
         },
         ..Default::default()
     })
@@ -247,16 +291,25 @@ fn row_style(text: Color, fill: Option<Color>) -> button::Style {
     }
 }
 
+/// Which fill a menu row shows under the pointer: [`HELD_HOVER_FILL`] for a
+/// held row, whose rest fill is already the Active fill, and the row's own
+/// hover colour otherwise.
+pub fn hover_fill(hover: Color, held: bool) -> Color {
+    if held { HELD_HOVER_FILL } else { hover }
+}
+
 /// A menu row: radius 8, transparent at rest, `hover` under the pointer,
 /// `pressed` while held, and [`DISABLED_ALPHA`] text when disabled.
 ///
 /// `held` paints the *Active fill* (`pressed`) at rest — the expanded
 /// Accounts… header, which stays lit for as long as its list is open. (The
-/// handoff has no chevron glyph, so the fill is the affordance.) `hovered`
-/// is untouched by `held`, so moving the pointer over the open header still
-/// darkens it a step further to the ordinary hover fill.
+/// handoff has no chevron glyph, so the fill is the affordance.) It also
+/// lifts the hover to [`HELD_HOVER_FILL`]: hover must brighten a row, and
+/// against a rest fill that is already the Active fill the ordinary hover
+/// colour would darken it instead.
 pub fn menu_row_class(text: Color, hover: Color, pressed: Color, held: bool) -> cosmic::theme::Button {
     let rest = held.then_some(pressed);
+    let hover = hover_fill(hover, held);
     cosmic::theme::Button::Custom {
         active: Box::new(move |_focused, _theme| row_style(text, rest)),
         disabled: Box::new(move |_theme| row_style(dimmed(text), None)),
@@ -294,8 +347,61 @@ mod tests {
         expect(CHIP_FILL, "#FFFFFF0F");
         expect(HAIRLINE, "#FFFFFF12");
         expect(ACTIVE_FILL, "#FFFFFF1F");
+        // Derived: one step above the handoff's active fill. The handoff has
+        // no token for it because it has no held-and-hovered row.
+        expect(HELD_HOVER_FILL, "#FFFFFF29");
         expect(POPUP_SURFACE, "#1A1D21F5");
         expect(POPUP_BORDER, "#FFFFFF1A");
+    }
+
+    /// I1: the held Accounts… header already carries the Active fill at
+    /// rest, so its hover has to be a step *above* it. Feeding it the
+    /// ordinary hover fill made the row go *darker* as the pointer arrived.
+    #[test]
+    fn hovering_a_held_row_brightens_it_instead_of_dimming_it() {
+        assert_eq!(hover_fill(HAIRLINE, false), HAIRLINE);
+        assert_eq!(hover_fill(DANGER_HOVER, false), DANGER_HOVER);
+        assert_eq!(hover_fill(HAIRLINE, true), HELD_HOVER_FILL);
+        // Rest → hover is a strictly brightening ladder for a held row.
+        const { assert!(HAIRLINE.a < ACTIVE_FILL.a, "hover must be above the resting hairline") };
+        const {
+            assert!(ACTIVE_FILL.a < HELD_HOVER_FILL.a, "a held row's hover must be above its own rest")
+        };
+    }
+
+    /// M1: libcosmic's `popup_container` rounds its outer container to the
+    /// COSMIC theme's `radius_m`, so our inner surface has to follow it or
+    /// the two corners disagree at every density but the handoff's.
+    #[test]
+    fn the_popup_surface_follows_the_themes_radius_and_falls_back_to_the_handoff() {
+        // COSMIC's three densities, as `cosmic-theme` ships them.
+        for corner in [16.0_f32, 8.0, 2.0] {
+            let r = popup_radius([corner; 4]);
+            assert_eq!(
+                (r.top_left, r.top_right, r.bottom_right, r.bottom_left),
+                (corner, corner, corner, corner)
+            );
+        }
+        // A theme that reports nothing leaves the handoff's own value.
+        let r = popup_radius([0.0; 4]);
+        assert_eq!(r.top_left, POPUP_RADIUS);
+        // Asymmetric radii are passed through corner for corner.
+        let r = popup_radius([1.0, 2.0, 3.0, 4.0]);
+        assert_eq!((r.top_left, r.top_right, r.bottom_right, r.bottom_left), (1.0, 2.0, 3.0, 4.0));
+    }
+
+    /// I4: eight rows of clients, then the list scrolls — so Preferences…,
+    /// the thumbnails row and Quit are never pushed past `popup_container`'s
+    /// 1000 px ceiling by a long account list.
+    #[test]
+    fn the_accounts_list_is_capped_at_eight_rows() {
+        // One row: 9 + 9 padding + 13.5 x 1.3 line box + the 1 px group gap.
+        let row = MENU_ROW_PAD.top + MENU_ROW_PAD.bottom + MENU_SIZE * LINE_HEIGHT + f32::from(MENU_GAP);
+        assert!((row - 36.55).abs() < 0.01, "row is {row}");
+        assert!(
+            (ACCOUNTS_LIST_MAX_PX - row * 8.0).abs() < 1.0,
+            "{ACCOUNTS_LIST_MAX_PX} should be eight {row} px rows"
+        );
     }
 
     #[test]
@@ -308,6 +414,8 @@ mod tests {
         assert_eq!((TILE_LABEL_SIZE, TILE_TOTAL_SIZE, TILE_RATE_SIZE), (10.0, 16.0, 11.0));
         assert_eq!((MENU_SIZE, MENU_HINT_SIZE, MENU_RADIUS), (13.5, 10.5, 8.0));
         assert_eq!((MENU_GAP, MENU_ROW_GAP, DISABLED_ALPHA), (1, 8, 0.4));
+        // The band's column gap is the header's, by construction.
+        assert_eq!(BAND_COLUMN_GAP, HEADER_COLUMN_GAP);
         assert_eq!(DIM_OPACITY, 0.38);
         // The handoff's per-section padding shorthands, in its own order
         // (top, right, bottom, left).

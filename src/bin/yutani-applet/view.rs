@@ -192,7 +192,7 @@ fn accounts_band<'a>(d: &Display) -> Element<'a, Msg> {
         .push(count(d.accounts.to_string(), theme::TEXT_PRIMARY))
         .push(ui(d.accounts_label, theme::COUNT_LABEL_SIZE, theme::TEXT_SECONDARY));
     let right = Column::new()
-        .spacing(theme::HEADER_COLUMN_GAP)
+        .spacing(theme::BAND_COLUMN_GAP)
         .align_x(Alignment::End)
         .push(mono(d.address.clone(), theme::BAND_RIGHT_SIZE, theme::TEXT_FAINT))
         .push(mono(d.handshake.clone(), theme::BAND_RIGHT_SIZE, theme::TEXT_FAINT));
@@ -319,38 +319,68 @@ fn note_line<'a>(note: &Note) -> Element<'a, Msg> {
         .into()
 }
 
+/// The expanded client rows, in their own scroll area.
+///
+/// `popup_container` caps the popup at 1000 px and caps it by *clipping*:
+/// without this, a long enough account list would push Preferences…, the
+/// thumbnails row and Quit straight off the bottom of the popup with no
+/// way to reach them. Only the client rows scroll — the Accounts… header
+/// stays outside, so what is scrolling is always labelled.
+fn accounts_list(rows: Vec<Element<'_, Msg>>) -> Element<'_, Msg> {
+    widget::container(widget::scrollable(
+        Column::with_children(rows).width(Length::Fill).spacing(theme::MENU_GAP),
+    ))
+    .width(Length::Fill)
+    .max_height(theme::ACCOUNTS_LIST_MAX_PX)
+    .into()
+}
+
 /// The menu group: the rows for the current state, the hairline the handoff
 /// puts above Quit, and the error note under whichever row earned it
 /// (spec §7). A note from a failed poll belongs to no row — it goes above
 /// the Quit divider, at the foot of the ordinary rows, rather than under
 /// the danger row it has nothing to do with. (If there is no Quit row to
 /// anchor to — the offline state — it falls back to the very end.)
+///
+/// The expanded client rows are a contiguous run in the middle of that
+/// list, and they are collected into [`accounts_list`] rather than pushed
+/// into the group — everything else keeps its place around them.
 fn menu(state: &Applet) -> Element<'_, Msg> {
     let rows = yutani::applet::menu::rows(state.status.as_ref(), state.accounts_open);
     let note = state.note.as_ref().filter(|n| note_visible(n.at_ms, state.now_ms()));
-    let mut group = Column::new().width(Length::Fill).spacing(theme::MENU_GAP);
+    let mut group: Vec<Element<'_, Msg>> = Vec::new();
+    let mut clients: Vec<Element<'_, Msg>> = Vec::new();
     let mut placed = false;
     for row in rows {
+        let is_client = matches!(row.kind, RowKind::Account { .. });
+        // The run has ended: fold it into the group before this row.
+        if !is_client && !clients.is_empty() {
+            group.push(accounts_list(std::mem::take(&mut clients)));
+        }
         if row.kind == RowKind::Danger {
             if let Some(note) = note.filter(|n| n.action.is_none()) {
-                group = group.push(note_line(note));
+                group.push(note_line(note));
                 placed = true;
             }
-            group = group.push(divider(theme::DIVIDER_ABOVE_MENU));
+            group.push(divider(theme::DIVIDER_ABOVE_MENU));
         }
         // The Accounts… header stays lit while its list is open.
         let held = row.toggles_accounts && state.accounts_open;
         let owns_note = note.is_some_and(|n| n.action.is_some() && n.action == row.action);
-        group = group.push(menu_row(row, held));
+        let target = if is_client { &mut clients } else { &mut group };
+        target.push(menu_row(row, held));
         if let Some(note) = note.filter(|_| owns_note) {
-            group = group.push(note_line(note));
+            target.push(note_line(note));
             placed = true;
         }
     }
-    if let Some(note) = note.filter(|_| !placed) {
-        group = group.push(note_line(note));
+    if !clients.is_empty() {
+        group.push(accounts_list(std::mem::take(&mut clients)));
     }
-    group.into()
+    if let Some(note) = note.filter(|_| !placed) {
+        group.push(note_line(note));
+    }
+    Column::with_children(group).width(Length::Fill).spacing(theme::MENU_GAP).into()
 }
 
 /// The popup's contents, on the handoff's own surface.
