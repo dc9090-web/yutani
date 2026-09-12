@@ -123,9 +123,13 @@ uniform mat3 u_uv;
 varying vec2 v_uv;
 varying vec2 v_o;
 void main() {
-    // Clip space → output space in *Wayland* orientation (y down): GL row 0
-    // is memory row 0, which the compositor treats as the top row.
-    vec2 o = vec2(a_pos.x * 0.5 + 0.5, 0.5 - a_pos.y * 0.5);
+    // Clip space → output space in *Wayland* orientation (y down). GL window
+    // row 0 (NDC y = -1) is memory row 0, which the compositor treats as the
+    // top row, so the top row must get Wayland-normalised o.y = 0: no flip.
+    // The source texture's v = 0 is also its memory row 0, so no flip is
+    // needed there either — `o` doubles as both the output position and the
+    // untransformed sample coordinate before `u_uv` is applied.
+    vec2 o = a_pos * 0.5 + 0.5;
     v_uv = (u_uv * vec3(o, 1.0)).xy;
     v_o = o;
     gl_Position = vec4(a_pos, 0.0, 1.0);
@@ -149,6 +153,7 @@ void main() {
     // Rounded-box signed distance: negative inside, 0 on the edge.
     float dist = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - u_radius;
     float a = clamp(0.5 - dist, 0.0, 1.0);
+    if (u_radius <= 0.0) { a = 1.0; }
     vec3 c = texture2D(u_tex, v_uv).rgb;
     gl_FragColor = vec4(c, 1.0) * a; // premultiplied; source treated as opaque
 }
@@ -179,7 +184,7 @@ pub struct SourceTexture {
 
 impl Drop for SourceTexture {
     fn drop(&mut self) {
-        let mut t = self.trash.lock().unwrap();
+        let mut t = self.trash.lock().unwrap_or_else(|e| e.into_inner());
         t.textures.push(self.texture);
         if self.image != 0 {
             t.images.push(self.image);
@@ -199,12 +204,23 @@ pub struct Target {
 
 impl Drop for Target {
     fn drop(&mut self) {
-        let mut t = self.trash.lock().unwrap();
+        let mut t = self.trash.lock().unwrap_or_else(|e| e.into_inner());
         t.framebuffers.push(self.framebuffer);
         t.renderbuffers.push(self.renderbuffer);
         t.images.push(self.image);
     }
 }
+
+// The capture session (shared with thread-pool tasks) stores these, so they
+// must stay `Send`: raw EGL handles live here only as integers.
+const _: () = {
+    #[allow(dead_code)]
+    fn assert_send<T: Send>() {}
+    fn _check() {
+        assert_send::<SourceTexture>();
+        assert_send::<Target>();
+    }
+};
 
 pub struct Gl {
     egl: egl::DynamicInstance<egl::EGL1_5>,
@@ -362,7 +378,13 @@ impl Gl {
         let image = self.create_image(dma)?;
         // SAFETY: GL calls on the current context.
         let texture = unsafe {
-            let t = self.gl.create_texture().map_err(|e| anyhow!(e))?;
+            let t = match self.gl.create_texture() {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = self.egl.destroy_image(self.display, image);
+                    return Err(anyhow!(e));
+                }
+            };
             self.gl.bind_texture(glow::TEXTURE_2D, Some(t));
             (self.image_target_texture)(glow::TEXTURE_2D, image.as_ptr());
             self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
@@ -370,7 +392,11 @@ impl Gl {
             self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
             self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
             let err = self.gl.get_error();
-            ensure!(err == glow::NO_ERROR, "glEGLImageTargetTexture2DOES: GL error {err:#x}");
+            if err != glow::NO_ERROR {
+                self.gl.delete_texture(t);
+                let _ = self.egl.destroy_image(self.display, image);
+                anyhow::bail!("glEGLImageTargetTexture2DOES: GL error {err:#x}");
+            }
             t.0.get()
         };
         Ok(SourceTexture { texture, image: image.as_ptr() as usize, trash: self.trash.clone() })
@@ -465,7 +491,7 @@ impl Gl {
     }
 
     fn collect_trash(&self) {
-        let trash = std::mem::take(&mut *self.trash.lock().unwrap());
+        let trash = std::mem::take(&mut *self.trash.lock().unwrap_or_else(|e| e.into_inner()));
         // SAFETY: freeing handles we created, on the context's thread.
         unsafe {
             for f in trash.framebuffers {
@@ -483,18 +509,28 @@ impl Gl {
         }
     }
 
-    /// Render a white 2×2 texture into a fresh 64×64 target with a 16 px
-    /// radius and read it back: the corner must be transparent, the centre
-    /// opaque white. Used by `yutani doctor`.
+    /// Render a 2×2 texture (top memory row white, bottom memory row
+    /// black-opaque) into a fresh 64×64 target with a 16 px radius and read
+    /// it back. `NEAREST` filtering keeps the two source rows from blending
+    /// so the readback can tell which memory row landed where. Used by
+    /// `yutani doctor`; the orientation assertions catch a y-flip in `VERT`
+    /// (`read_pixels` returns rows starting at GL window row 0 = memory row
+    /// 0 = top, so `at(x, y)` indexes memory rows top-down as written).
     pub fn self_test(&self, gbm: &gbm::Device<File>) -> anyhow::Result<()> {
         let target = self.create_target(gbm, &[], (64, 64))?;
+        // Top memory row (first 8 bytes) white, bottom memory row black-opaque.
+        #[rustfmt::skip]
+        let pixels: [u8; 16] = [
+            255, 255, 255, 255,  255, 255, 255, 255,
+              0,   0,   0, 255,    0,   0,   0, 255,
+        ];
         // SAFETY: GL calls on the current context.
         let texture = unsafe {
             let t = self.gl.create_texture().map_err(|e| anyhow!(e))?;
             self.gl.bind_texture(glow::TEXTURE_2D, Some(t));
-            self.gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA as i32, 2, 2, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(&[255u8; 16])));
-            self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-            self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+            self.gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA as i32, 2, 2, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(&pixels)));
+            self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+            self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
             t.0.get()
         };
         let src = SourceTexture { texture, image: 0, trash: self.trash.clone() };
@@ -506,8 +542,11 @@ impl Gl {
         }
         let at = |x: usize, y: usize| &px[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
         ensure!(at(0, 0)[3] == 0, "corner pixel not transparent: {:?}", at(0, 0));
-        ensure!(at(32, 32) == [255, 255, 255, 255], "centre pixel not opaque white: {:?}", at(32, 32));
         ensure!(at(32, 0)[3] == 255, "top-edge pixel not opaque: {:?}", at(32, 0));
+        ensure!(at(32, 16) == [255, 255, 255, 255], "upper-half pixel not opaque white: {:?}", at(32, 16));
+        ensure!(at(2, 40) == [0, 0, 0, 255], "left-edge pixel inside mask not opaque black: {:?}", at(2, 40));
+        ensure!(at(32, 2) == [255, 255, 255, 255], "top row must come from the source's first memory row: {:?}", at(32, 2));
+        ensure!(at(32, 61) == [0, 0, 0, 255], "bottom row must come from the source's last memory row: {:?}", at(32, 61));
         Ok(())
     }
 }
@@ -515,7 +554,8 @@ impl Gl {
 /// First render node under /dev/dri, for `yutani doctor` (the app uses the
 /// device the compositor names in its dmabuf feedback).
 pub fn open_render_node() -> anyhow::Result<gbm::Device<File>> {
-    let mut nodes: Vec<_> = std::fs::read_dir("/dev/dri")?
+    let mut nodes: Vec<_> = std::fs::read_dir("/dev/dri")
+        .context("read /dev/dri")?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("renderD")))
