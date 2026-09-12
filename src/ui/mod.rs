@@ -108,7 +108,32 @@ pub enum Msg {
     ConfigChanged(Config),
     Tray(tray::TrayEvent),
     Ipc(ipc::IpcEvent),
+    /// The answer to an IPC request that could not be produced on the update
+    /// thread (see [`Reply::Later`]). Carries the request's one-shot reply
+    /// handle, so the answer still reaches exactly the client that asked.
+    IpcReplyLater(ipc::Responder, Result<Option<String>, String>),
     Adopt(adopt::AdoptEvent),
+}
+
+/// How an IPC request is answered. Every request produces exactly one
+/// `Response`: either here on the update thread, or — for requests that
+/// would otherwise block it — from the `Msg::IpcReplyLater` the returned
+/// `Task` resolves to. If the app quits before that task resolves, the task
+/// (and with it the `Responder`) is dropped, the one-shot sender closes and
+/// the waiting client is told "no reply from app"; nothing panics.
+enum Reply {
+    /// Answer now, from this call.
+    Now(Result<Option<String>, String>),
+    /// The `Task` returned alongside owns the reply handle and will answer.
+    Later,
+}
+
+fn response_of(result: Result<Option<String>, String>) -> crate::ipc::Response {
+    match result {
+        Ok(None) => crate::ipc::Response::Ok,
+        Ok(Some(data)) => crate::ipc::Response::OkData(data),
+        Err(m) => crate::ipc::Response::Err(m),
+    }
 }
 
 impl App {
@@ -256,7 +281,11 @@ impl App {
     }
 
     /// Execute one IPC request. `Err` is the text sent back after `err `.
-    fn handle_request(&mut self, request: &crate::ipc::Request) -> (Result<Option<String>, String>, Task<cosmic::Action<Msg>>) {
+    fn handle_request(
+        &mut self,
+        request: &crate::ipc::Request,
+        reply: &ipc::Responder,
+    ) -> (Reply, Task<cosmic::Action<Msg>>) {
         use crate::ipc::Request;
         match request {
             Request::Focus(n) => {
@@ -264,9 +293,9 @@ impl App {
                 match n.checked_sub(1).and_then(|i| order.get(i)) {
                     Some(h) => {
                         self.send(Cmd::Activate(h.clone()));
-                        (Ok(None), Task::none())
+                        (Reply::Now(Ok(None)), Task::none())
                     }
-                    None => (Err(format!("no client {n} ({} known)", order.len())), Task::none()),
+                    None => (Reply::Now(Err(format!("no client {n} ({} known)", order.len()))), Task::none()),
                 }
             }
             Request::Next | Request::Prev => {
@@ -275,23 +304,23 @@ impl App {
                 match rules::step(&order, active.as_ref(), matches!(request, Request::Next)) {
                     Some(h) => {
                         self.send(Cmd::Activate(h));
-                        (Ok(None), Task::none())
+                        (Reply::Now(Ok(None)), Task::none())
                     }
-                    None => (Err("no clients".into()), Task::none()),
+                    None => (Reply::Now(Err("no clients".into())), Task::none()),
                 }
             }
-            Request::Show => (Ok(None), self.set_hidden(false)),
-            Request::Hide => (Ok(None), self.set_hidden(true)),
+            Request::Show => (Reply::Now(Ok(None)), self.set_hidden(false)),
+            Request::Hide => (Reply::Now(Ok(None)), self.set_hidden(true)),
             Request::Toggle => {
                 let h = !self.hidden;
-                (Ok(None), self.set_hidden(h))
+                (Reply::Now(Ok(None)), self.set_hidden(h))
             }
             Request::Layout(_) | Request::Settings => {
-                (Err("not supported yet (settings and layouts arrive in plan 5)".into()), Task::none())
+                (Reply::Now(Err("not supported yet (settings and layouts arrive in plan 5)".into())), Task::none())
             }
             Request::Quit => {
                 ipc::remove_socket();
-                (Ok(None), cosmic::iced::exit())
+                (Reply::Now(Ok(None)), cosmic::iced::exit())
             }
             Request::Status => {
                 let order = self.focus_order();
@@ -306,12 +335,34 @@ impl App {
                     tunnel: crate::tunnel::control::current_tunnel_status(&self.config.tunnel.location),
                 };
                 match serde_json::to_string(&status) {
-                    Ok(json) => (Ok(Some(json)), Task::none()),
-                    Err(e) => (Err(format!("status: {e}")), Task::none()),
+                    Ok(json) => (Reply::Now(Ok(Some(json))), Task::none()),
+                    Err(e) => (Reply::Now(Err(format!("status: {e}"))), Task::none()),
                 }
             }
-            Request::TunnelConnect => (crate::tunnel::control::connect().map(|()| None).map_err(|e| format!("{e:#}")), Task::none()),
-            Request::TunnelDisconnect => (crate::tunnel::control::disconnect().map(|()| None).map_err(|e| format!("{e:#}")), Task::none()),
+            // `systemctl start|stop` is a synchronous subprocess that can
+            // take up to the unit's TimeoutStopSec (10 s). Running it here
+            // would freeze every thumbnail for that long, so it goes to the
+            // blocking pool and the answer comes back as `IpcReplyLater`.
+            Request::TunnelConnect | Request::TunnelDisconnect => {
+                let connect = matches!(request, Request::TunnelConnect);
+                let reply = reply.clone();
+                let task = cosmic::iced::Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            if connect {
+                                crate::tunnel::control::connect()
+                            } else {
+                                crate::tunnel::control::disconnect()
+                            }
+                        })
+                        .await
+                        .map_err(|e| format!("tunnel task failed: {e}"))
+                        .and_then(|r| r.map(|()| None).map_err(|e| format!("{e:#}")))
+                    },
+                    move |result| cosmic::Action::App(Msg::IpcReplyLater(reply, result)),
+                );
+                (Reply::Later, task)
+            }
         }
     }
 
@@ -893,13 +944,15 @@ impl Application for App {
                 cosmic::iced::exit()
             }
             Msg::Ipc(ev) => {
-                let (result, task) = self.handle_request(&ev.request);
-                ev.reply.respond(match result {
-                    Ok(None) => crate::ipc::Response::Ok,
-                    Ok(Some(data)) => crate::ipc::Response::OkData(data),
-                    Err(m) => crate::ipc::Response::Err(m),
-                });
+                let (reply, task) = self.handle_request(&ev.request, &ev.reply);
+                if let Reply::Now(result) = reply {
+                    ev.reply.respond(response_of(result));
+                }
                 task
+            }
+            Msg::IpcReplyLater(reply, result) => {
+                reply.respond(response_of(result));
+                Task::none()
             }
             Msg::Adopt(ev) => {
                 match ev.result {

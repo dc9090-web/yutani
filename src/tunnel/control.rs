@@ -12,9 +12,18 @@ pub fn installed() -> bool {
     std::path::Path::new(UNIT_PATH).exists()
 }
 
+/// `--no-ask-password`: without the polkit rule in place, systemctl would
+/// otherwise hand the request to an authentication agent and block for as
+/// long as that agent cares to wait. With it, the call fails fast and says
+/// why — which the caller can show, whereas an unbounded wait it cannot.
+pub fn systemctl_argv(verb: &str) -> Vec<String> {
+    ["systemctl", "--no-ask-password", verb, UNIT_NAME].iter().map(|s| s.to_string()).collect()
+}
+
 fn systemctl(verb: &str) -> anyhow::Result<()> {
     ensure!(installed(), "tunnel is not installed; run `yutani tunnel install <conf>`");
-    let out = Command::new("systemctl").args([verb, UNIT_NAME]).output().context("systemctl")?;
+    let argv = systemctl_argv(verb);
+    let out = Command::new(&argv[0]).args(&argv[1..]).output().context("systemctl")?;
     ensure!(out.status.success(), "systemctl {verb} {UNIT_NAME}: {}", String::from_utf8_lossy(&out.stderr).trim());
     Ok(())
 }
@@ -43,4 +52,15 @@ pub fn sysfs_counters() -> Option<(u64, u64)> {
 pub fn current_tunnel_status(location: &str) -> TunnelStatus {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     assemble(read_tunnel_file().as_ref(), iface_present(), sysfs_counters(), installed(), location, now)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn systemctl_never_waits_on_an_authentication_agent() {
+        assert_eq!(systemctl_argv("start"), vec!["systemctl", "--no-ask-password", "start", "yutani-tunnel.service"]);
+        assert_eq!(systemctl_argv("stop"), vec!["systemctl", "--no-ask-password", "stop", "yutani-tunnel.service"]);
+    }
 }
