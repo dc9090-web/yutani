@@ -84,6 +84,16 @@ pub fn run() -> anyhow::Result<ExitCode> {
         println!("{:<56} {:<9} {}", c.interface, needed, found);
     }
 
+    // GPU thumbnail pass: EGL on the first render node + a tiny offscreen render.
+    let gl_status = crate::backend::gl::open_render_node()
+        .and_then(|gbm| {
+            let gl = crate::backend::gl::Gl::new(&gbm)?;
+            gl.self_test(&gbm)
+        })
+        .map(|()| "ok".to_string())
+        .unwrap_or_else(|err| format!("unavailable: {err:#} (thumbnails will have square corners)"));
+    println!("\n{:<56} {}", "gl (rounded corners)", gl_status);
+
     if all_required_present(&checks) {
         println!("\nOK: cosmic-comp advertises everything Yutani needs.");
         Ok(ExitCode::SUCCESS)
