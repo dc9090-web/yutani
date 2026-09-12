@@ -259,7 +259,7 @@ impl App {
         match request {
             Request::Focus(n) => {
                 let order = self.focus_order();
-                match order.get(n - 1) {
+                match n.checked_sub(1).and_then(|i| order.get(i)) {
                     Some(h) => {
                         self.send(Cmd::Activate(h.clone()));
                         (Ok(()), Task::none())
@@ -913,8 +913,9 @@ impl Application for App {
 
     /// `run_single_instance` activates the already-running instance and lets
     /// this dbus-activation request arrive here instead of spawning a second
-    /// process. Plan 4's IPC will give it a real message; for now, log so a
-    /// second launch is visible rather than silently doing nothing.
+    /// process. In practice this never fires: the second-instance case is
+    /// already handled before `run_single_instance` runs, by the socket
+    /// check in `main.rs` (`cli::is_running`). This activation is a no-op.
     fn dbus_activation(&mut self, _msg: cosmic::dbus_activation::Message) -> Task<cosmic::Action<Msg>> {
         tracing::info!("activation request received (another yutani instance was launched)");
         Task::none()

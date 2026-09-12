@@ -186,6 +186,15 @@ impl Config {
                 self.shortcuts = ShortcutsConfig::default();
             }
         }
+        {
+            let prefix = &self.shortcuts.focus_prefix;
+            let mut seen = std::collections::HashSet::new();
+            let has_dup = !prefix.iter().all(|m| seen.insert(*m));
+            if prefix.is_empty() || has_dup {
+                tracing::warn!("config: shortcuts.focus_prefix {prefix:?} must be non-empty with no duplicate modifiers; using defaults");
+                self.shortcuts = ShortcutsConfig::default();
+            }
+        }
         self
     }
 }
@@ -373,6 +382,19 @@ mod tests {
         let mut c = Config::default();
         c.shortcuts.next = "Tab".into();
         c.shortcuts.prev = "grave".into();
+        assert_eq!(c.clone().validate(), c);
+    }
+
+    #[test]
+    fn validate_rejects_empty_or_duplicate_focus_prefix() {
+        let mut c = Config::default();
+        c.shortcuts.focus_prefix = vec![];
+        assert_eq!(c.validate().shortcuts.focus_prefix, vec![Modifier::Ctrl, Modifier::Alt]);
+        let mut c = Config::default();
+        c.shortcuts.focus_prefix = vec![Modifier::Super, Modifier::Super];
+        assert_eq!(c.validate().shortcuts.focus_prefix, vec![Modifier::Ctrl, Modifier::Alt]);
+        let mut c = Config::default();
+        c.shortcuts.focus_prefix = vec![Modifier::Super];
         assert_eq!(c.clone().validate(), c);
     }
 }
