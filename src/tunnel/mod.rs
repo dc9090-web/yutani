@@ -18,24 +18,125 @@ pub const UNIT_NAME: &str = "yutani-tunnel.service";
 pub const UNIT_PATH: &str = "/etc/systemd/system/yutani-tunnel.service";
 pub const POLKIT_PATH: &str = "/etc/polkit-1/rules.d/50-yutani-tunnel.rules";
 
-/// Create `path` with `mode` from the start: files that hold key material
-/// must never be readable by anyone else, not even for the instant between
-/// `write` and `chmod`.
+/// Write `path` with exactly `mode`, atomically.
+///
+/// The temporary is created in the target's directory with `mode` from the
+/// start — files that hold key material must never be readable by anyone
+/// else, not even for the instant between `write` and `chmod`. `open(2)`
+/// masks the mode it is given with the umask, so the mode is also set
+/// explicitly: a 0644 unit or polkit rule must stay readable by `systemd`
+/// and `polkitd` however the caller's umask is set. The `rename` is the last
+/// step, so a failure leaves the previous file in place.
 fn write_with_mode(path: &str, text: &str, mode: u32) -> anyhow::Result<()> {
     use anyhow::Context as _;
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("remove {path}")),
+    let target = std::path::Path::new(path);
+    let dir = match target.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => std::path::Path::new("."),
+    };
+    let name = target.file_name().and_then(|n| n.to_str()).with_context(|| format!("{path} is not a file path"))?;
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+
+    let attempt = || -> anyhow::Result<()> {
+        match std::fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("remove stale {}", tmp.display())),
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(text.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("chmod {mode:o} {}", tmp.display()))?;
+        std::fs::rename(&tmp, target).with_context(|| format!("rename into place: {path}"))
+    };
+
+    let result = attempt();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(path)
-        .with_context(|| format!("create {path}"))?;
-    f.write_all(text.as_bytes()).with_context(|| format!("write {path}"))
+    result
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // POSIX `mode_t umask(mode_t)`: the test must prove the modes we ask for
+    // survive a restrictive umask.
+    unsafe extern "C" {
+        #[link_name = "umask"]
+        fn libc_umask(mask: u32) -> u32;
+    }
+
+    fn mode_of(path: &str) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("yutani-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn modes_are_exact_whatever_the_umask() {
+        let dir = temp_dir("mode");
+        let unit = dir.join("unit").to_string_lossy().into_owned();
+        let key = dir.join("key").to_string_lossy().into_owned();
+        // SAFETY: umask has no preconditions and cannot fail; restored below.
+        let old = unsafe { libc_umask(0o077) };
+        let got = std::panic::catch_unwind(|| {
+            write_with_mode(&unit, "unit\n", 0o644).unwrap();
+            write_with_mode(&key, "key\n", 0o600).unwrap();
+            (mode_of(&unit), mode_of(&key))
+        });
+        // SAFETY: as above.
+        unsafe { libc_umask(old) };
+        let (unit_mode, key_mode) = got.unwrap();
+        assert_eq!(unit_mode, 0o644, "polkitd must be able to read a 0644 file under any umask");
+        assert_eq!(key_mode, 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_overwrite_replaces_the_content_and_leaves_no_temporary_behind() {
+        let dir = temp_dir("atomic");
+        let path = dir.join("f").to_string_lossy().into_owned();
+        write_with_mode(&path, "old\n", 0o600).unwrap();
+        write_with_mode(&path, "new\n", 0o644).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        assert_eq!(mode_of(&path), 0o644);
+        let left: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(left, vec!["f".to_string()], "the temporary must be renamed, not left behind");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_write_keeps_the_target_and_removes_its_temporary() {
+        let dir = temp_dir("atomic-fail");
+        // A directory can never be replaced by `rename` of a file: the write
+        // fails, the target survives, and nothing is left lying around.
+        let target = dir.join("d");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("inside"), "keep").unwrap();
+        let path = target.to_string_lossy().into_owned();
+        assert!(write_with_mode(&path, "new\n", 0o600).is_err());
+        assert_eq!(std::fs::read_to_string(target.join("inside")).unwrap(), "keep");
+        let left: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(left, vec!["d".to_string()], "a failed write must clean up its temporary");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

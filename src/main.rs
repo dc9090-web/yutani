@@ -132,7 +132,8 @@ fn main() -> ExitCode {
         Some(Command::Tunnel { action }) => match action {
             TunnelAction::Install { conf, dry_run: true } => {
                 let (uid, user) = (ipc::uid(), std::env::var("USER").unwrap_or_default());
-                let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+                // The same canonical path the real install passes to `install-root`.
+                let exe = tunnel::install::current_exe().unwrap_or_default();
                 tunnel::install::install_root(&conf.canonicalize().unwrap_or(conf.clone()), uid, &user, &exe, true)
                     .and_then(|report| {
                         print!("{report}");

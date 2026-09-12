@@ -61,15 +61,36 @@ fn load(conf_path: &Path) -> anyhow::Result<(WgConf, u32)> {
 }
 
 /// Every step is attempted even if an earlier one fails: teardown must leave
-/// nothing behind after a partial `up`.
+/// nothing behind after a partial `up`. Failures are expected (an object that
+/// never existed) but not hidden: `exec`'s error carries the argv and the
+/// command's stderr, and `info` is inside the unit's default filter.
 fn down() {
     for argv in rules::down_commands() {
         if let Err(e) = exec(&argv) {
-            tracing::debug!("teardown: {e:#}");
+            tracing::info!("teardown: {e:#}");
         }
     }
     let _ = std::fs::remove_file(STATUS_PATH);
     let _ = std::fs::remove_file(WG_CONF_TMP);
+}
+
+/// Runs its action once when it goes out of scope — normal return, `?`, or a
+/// panic. `run` holds one from just before `up` until it returns, so the
+/// tunnel is torn down on every path out and never twice.
+struct Teardown(Option<fn()>);
+
+impl Teardown {
+    fn new(action: fn()) -> Self {
+        Teardown(Some(action))
+    }
+}
+
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        if let Some(action) = self.0.take() {
+            action();
+        }
+    }
 }
 
 fn up(conf: &WgConf, uid: u32) -> anyhow::Result<()> {
@@ -112,9 +133,11 @@ fn write_status(conf: &WgConf, since: u64) -> anyhow::Result<()> {
 pub fn run() -> anyhow::Result<()> {
     let (conf, uid) = load(Path::new(CONF_PATH))?;
     tracing::info!("tunnel up: {} via {} for uid {uid}", conf.label, conf.endpoint);
+    // From here on every exit tears the tunnel down: the guard is the only
+    // caller of `down`, so it happens exactly once.
+    let _teardown = Teardown::new(down);
     if let Err(e) = up(&conf, uid) {
         tracing::error!("tunnel start failed: {e:#}; tearing down");
-        down();
         return Err(e);
     }
     let since = now_unix();
@@ -137,7 +160,6 @@ pub fn run() -> anyhow::Result<()> {
         Ok(())
     });
     tracing::info!("tunnel down");
-    down();
     result
 }
 
@@ -180,6 +202,28 @@ mod tests {
         assert!(out.contains("PrivateKey = <redacted>"));
         assert!(!out.contains("U0VDUkVU"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_teardown_guard_runs_exactly_once_on_every_way_out() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        fn bump() {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+        }
+        {
+            let _guard = Teardown::new(bump);
+        }
+        assert_eq!(RUNS.load(Ordering::SeqCst), 1, "dropping the guard tears down once");
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let r = std::panic::catch_unwind(|| {
+            let _guard = Teardown::new(bump);
+            panic!("worker blew up");
+        });
+        std::panic::set_hook(hook);
+        assert!(r.is_err());
+        assert_eq!(RUNS.load(Ordering::SeqCst), 2, "a panic must still tear down, exactly once");
     }
 
     #[test]
