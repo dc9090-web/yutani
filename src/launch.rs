@@ -8,13 +8,17 @@
 //! `XDG_RUNTIME_DIR`, no session bus) or wedged, and in either case
 //! `systemd-run --scope` would exit non-zero *without ever starting the
 //! game* — indistinguishable, from the exit code alone, from the game
-//! itself failing. So before wrapping we preflight the manager with a
-//! short, bounded `busctl --user --timeout=2 status` (chosen over
-//! `systemctl --user show --property=Version` because `busctl` takes a
-//! native `--timeout`, so a wedged manager cannot stall this call past that
-//! bound — `systemctl` has no such flag and would need an external timeout
-//! wrapper). If the preflight fails (non-zero exit, spawn error, or no
-//! stdout), we skip `systemd-run` entirely and run the command directly,
+//! itself failing. So before wrapping we preflight the manager with a short
+//! `busctl --user --timeout=2 status`, run under [`crate::proc`]'s
+//! process-level timeout.
+//!
+//! The two bounds are not the same thing. `busctl`'s own `--timeout` bounds
+//! only the *method-call reply* phase, and `busctl status` ignores it
+//! altogether: a socket that accepts a connection but never speaks D-Bus
+//! keeps `busctl` in connect/authentication for 90 s or more. What actually
+//! bounds this call is [`PREFLIGHT_TIMEOUT`], after which the process is
+//! killed. If the preflight fails (timeout, non-zero exit, spawn error, or
+//! no stdout), we skip `systemd-run` entirely and run the command directly,
 //! warning on stderr, so the game still starts exactly once.
 //!
 //! Once the preflight has passed, `systemd-run`'s exit status is propagated
@@ -28,8 +32,14 @@
 
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitCode, ExitStatus, Output};
+use std::time::Duration;
 
 use crate::tunnel::SLICE;
+
+/// Wall-clock bound on the preflight. The game is waiting behind it, so it
+/// is deliberately short: a manager that cannot answer in two seconds is
+/// treated as unreachable.
+pub const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn systemd_run_argv(command: &[String]) -> Vec<String> {
     let mut v: Vec<String> = ["systemd-run", "--user", "--scope", "--quiet", "--collect", &format!("--slice={SLICE}"), "--"]
@@ -41,22 +51,24 @@ pub fn systemd_run_argv(command: &[String]) -> Vec<String> {
 }
 
 /// argv for the preflight: is the user's systemd/D-Bus manager reachable at
-/// all? `--timeout=2` bounds how long a wedged manager can stall us.
+/// all? `--timeout=2` only bounds a method call's reply (and `status`
+/// ignores it); [`PREFLIGHT_TIMEOUT`] is what bounds this call.
 pub fn preflight_argv() -> Vec<String> {
     ["busctl", "--user", "--timeout=2", "status"].iter().map(|s| s.to_string()).collect()
 }
 
-/// From the preflight's outcome (`None` if it could not even be spawned —
-/// e.g. `busctl` itself is missing), decide whether it is safe to wrap the
-/// game in `systemd-run`. A non-zero exit, a spawn error, or empty stdout
-/// (the call returned but said nothing sane) all mean "no, run directly".
+/// From the preflight's outcome (`None` if it timed out or could not even
+/// be spawned — e.g. `busctl` itself is missing), decide whether it is safe
+/// to wrap the game in `systemd-run`. A timeout, a non-zero exit, a spawn
+/// error, or empty stdout (the call returned but said nothing sane) all
+/// mean "no, run directly".
 pub fn should_wrap(preflight: Option<&Output>) -> bool {
     preflight.is_some_and(|o| o.status.success() && !o.stdout.is_empty())
 }
 
 fn run_preflight() -> Option<Output> {
     let argv = preflight_argv();
-    Command::new(&argv[0]).args(&argv[1..]).output().ok()
+    crate::proc::output_with_timeout(Command::new(&argv[0]).args(&argv[1..]), PREFLIGHT_TIMEOUT).ok().flatten()
 }
 
 /// Exit code for a finished child, POSIX-shell style: the process's own
@@ -87,7 +99,9 @@ pub fn run(command: Vec<String>) -> ExitCode {
             }
         }
     } else {
-        eprintln!("yutani launch: user systemd/D-Bus manager not reachable; running without the tunnel cgroup");
+        eprintln!(
+            "yutani launch: user systemd/D-Bus manager not reachable within {PREFLIGHT_TIMEOUT:?}; running without the tunnel cgroup"
+        );
     }
     match Command::new(&command[0]).args(&command[1..]).status() {
         Ok(status) => ExitCode::from(exit_code(status)),
@@ -116,6 +130,23 @@ mod tests {
     #[test]
     fn preflight_checks_the_user_bus_with_a_short_timeout() {
         assert_eq!(preflight_argv(), vec!["busctl", "--user", "--timeout=2", "status"]);
+        // The real bound is the process-level one: `busctl status` ignores
+        // `--timeout` entirely.
+        assert!(PREFLIGHT_TIMEOUT <= Duration::from_secs(2), "the game waits behind this");
+    }
+
+    #[test]
+    fn a_preflight_that_times_out_is_treated_as_unreachable() {
+        // `output_with_timeout` reports a timeout as `Ok(None)`, which
+        // `run_preflight` flattens to `None` — the same "run directly" path
+        // as a missing `busctl`.
+        let timed_out: Option<Output> = crate::proc::output_with_timeout(
+            Command::new("sleep").arg("10"),
+            Duration::from_millis(100),
+        )
+        .ok()
+        .flatten();
+        assert!(!should_wrap(timed_out.as_ref()), "a wedged manager must not wrap the game");
     }
 
     #[test]

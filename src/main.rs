@@ -5,6 +5,7 @@ mod doctor;
 mod ipc;
 mod launch;
 mod model;
+mod proc;
 mod shortcuts;
 mod tunnel;
 mod ui;
