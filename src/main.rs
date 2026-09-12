@@ -42,6 +42,13 @@ enum Command {
     Hide,
     /// Hide the thumbnails if shown, show them if hidden
     Toggle,
+    /// Apply a saved layout by name
+    Layout {
+        /// Name of a layout in ~/.config/yutani/layouts
+        name: String,
+    },
+    /// List the saved layouts, one per line
+    Layouts,
     /// Ask the running instance to exit
     Quit,
     /// Print the daemon's status (clients, visibility, tunnel) as JSON
@@ -141,6 +148,8 @@ fn main() -> ExitCode {
         Some(Command::Show) => Ok(cli::send(&ipc::Request::Show)),
         Some(Command::Hide) => Ok(cli::send(&ipc::Request::Hide)),
         Some(Command::Toggle) => Ok(cli::send(&ipc::Request::Toggle)),
+        Some(Command::Layout { name }) => Ok(cli::send(&ipc::Request::Layout(name))),
+        Some(Command::Layouts) => Ok(cli::layouts()),
         Some(Command::Quit) => Ok(cli::send(&ipc::Request::Quit)),
         Some(Command::Status) => Ok(cli::send(&ipc::Request::Status)),
         Some(Command::Launch { command }) => Ok(launch::run(command)),

@@ -14,41 +14,69 @@ pub fn is_running() -> bool {
     UnixStream::connect(socket_path()).is_ok()
 }
 
-/// Send `request`; print the reply; map it to an exit code.
-pub fn send(request: &Request) -> ExitCode {
+/// Send one request and return the reply. `Err` is a message already
+/// formatted for stderr.
+fn exchange(request: &Request) -> Result<Response, String> {
     let path = socket_path();
     let stream = match UnixStream::connect(&path) {
         Ok(s) => s,
         Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {
-            eprintln!("yutani is not running");
-            return ExitCode::from(1);
+            return Err("yutani is not running".into());
         }
-        Err(err) => {
-            eprintln!("yutani: cannot connect to {}: {err}", path.display());
-            return ExitCode::from(1);
-        }
+        Err(err) => return Err(format!("yutani: cannot connect to {}: {err}", path.display())),
     };
-    if let Err(err) = stream.set_read_timeout(Some(TIMEOUT)).and(stream.set_write_timeout(Some(TIMEOUT))) {
-        eprintln!("yutani: socket setup failed: {err}");
-        return ExitCode::from(1);
-    }
+    stream
+        .set_read_timeout(Some(TIMEOUT))
+        .and(stream.set_write_timeout(Some(TIMEOUT)))
+        .map_err(|err| format!("yutani: socket setup failed: {err}"))?;
     let mut writer = &stream;
-    if let Err(err) = writer.write_all(request.to_line().as_bytes()) {
-        eprintln!("yutani: send failed: {err}");
-        return ExitCode::from(1);
-    }
+    writer.write_all(request.to_line().as_bytes()).map_err(|err| format!("yutani: send failed: {err}"))?;
     let mut line = String::new();
-    if let Err(err) = BufReader::new(&stream).read_line(&mut line) {
-        eprintln!("yutani: no reply: {err}");
-        return ExitCode::from(1);
-    }
-    match Response::parse(&line) {
-        Response::Ok => ExitCode::SUCCESS,
-        Response::OkData(data) => {
+    BufReader::new(&stream).read_line(&mut line).map_err(|err| format!("yutani: no reply: {err}"))?;
+    Ok(Response::parse(&line))
+}
+
+/// Send `request`; print the reply; map it to an exit code.
+pub fn send(request: &Request) -> ExitCode {
+    match exchange(request) {
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(1)
+        }
+        Ok(Response::Ok) => ExitCode::SUCCESS,
+        Ok(Response::OkData(data)) => {
             println!("{data}");
             ExitCode::SUCCESS
         }
-        Response::Err(msg) => {
+        Ok(Response::Err(msg)) => {
+            eprintln!("yutani: {msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `yutani layouts`: the saved layout names, one per line (and nothing at
+/// all when none are saved).
+pub fn layouts() -> ExitCode {
+    match exchange(&Request::Layouts) {
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(1)
+        }
+        Ok(Response::OkData(json)) => match serde_json::from_str::<Vec<String>>(&json) {
+            Ok(names) => {
+                for name in names {
+                    println!("{name}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("yutani: cannot read the layout list: {err}");
+                ExitCode::from(1)
+            }
+        },
+        Ok(Response::Ok) => ExitCode::SUCCESS,
+        Ok(Response::Err(msg)) => {
             eprintln!("yutani: {msg}");
             ExitCode::from(1)
         }

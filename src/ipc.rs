@@ -40,6 +40,7 @@ pub enum Request {
     Hide,
     Toggle,
     Layout(String),
+    Layouts,
     Settings,
     Quit,
     Status,
@@ -68,6 +69,7 @@ impl Request {
             ("toggle", None) => Ok(Request::Toggle),
             ("layout", Some(name)) => Ok(Request::Layout(name.to_string())),
             ("layout", None) => Err("layout needs a name".into()),
+            ("layouts", None) => Ok(Request::Layouts),
             ("settings", None) => Ok(Request::Settings),
             ("quit", None) => Ok(Request::Quit),
             ("status", None) => Ok(Request::Status),
@@ -75,7 +77,9 @@ impl Request {
             ("tunnel", Some("disconnect")) => Ok(Request::TunnelDisconnect),
             ("tunnel", _) => Err("tunnel needs connect or disconnect".into()),
             ("", _) => Err("empty request".into()),
-            (cmd, Some(_)) if matches!(cmd, "next" | "prev" | "show" | "hide" | "toggle" | "settings" | "quit" | "status") => {
+            (cmd, Some(_))
+                if matches!(cmd, "next" | "prev" | "show" | "hide" | "toggle" | "layouts" | "settings" | "quit" | "status") =>
+            {
                 Err(format!("{cmd} takes no argument"))
             }
             (cmd, _) => Err(format!("unknown command {cmd:?}")),
@@ -91,6 +95,7 @@ impl Request {
             Request::Hide => "hide\n".into(),
             Request::Toggle => "toggle\n".into(),
             Request::Layout(name) => format!("layout {name}\n"),
+            Request::Layouts => "layouts\n".into(),
             Request::Settings => "settings\n".into(),
             Request::Quit => "quit\n".into(),
             Request::Status => "status\n".into(),
@@ -163,6 +168,14 @@ mod tests {
     }
 
     #[test]
+    fn layouts_is_its_own_command_not_a_layout_named_s() {
+        assert_eq!(Request::parse("layouts"), Ok(Request::Layouts));
+        assert_eq!(Request::parse("layouts now").unwrap_err(), "layouts takes no argument");
+        assert_eq!(Request::parse("layout current"), Ok(Request::Layout("current".into())));
+        assert_eq!(Request::Layouts.to_line(), "layouts\n");
+    }
+
+    #[test]
     fn request_lines_round_trip() {
         for r in [
             Request::Focus(9),
@@ -172,6 +185,7 @@ mod tests {
             Request::Hide,
             Request::Toggle,
             Request::Layout("a b".into()),
+            Request::Layouts,
             Request::Settings,
             Request::Quit,
             Request::Status,

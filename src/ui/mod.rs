@@ -90,6 +90,11 @@ pub struct Client {
     /// Pause/resume is an edge on this, not on whether a surface exists, so
     /// a client born hidden is paused too.
     pub paused: bool,
+    /// Connector name of the output this client's surface was created on;
+    /// empty when it has none. Applying a layout compares this with the
+    /// layout's output: a layer surface is bound to one output for life, so
+    /// a different one means destroy + recreate, not `set_margin`.
+    pub output: String,
 }
 
 pub struct App {
@@ -378,9 +383,19 @@ impl App {
                 let h = !self.hidden;
                 (Reply::Now(Ok(None)), self.set_hidden(h))
             }
-            Request::Layout(_) | Request::Settings => {
-                (Reply::Now(Err("not supported yet (settings and layouts arrive in plan 5)".into())), Task::none())
-            }
+            Request::Layout(name) => match self.apply_layout(name) {
+                Ok(task) => (Reply::Now(Ok(None)), task),
+                Err(msg) => (Reply::Now(Err(msg)), Task::none()),
+            },
+            Request::Layouts => match serde_json::to_string(&layout::list_names()) {
+                Ok(json) => (Reply::Now(Ok(Some(json))), Task::none()),
+                Err(e) => (Reply::Now(Err(format!("layouts: {e}"))), Task::none()),
+            },
+            // Task 4 replaces this arm with the settings window.
+            Request::Settings => (
+                Reply::Now(Err("not supported yet (the settings window lands in the next commit)".into())),
+                Task::none(),
+            ),
             Request::Quit => {
                 ipc::remove_socket();
                 (Reply::Now(Ok(None)), cosmic::iced::exit())
@@ -492,6 +507,8 @@ impl App {
             tracing::debug!("no outputs yet; deferring surface");
             return Task::none();
         };
+        let output_name =
+            self.outputs.iter().find(|o| o.handle == output).map(|o| o.name.clone()).unwrap_or_default();
         let (width, height) = self.surface_size(client);
         let id = SurfaceId::unique();
         let position = match self.config.mode {
@@ -515,6 +532,7 @@ impl App {
         client.surface = Some(id);
         client.position = position;
         client.last_size = Some((width, height));
+        client.output = output_name;
         tracing::info!(?id, x = position.0, y = position.1, width, height, "create_surface");
         self.send_thumb_size(handle, (width, height));
         let create = get_layer_surface(SctkLayerSurfaceSettings {
@@ -557,6 +575,7 @@ impl App {
         if let Some(c) = self.clients.get_mut(handle) {
             c.hovered = false;
             c.last_cursor = Point::ORIGIN;
+            c.output.clear();
         }
         Some(id)
     }
@@ -638,6 +657,65 @@ impl App {
             Some(id) if !self.in_canvas(id) => set_margin(id, saved.y, 0, 0, saved.x),
             _ => Task::none(),
         }
+    }
+
+    /// Apply a named layout (spec §9): copy it to `current.ron` and move
+    /// every live thumbnail to the spot it names. `Err` is the text the IPC
+    /// reply sends after `err `.
+    fn apply_layout(&mut self, name: &str) -> Result<Task<cosmic::Action<Msg>>, String> {
+        let loaded = Layout::load_named(name)?;
+        tracing::info!(name, thumbs = loaded.thumbs.len(), "applying layout");
+        self.layout = loaded;
+        match self.layout.save() {
+            // Applying a layout deliberately replaces `current.ron`, so a
+            // file that failed to parse at startup is gone now: un-poison,
+            // and re-arm the one-time warning for a future poisoning.
+            Ok(()) => {
+                self.layout_poisoned = false;
+                self.layout_poison_warned = false;
+            }
+            // The write failed, so whatever was on disk is still there —
+            // stay poisoned if we were.
+            Err(e) => tracing::warn!("cannot copy the layout to current.ron: {e:#}"),
+        }
+        Ok(self.reposition_to_layout())
+    }
+
+    /// Move every live thumbnail to where `self.layout` puts it. A
+    /// thumbnail whose output changed is destroyed and left to
+    /// `reconcile_surfaces`, which recreates it — `output_for_thumb` now
+    /// resolves to the layout's output. In dock mode positions are a
+    /// policy, so only the arrangement (the recorded `order`) changes.
+    fn reposition_to_layout(&mut self) -> Task<cosmic::Action<Msg>> {
+        if self.config.mode == Mode::Dock {
+            return self.relayout_dock();
+        }
+        let connected: Vec<String> = self.outputs.iter().map(|o| o.name.clone()).collect();
+        let handles: Vec<Handle> = self.clients.keys().cloned().collect();
+        let mut tasks = Vec::new();
+        for h in handles {
+            let Some(client) = self.clients.get(&h) else { continue };
+            let Login::LoggedIn(name) = client.info.login.clone() else { continue };
+            let current = client.output.clone();
+            let Some(saved) = self.layout.thumbs.get(&name).cloned() else { continue };
+            let Some(p) = layout::placement(&saved, &connected, &current) else { continue };
+            let surface = {
+                let c = self.clients.get_mut(&h).unwrap();
+                c.position = (p.x, p.y);
+                c.pinned = p.pinned;
+                c.placed = true;
+                c.surface
+            };
+            match surface {
+                Some(_) if p.recreate => tasks.push(self.destroy_surface(&h)),
+                // A drag canvas keeps its margin; `leave_canvas` applies the
+                // new position at drag end.
+                Some(id) if !self.in_canvas(id) => tasks.push(set_margin(id, p.y, 0, 0, p.x)),
+                _ => {}
+            }
+        }
+        tasks.push(self.reconcile_surfaces());
+        Task::batch(tasks)
     }
 
     /// Leaving dock mode: every surface goes back to a floating spot — the
@@ -862,6 +940,7 @@ impl App {
                     placed: false,
                     last_size: None,
                     paused: false,
+                    output: String::new(),
                 });
                 let was_named = matches!(entry.info.login, Login::LoggedIn(_));
                 entry.info = info;
