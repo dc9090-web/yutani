@@ -63,7 +63,7 @@ impl Default for Config {
         Self {
             app_ids: vec!["exefile.exe".to_string(), "steam_app_8500".to_string()],
             thumb_width: 480,
-            opacity: 0.9,
+            opacity: 1.0,
             fps: 30,
             active_border: "#ff8800".to_string(),
             inactive_border: "#404040".to_string(),
@@ -179,7 +179,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.app_ids, vec!["exefile.exe".to_string(), "steam_app_8500".to_string()]);
         assert_eq!(c.thumb_width, 480);
-        assert_eq!(c.opacity, 0.9);
+        assert_eq!(c.opacity, 1.0);
         assert_eq!(c.fps, 30);
         assert_eq!(c.active_border, "#ff8800");
         assert_eq!(c.inactive_border, "#404040");

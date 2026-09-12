@@ -356,7 +356,7 @@ if the socket is absent it prints "yutani is not running" and exits 1.
   mode: Dock,                // Floating | Dock
   dock_edge: Top,            // Top | Bottom | Left | Right
   thumb_width: 480,
-  opacity: 0.9,
+  opacity: 1.0,
   fps: 30,                   // 10 | 15 | 30 | 60
   active_border: "#ff8800",
   inactive_border: "#404040",
