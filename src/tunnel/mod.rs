@@ -65,18 +65,33 @@ fn write_with_mode(path: &str, text: &str, mode: u32) -> anyhow::Result<()> {
     result
 }
 
+/// Test-only helpers shared by this module's children.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::sync::{Mutex, MutexGuard};
+
+    // POSIX `mode_t umask(mode_t)`: tests that must prove a mode survives a
+    // restrictive umask set it themselves.
+    unsafe extern "C" {
+        #[link_name = "umask"]
+        pub(crate) fn libc_umask(mask: u32) -> u32;
+    }
+
+    static MODE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The umask is process-wide, so tests that change it must not run
+    /// concurrently with each other (or with any test that checks a mode).
+    pub(crate) fn mode_lock() -> MutexGuard<'static, ()> {
+        MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
 
-    // POSIX `mode_t umask(mode_t)`: the test must prove the modes we ask for
-    // survive a restrictive umask.
-    unsafe extern "C" {
-        #[link_name = "umask"]
-        fn libc_umask(mask: u32) -> u32;
-    }
+    use super::testing::{libc_umask, mode_lock};
 
     fn mode_of(path: &str) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
@@ -94,6 +109,9 @@ mod tests {
         let dir = temp_dir("mode");
         let unit = dir.join("unit").to_string_lossy().into_owned();
         let key = dir.join("key").to_string_lossy().into_owned();
+        // The umask is process-wide: hold the lock so a concurrent test
+        // cannot observe (or set) a different one.
+        let _lock = mode_lock();
         // SAFETY: umask has no preconditions and cannot fail; restored below.
         let old = unsafe { libc_umask(0o077) };
         let got = std::panic::catch_unwind(|| {

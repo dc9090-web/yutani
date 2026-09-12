@@ -1,7 +1,8 @@
 //! `yutani tunnel install|uninstall`: one-time privileged setup through
 //! `pkexec`, and the root-side `install-root|uninstall-root` it invokes.
 
-use anyhow::{Context as _, anyhow, ensure};
+use anyhow::{Context as _, anyhow, bail, ensure};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
 use std::process::Command;
 
@@ -43,7 +44,65 @@ pub fn current_exe() -> anyhow::Result<String> {
     Ok(std::env::current_exe()?.canonicalize()?.to_string_lossy().into_owned())
 }
 
-fn whoami() -> anyhow::Result<(u32, String)> {
+/// Invariant behind every check in this file: **nothing the user can write is
+/// executed or read by root.** A path satisfies it when it is owned by root
+/// and neither group- nor world-writable; the sticky bit (`/tmp`) does not
+/// count, since anyone can still create entries there.
+pub fn is_trusted(uid: u32, mode: u32) -> bool {
+    uid == 0 && mode & 0o022 == 0
+}
+
+/// `Ok` when `p` and every one of its ancestors satisfies [`is_trusted`].
+/// The path is canonicalised first, so a symlink cannot hide an untrusted
+/// component, and a path that does not exist is refused outright.
+pub fn trusted_path(p: &Path) -> Result<(), String> {
+    let real = p.canonicalize().map_err(|e| format!("{}: {e}", p.display()))?;
+    for ancestor in real.ancestors() {
+        let md = std::fs::symlink_metadata(ancestor).map_err(|e| format!("{}: {e}", ancestor.display()))?;
+        if !is_trusted(md.uid(), md.mode()) {
+            return Err(format!(
+                "{} is owned by uid {} with mode {:04o}",
+                ancestor.display(),
+                md.uid(),
+                md.mode() & 0o7777
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What to tell the user when the binary they ran cannot be the unit's
+/// `ExecStart`. Says exactly what to type, because the fix is not obvious.
+fn untrusted_exe_message(exe: &str, conf: &Path, why: &str) -> String {
+    format!(
+        "refusing {exe}: the tunnel unit runs it as root, so it must be root-owned and not writable by others ({why}). Install it first:\n  sudo install -o root -g root -m 0755 {exe} /usr/local/bin/yutani\nthen re-run: /usr/local/bin/yutani tunnel install {}",
+        conf.display()
+    )
+}
+
+/// The name the system has for `uid` (root side; `id -un` avoids linking
+/// `getpwuid`). `None` when the uid has no passwd entry.
+fn username_for_uid(uid: u32) -> Option<String> {
+    let out = Command::new("id").args(["-un", &uid.to_string()]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// The polkit rule is written for `claimed`, but the cgroup rules key on
+/// `uid`: if those are different people the tunnel would be controllable by
+/// one user and routed for another. `resolved` is what the system says.
+fn check_username(uid: u32, claimed: &str, resolved: Option<&str>) -> anyhow::Result<()> {
+    match resolved {
+        Some(name) if name == claimed => Ok(()),
+        Some(name) => bail!("--user is {claimed:?} but uid {uid} is {name:?}: refusing to install for another user"),
+        None => bail!("uid {uid} has no user name on this system; refusing to install"),
+    }
+}
+
+pub fn whoami() -> anyhow::Result<(u32, String)> {
     let uid = crate::ipc::uid();
     let name = std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).context("USER not set")?;
     Ok((uid, name))
@@ -53,6 +112,11 @@ fn whoami() -> anyhow::Result<(u32, String)> {
 pub fn install(conf: &Path) -> anyhow::Result<()> {
     let conf = conf.canonicalize().with_context(|| format!("{}", conf.display()))?;
     let exe = current_exe()?;
+    // Check before the prompt, not after: the root side refuses this anyway,
+    // and there is no point spending the user's password on it.
+    if let Err(why) = trusted_path(Path::new(&exe)) {
+        bail!("{}", untrusted_exe_message(&exe, &conf, &why));
+    }
     let (uid, user) = whoami()?;
     let status = Command::new("pkexec")
         .args([&exe, "tunnel", "install-root", "--conf"])
@@ -85,9 +149,28 @@ pub fn uninstall() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write(path: &str, text: &str, mode: u32) -> anyhow::Result<()> {
+/// `create_dir_all` applies the caller's umask, and `pkexec` does not reset
+/// it — so the mode is set explicitly afterwards rather than hoped for.
+fn create_dir_with_mode(dir: &Path, mode: u32) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("chmod {mode:o} {}", dir.display()))
+}
+
+/// The directory root will read these files from must itself be untouchable
+/// by the user (see [`is_trusted`]): an existing one is verified, a missing
+/// one is created with `mode`.
+fn ensure_dir(dir: &Path, mode: u32) -> anyhow::Result<()> {
+    if dir.exists() {
+        trusted_path(dir).map_err(|why| anyhow!("refusing to use {}: {why}", dir.display()))?;
+        return Ok(());
+    }
+    create_dir_with_mode(dir, mode)
+}
+
+fn write(path: &str, text: &str, mode: u32, dir_mode: u32) -> anyhow::Result<()> {
     if let Some(dir) = Path::new(path).parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        ensure_dir(dir, dir_mode)?;
     }
     write_with_mode(path, text, mode)
 }
@@ -140,14 +223,33 @@ pub fn install_root(conf: &Path, uid: u32, username: &str, exe: &str, dry_run: b
     let stored = format!("# yutani: label = {}\n# yutani: uid = {uid}\n{text}", parsed.label);
     let unit = unit_text(exe);
     let rule = polkit_text(username);
+    // Both checks are hard errors for a real install and *reported* by a dry
+    // run, which is unprivileged and exists to tell the user what is wrong.
+    let mut checks = String::new();
+    let refuse = |msg: String, checks: &mut String| -> anyhow::Result<()> {
+        if !dry_run {
+            bail!("{msg}");
+        }
+        checks.push_str(&format!("# check FAILED — the real install would stop here:\n{msg}\n\n"));
+        Ok(())
+    };
+    match trusted_path(Path::new(exe)) {
+        Ok(()) => checks.push_str(&format!("# {exe} is root-owned and not writable by others: OK\n\n")),
+        Err(why) => refuse(untrusted_exe_message(exe, conf, &why), &mut checks)?,
+    }
+    match check_username(uid, username, username_for_uid(uid).as_deref()) {
+        Ok(()) => checks.push_str(&format!("# uid {uid} is {username:?}: OK\n\n")),
+        Err(e) => refuse(format!("{e:#}"), &mut checks)?,
+    }
     let report =
-        format!("{CONF_PATH} (0600):\n{}\n{UNIT_PATH}:\n{unit}\n{POLKIT_PATH}:\n{rule}", redact_lines(&stored));
+        format!("{checks}{CONF_PATH} (0600):\n{}\n{UNIT_PATH}:\n{unit}\n{POLKIT_PATH}:\n{rule}", redact_lines(&stored));
     if dry_run {
         return Ok(report);
     }
-    write(CONF_PATH, &stored, 0o600)?;
-    write(UNIT_PATH, &unit, 0o644)?;
-    write(POLKIT_PATH, &rule, 0o644)?;
+    // 0700: only root ever reads the conf, and it holds the private key.
+    write(CONF_PATH, &stored, 0o600, 0o700)?;
+    write(UNIT_PATH, &unit, 0o644, 0o755)?;
+    write(POLKIT_PATH, &rule, 0o644, 0o755)?;
     let st = Command::new("systemctl").arg("daemon-reload").status().context("systemctl daemon-reload")?;
     ensure!(st.success(), "systemctl daemon-reload failed");
     if parsed.dns.is_none() {
@@ -196,6 +298,15 @@ pub fn uninstall_root(dry_run: bool) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GOOD_CONF: &str = "[Interface]\nPrivateKey = U0VDUkVU\nAddress = 10.2.0.2/32\nDNS = 10.2.0.1\n[Peer]\n# UK#455\nPublicKey = p=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n";
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("yutani-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
 
     #[test]
     fn unit_text_runs_the_given_binary_as_the_worker() {
@@ -321,5 +432,108 @@ mod tests {
     fn uninstall_root_dry_run_names_every_path_it_would_remove() {
         let r = uninstall_root(true).unwrap();
         assert!(r.contains(UNIT_NAME) && r.contains(CONF_PATH) && r.contains(UNIT_PATH) && r.contains(POLKIT_PATH));
+    }
+
+    #[test]
+    fn only_root_owned_paths_that_others_cannot_write_are_trusted() {
+        assert!(is_trusted(0, 0o755), "root-owned, nobody else writes: trusted");
+        assert!(is_trusted(0, 0o700));
+        assert!(!is_trusted(1000, 0o755), "a user-owned path is never trusted");
+        assert!(!is_trusted(0, 0o775), "group-writable is not trusted");
+        assert!(!is_trusted(0, 0o757), "world-writable is not trusted");
+        assert!(!is_trusted(0, 0o1777), "the sticky bit does not make /tmp trusted");
+    }
+
+    #[test]
+    fn a_path_the_test_user_owns_is_refused() {
+        // There is no way to create a root-owned path from the test suite, so
+        // this pins the rejection side: anything under a user-owned directory
+        // must be refused, naming the offending component.
+        let dir = temp_dir("trust");
+        let exe = dir.join("yutani");
+        std::fs::write(&exe, "#!/bin/true\n").unwrap();
+        let why = trusted_path(&exe).unwrap_err();
+        assert!(why.contains("yutani") || why.contains(&dir.display().to_string()), "got {why}");
+        assert!(trusted_path(&dir).is_err());
+        assert!(trusted_path(Path::new("/nonexistent-yutani-path")).is_err(), "a missing path is not trusted");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_refusal_says_exactly_how_to_install_the_binary_as_root() {
+        let m = untrusted_exe_message("/home/d/y/target/debug/yutani", Path::new("/home/d/EVE.conf"), "owned by uid 1000");
+        assert!(m.contains("refusing /home/d/y/target/debug/yutani"));
+        assert!(m.contains("must be root-owned and not writable by others"));
+        assert!(m.contains("sudo install -o root -g root -m 0755 /home/d/y/target/debug/yutani /usr/local/bin/yutani"));
+        assert!(m.contains("/usr/local/bin/yutani tunnel install /home/d/EVE.conf"));
+    }
+
+    #[test]
+    fn a_real_install_refuses_an_exe_the_user_can_rewrite() {
+        // The unit's ExecStart runs this as root and the polkit rule lets the
+        // user start it without a password, so a user-writable binary would be
+        // passwordless root.
+        let dir = temp_dir("trust-install");
+        let conf = dir.join("EVE.conf");
+        std::fs::write(&conf, GOOD_CONF).unwrap();
+        let exe = dir.join("yutani");
+        std::fs::write(&exe, "#!/bin/true\n").unwrap();
+        let e = install_root(&conf, 1000, "daniel", exe.to_str().unwrap(), false).unwrap_err().to_string();
+        assert!(e.contains("refusing"), "got {e}");
+        assert!(e.contains("sudo install -o root -g root -m 0755"), "got {e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_dry_run_reports_the_trust_check_and_still_prints_the_rest() {
+        let dir = temp_dir("trust-dry");
+        let conf = dir.join("EVE.conf");
+        std::fs::write(&conf, GOOD_CONF).unwrap();
+        let exe = dir.join("yutani");
+        std::fs::write(&exe, "#!/bin/true\n").unwrap();
+        let r = install_root(&conf, 1000, "daniel", exe.to_str().unwrap(), true).unwrap();
+        assert!(r.contains("refusing"), "the dry run must report the refusal: {r}");
+        assert!(r.contains("sudo install -o root -g root -m 0755"));
+        assert!(r.contains("ExecStart="), "the dry run must still print the rest: {r}");
+        assert!(r.contains(POLKIT_PATH));
+        assert!(!r.contains("U0VDUkVU"), "the key must never be printed");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_root_side_refuses_a_user_name_that_is_not_the_uids_own() {
+        assert!(check_username(1000, "daniel", Some("daniel")).is_ok());
+        let e = check_username(1000, "root", Some("daniel")).unwrap_err().to_string();
+        assert!(e.contains("uid 1000"), "got {e}");
+        assert!(e.contains("daniel") && e.contains("root"), "got {e}");
+        let e = check_username(4242, "daniel", None).unwrap_err().to_string();
+        assert!(e.contains("4242"), "got {e}");
+    }
+
+    #[test]
+    fn a_directory_that_is_not_root_owned_is_refused_rather_than_used() {
+        let dir = temp_dir("etc-yutani");
+        let e = ensure_dir(&dir, 0o700).unwrap_err().to_string();
+        assert!(e.contains("refusing"), "got {e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_freshly_created_dir_gets_its_mode_whatever_the_umask() {
+        let base = temp_dir("etc-mode");
+        // The parent is user-owned, so only the create path can be exercised
+        // here: make the new directory a child that does not exist yet and
+        // check the mode it is created with, not the trust check.
+        let dir = base.join("yutani");
+        let _lock = crate::tunnel::testing::mode_lock();
+        // SAFETY: umask has no preconditions and cannot fail; restored below.
+        let old = unsafe { crate::tunnel::testing::libc_umask(0o077) };
+        let created = create_dir_with_mode(&dir, 0o755);
+        // SAFETY: as above.
+        unsafe { crate::tunnel::testing::libc_umask(old) };
+        created.unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777, 0o755);
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

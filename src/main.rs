@@ -142,18 +142,20 @@ fn main() -> ExitCode {
         }),
         Some(Command::Tunnel { action }) => match action {
             TunnelAction::Install { conf, dry_run: true } => {
-                let (uid, user) = (ipc::uid(), std::env::var("USER").unwrap_or_default());
-                // The same canonical path the real install passes to `install-root`.
-                let exe = tunnel::install::current_exe().unwrap_or_default();
-                tunnel::install::install_root(&conf.canonicalize().unwrap_or(conf.clone()), uid, &user, &exe, true)
-                    .and_then(|report| {
-                        print!("{report}");
-                        tunnel::worker::dry_run(&conf, uid)
-                    })
-                    .map(|plan| {
-                        print!("\n{plan}");
-                        ExitCode::SUCCESS
-                    })
+                // The same uid/name pair and canonical exe path the real
+                // install passes to `install-root`.
+                tunnel::install::whoami().and_then(|(uid, user)| {
+                    let exe = tunnel::install::current_exe().unwrap_or_default();
+                    tunnel::install::install_root(&conf.canonicalize().unwrap_or(conf.clone()), uid, &user, &exe, true)
+                        .and_then(|report| {
+                            print!("{report}");
+                            tunnel::worker::dry_run(&conf, uid)
+                        })
+                        .map(|plan| {
+                            print!("\n{plan}");
+                            ExitCode::SUCCESS
+                        })
+                })
             }
             TunnelAction::Install { conf, dry_run: false } => tunnel::install::install(&conf).map(|()| ExitCode::SUCCESS),
             TunnelAction::Uninstall => tunnel::install::uninstall().map(|()| ExitCode::SUCCESS),
