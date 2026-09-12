@@ -26,6 +26,7 @@ use crate::model::layout::{self, Layout, Rect, ThumbPos};
 
 pub mod config_watch;
 pub mod dock;
+pub mod ipc;
 pub mod pointer;
 pub mod rules;
 pub mod thumbnail;
@@ -93,8 +94,8 @@ pub struct App {
     pub outputs: Vec<Output>,
     pub layout: Layout,
     pub drag: Option<pointer::DragState>,
-    /// Tray-toggled visibility: when true, no thumbnail is shown regardless
-    /// of `Visibility`/`hide_active`. Set by the tray icon (Task 3).
+    /// Tray/IPC-toggled visibility: when true, no thumbnail is shown
+    /// regardless of `Visibility`/`hide_active`. Only `set_hidden` writes it.
     pub hidden: bool,
 }
 
@@ -105,6 +106,7 @@ pub enum Msg {
     Pointer(SurfaceId, mouse::Event),
     ConfigChanged(Config),
     Tray(tray::TrayEvent),
+    Ipc(ipc::IpcEvent),
 }
 
 impl App {
@@ -227,6 +229,78 @@ impl App {
         }
         tasks.push(self.relayout_dock());
         Task::batch(tasks)
+    }
+
+    /// Layout order of every known client (spec §7).
+    fn focus_order(&self) -> Vec<Handle> {
+        let items = self
+            .clients
+            .iter()
+            .map(|(h, c)| rules::FocusItem {
+                handle: h.clone(),
+                label: c.info.login.label().to_string(),
+                output: self
+                    .output_for(&c.info)
+                    .and_then(|o| self.outputs.iter().find(|k| k.handle == o).map(|k| k.name.clone()))
+                    .unwrap_or_default(),
+                position: c.position,
+            })
+            .collect();
+        rules::focus_order(self.config.mode, items)
+    }
+
+    fn active_client(&self) -> Option<Handle> {
+        self.clients.iter().find(|(_, c)| c.info.activated).map(|(h, _)| h.clone())
+    }
+
+    /// Execute one IPC request. `Err` is the text sent back after `err `.
+    fn handle_request(&mut self, request: &crate::ipc::Request) -> (Result<(), String>, Task<cosmic::Action<Msg>>) {
+        use crate::ipc::Request;
+        match request {
+            Request::Focus(n) => {
+                let order = self.focus_order();
+                match order.get(n - 1) {
+                    Some(h) => {
+                        self.send(Cmd::Activate(h.clone()));
+                        (Ok(()), Task::none())
+                    }
+                    None => (Err(format!("no client {n} ({} known)", order.len())), Task::none()),
+                }
+            }
+            Request::Next | Request::Prev => {
+                let order = self.focus_order();
+                let active = self.active_client();
+                match rules::step(&order, active.as_ref(), matches!(request, Request::Next)) {
+                    Some(h) => {
+                        self.send(Cmd::Activate(h));
+                        (Ok(()), Task::none())
+                    }
+                    None => (Err("no clients".into()), Task::none()),
+                }
+            }
+            Request::Show => (Ok(()), self.set_hidden(false)),
+            Request::Hide => (Ok(()), self.set_hidden(true)),
+            Request::Toggle => {
+                let h = !self.hidden;
+                (Ok(()), self.set_hidden(h))
+            }
+            Request::Layout(_) | Request::Settings => {
+                (Err("not supported yet (settings and layouts arrive in plan 5)".into()), Task::none())
+            }
+            Request::Quit => {
+                ipc::remove_socket();
+                (Ok(()), cosmic::iced::exit())
+            }
+        }
+    }
+
+    /// The one place `hidden` changes (tray and IPC both come through here).
+    fn set_hidden(&mut self, hidden: bool) -> Task<cosmic::Action<Msg>> {
+        if self.hidden == hidden {
+            return Task::none();
+        }
+        self.hidden = hidden;
+        self.reconcile_surfaces()
     }
 
     /// Output to show a client on: the one it is on, else the first known.
@@ -789,18 +863,22 @@ impl Application for App {
             Msg::Pointer(id, event) => self.on_pointer(id, event),
             Msg::ConfigChanged(config) => self.apply_config(config),
             Msg::Tray(tray::TrayEvent::ToggleVisibility) => {
-                self.hidden = !self.hidden;
-                self.reconcile_surfaces()
+                let h = !self.hidden;
+                self.set_hidden(h)
             }
-            Msg::Tray(tray::TrayEvent::SetHidden(h)) => {
-                if self.hidden != h {
-                    self.hidden = h;
-                    self.reconcile_surfaces()
-                } else {
-                    Task::none()
-                }
+            Msg::Tray(tray::TrayEvent::SetHidden(h)) => self.set_hidden(h),
+            Msg::Tray(tray::TrayEvent::Quit) => {
+                ipc::remove_socket();
+                cosmic::iced::exit()
             }
-            Msg::Tray(tray::TrayEvent::Quit) => cosmic::iced::exit(),
+            Msg::Ipc(ev) => {
+                let (result, task) = self.handle_request(&ev.request);
+                ev.reply.respond(match result {
+                    Ok(()) => crate::ipc::Response::Ok,
+                    Err(m) => crate::ipc::Response::Err(m),
+                });
+                task
+            }
         }
     }
 
@@ -818,6 +896,7 @@ impl Application for App {
             events,
             config_watch::subscription().map(Msg::ConfigChanged),
             tray::subscription().map(Msg::Tray),
+            ipc::subscription().map(Msg::Ipc),
         ];
         if let Some(conn) = self.conn.clone() {
             subs.push(

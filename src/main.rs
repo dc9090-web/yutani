@@ -63,11 +63,12 @@ fn main() -> ExitCode {
                 Ok(ExitCode::from(1))
             } else {
                 let config = model::config::Config::load();
-                let outcome = ui::run(config).map(|()| ExitCode::SUCCESS).map_err(anyhow::Error::from);
-                // Belt and braces: the app removes the socket on `quit`, but a
-                // panic or SIGTERM path may not get there.
-                let _ = std::fs::remove_file(ipc::socket_path());
-                outcome
+                // The IPC server owns the socket file: it is removed on
+                // `quit`, and a stale one (crash/SIGTERM) is replaced at bind.
+                // Do not remove it here: if this process lost libcosmic's
+                // single-instance race, `ui::run` returns Ok at once and the
+                // socket belongs to the winning instance.
+                ui::run(config).map(|()| ExitCode::SUCCESS).map_err(anyhow::Error::from)
             }
         }
     };
