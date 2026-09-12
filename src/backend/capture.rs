@@ -285,11 +285,14 @@ impl ScreencopyHandler for AppData {
         };
         // What the next submit must wait for: the buffer the compositor is
         // now holding — the GL target if we rendered, else the raw front.
-        let previous_release = if was_processed {
+        // A processed frame also takes any pending raw release: the raw
+        // buffer shipped last time (before the pass kicked in) is the one
+        // the next capture writes into, so it must be released first.
+        let (previous_release, stale_raw_release) = if was_processed {
             let pool = state.thumb.as_mut().unwrap();
-            pool.release.replace(release)
+            (pool.release.replace(release), state.release.take())
         } else {
-            state.release.replace(release)
+            (state.release.replace(release), None)
         };
         let last_submit = state.last_submit;
         let session_id = state.session.clone();
@@ -304,6 +307,9 @@ impl ScreencopyHandler for AppData {
         let fps = self.fps.clone();
         self.thread_pool.spawn_ok(async move {
             if let Some(release) = previous_release {
+                release.await;
+            }
+            if let Some(release) = stale_raw_release {
                 release.await;
             }
             let wait = frame_interval(&fps).saturating_sub(last_submit.elapsed());
