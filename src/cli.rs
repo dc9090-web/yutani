@@ -44,6 +44,10 @@ pub fn send(request: &Request) -> ExitCode {
     }
     match Response::parse(&line) {
         Response::Ok => ExitCode::SUCCESS,
+        Response::OkData(data) => {
+            println!("{data}");
+            ExitCode::SUCCESS
+        }
         Response::Err(msg) => {
             eprintln!("yutani: {msg}");
             ExitCode::from(1)

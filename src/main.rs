@@ -38,6 +38,8 @@ enum Command {
     Toggle,
     /// Ask the running instance to exit
     Quit,
+    /// Print the daemon's status (clients, visibility, tunnel) as JSON
+    Status,
     /// Install or remove the COSMIC keyboard shortcuts (Ctrl+Alt+1..9, Right, Left by default)
     Shortcuts {
         #[command(subcommand)]
@@ -114,6 +116,7 @@ fn main() -> ExitCode {
         Some(Command::Hide) => Ok(cli::send(&ipc::Request::Hide)),
         Some(Command::Toggle) => Ok(cli::send(&ipc::Request::Toggle)),
         Some(Command::Quit) => Ok(cli::send(&ipc::Request::Quit)),
+        Some(Command::Status) => Ok(cli::send(&ipc::Request::Status)),
         Some(Command::Shortcuts { action: ShortcutsAction::Install }) => {
             let config = model::config::Config::load();
             shortcuts::install(&config.shortcuts).map(|(installed, wanted)| {

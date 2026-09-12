@@ -254,7 +254,7 @@ impl App {
     }
 
     /// Execute one IPC request. `Err` is the text sent back after `err `.
-    fn handle_request(&mut self, request: &crate::ipc::Request) -> (Result<(), String>, Task<cosmic::Action<Msg>>) {
+    fn handle_request(&mut self, request: &crate::ipc::Request) -> (Result<Option<String>, String>, Task<cosmic::Action<Msg>>) {
         use crate::ipc::Request;
         match request {
             Request::Focus(n) => {
@@ -262,7 +262,7 @@ impl App {
                 match n.checked_sub(1).and_then(|i| order.get(i)) {
                     Some(h) => {
                         self.send(Cmd::Activate(h.clone()));
-                        (Ok(()), Task::none())
+                        (Ok(None), Task::none())
                     }
                     None => (Err(format!("no client {n} ({} known)", order.len())), Task::none()),
                 }
@@ -273,24 +273,43 @@ impl App {
                 match rules::step(&order, active.as_ref(), matches!(request, Request::Next)) {
                     Some(h) => {
                         self.send(Cmd::Activate(h));
-                        (Ok(()), Task::none())
+                        (Ok(None), Task::none())
                     }
                     None => (Err("no clients".into()), Task::none()),
                 }
             }
-            Request::Show => (Ok(()), self.set_hidden(false)),
-            Request::Hide => (Ok(()), self.set_hidden(true)),
+            Request::Show => (Ok(None), self.set_hidden(false)),
+            Request::Hide => (Ok(None), self.set_hidden(true)),
             Request::Toggle => {
                 let h = !self.hidden;
-                (Ok(()), self.set_hidden(h))
+                (Ok(None), self.set_hidden(h))
             }
             Request::Layout(_) | Request::Settings => {
                 (Err("not supported yet (settings and layouts arrive in plan 5)".into()), Task::none())
             }
             Request::Quit => {
                 ipc::remove_socket();
-                (Ok(()), cosmic::iced::exit())
+                (Ok(None), cosmic::iced::exit())
             }
+            Request::Status => {
+                let order = self.focus_order();
+                let clients = order
+                    .iter()
+                    .filter_map(|h| self.clients.get(h))
+                    .map(|c| crate::tunnel::status::ClientStatus { name: c.info.login.label().to_string(), active: c.info.activated })
+                    .collect();
+                let status = crate::tunnel::status::Status {
+                    clients,
+                    hidden: self.hidden,
+                    tunnel: crate::tunnel::control::current_tunnel_status(&self.config.tunnel.location),
+                };
+                match serde_json::to_string(&status) {
+                    Ok(json) => (Ok(Some(json)), Task::none()),
+                    Err(e) => (Err(format!("status: {e}")), Task::none()),
+                }
+            }
+            Request::TunnelConnect => (crate::tunnel::control::connect().map(|()| None).map_err(|e| format!("{e:#}")), Task::none()),
+            Request::TunnelDisconnect => (crate::tunnel::control::disconnect().map(|()| None).map_err(|e| format!("{e:#}")), Task::none()),
         }
     }
 
@@ -874,7 +893,8 @@ impl Application for App {
             Msg::Ipc(ev) => {
                 let (result, task) = self.handle_request(&ev.request);
                 ev.reply.respond(match result {
-                    Ok(()) => crate::ipc::Response::Ok,
+                    Ok(None) => crate::ipc::Response::Ok,
+                    Ok(Some(data)) => crate::ipc::Response::OkData(data),
                     Err(m) => crate::ipc::Response::Err(m),
                 });
                 task

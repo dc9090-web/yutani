@@ -36,6 +36,9 @@ pub enum Request {
     Layout(String),
     Settings,
     Quit,
+    Status,
+    TunnelConnect,
+    TunnelDisconnect,
 }
 
 impl Request {
@@ -61,8 +64,12 @@ impl Request {
             ("layout", None) => Err("layout needs a name".into()),
             ("settings", None) => Ok(Request::Settings),
             ("quit", None) => Ok(Request::Quit),
+            ("status", None) => Ok(Request::Status),
+            ("tunnel", Some("connect")) => Ok(Request::TunnelConnect),
+            ("tunnel", Some("disconnect")) => Ok(Request::TunnelDisconnect),
+            ("tunnel", _) => Err("tunnel needs connect or disconnect".into()),
             ("", _) => Err("empty request".into()),
-            (cmd, Some(_)) if matches!(cmd, "next" | "prev" | "show" | "hide" | "toggle" | "settings" | "quit") => {
+            (cmd, Some(_)) if matches!(cmd, "next" | "prev" | "show" | "hide" | "toggle" | "settings" | "quit" | "status") => {
                 Err(format!("{cmd} takes no argument"))
             }
             (cmd, _) => Err(format!("unknown command {cmd:?}")),
@@ -80,6 +87,9 @@ impl Request {
             Request::Layout(name) => format!("layout {name}\n"),
             Request::Settings => "settings\n".into(),
             Request::Quit => "quit\n".into(),
+            Request::Status => "status\n".into(),
+            Request::TunnelConnect => "tunnel connect\n".into(),
+            Request::TunnelDisconnect => "tunnel disconnect\n".into(),
         }
     }
 }
@@ -87,6 +97,7 @@ impl Request {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Response {
     Ok,
+    OkData(String),
     Err(String),
 }
 
@@ -96,13 +107,17 @@ impl Response {
         match line.strip_prefix("err") {
             Some(rest) if line == "err" || rest.starts_with(' ') => Response::Err(rest.trim_start().to_string()),
             _ if line == "ok" => Response::Ok,
-            _ => Response::Err(format!("malformed reply {line:?}")),
+            _ => match line.strip_prefix("ok ") {
+                Some(rest) => Response::OkData(rest.to_string()),
+                None => Response::Err(format!("malformed reply {line:?}")),
+            },
         }
     }
 
     pub fn to_line(&self) -> String {
         match self {
             Response::Ok => "ok\n".into(),
+            Response::OkData(data) => format!("ok {}\n", data.replace('\n', " ")),
             Response::Err(msg) => format!("err {}\n", msg.replace('\n', " ")),
         }
     }
@@ -123,6 +138,9 @@ mod tests {
         assert_eq!(Request::parse("layout pvp fleet"), Ok(Request::Layout("pvp fleet".into())));
         assert_eq!(Request::parse("settings"), Ok(Request::Settings));
         assert_eq!(Request::parse("quit"), Ok(Request::Quit));
+        assert_eq!(Request::parse("status"), Ok(Request::Status));
+        assert_eq!(Request::parse("tunnel connect"), Ok(Request::TunnelConnect));
+        assert_eq!(Request::parse("tunnel disconnect"), Ok(Request::TunnelDisconnect));
     }
 
     #[test]
@@ -134,6 +152,8 @@ mod tests {
         assert_eq!(Request::parse("next now").unwrap_err(), "next takes no argument");
         assert_eq!(Request::parse("dance").unwrap_err(), "unknown command \"dance\"");
         assert_eq!(Request::parse("").unwrap_err(), "empty request");
+        assert_eq!(Request::parse("tunnel").unwrap_err(), "tunnel needs connect or disconnect");
+        assert_eq!(Request::parse("tunnel up").unwrap_err(), "tunnel needs connect or disconnect");
     }
 
     #[test]
@@ -148,6 +168,9 @@ mod tests {
             Request::Layout("a b".into()),
             Request::Settings,
             Request::Quit,
+            Request::Status,
+            Request::TunnelConnect,
+            Request::TunnelDisconnect,
         ] {
             let line = r.to_line();
             assert!(line.ends_with('\n'));
@@ -163,6 +186,8 @@ mod tests {
         assert_eq!(Response::Err("a\nb".into()).to_line(), "err a b\n");
         assert!(matches!(Response::parse("banana"), Response::Err(m) if m.contains("malformed")));
         assert!(matches!(Response::parse("error x"), Response::Err(m) if m.contains("malformed")));
+        assert_eq!(Response::parse("ok {\"a\":1}\n"), Response::OkData("{\"a\":1}".into()));
+        assert_eq!(Response::OkData("x".into()).to_line(), "ok x\n");
     }
 
     #[test]
