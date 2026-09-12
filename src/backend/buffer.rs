@@ -21,6 +21,9 @@ pub struct Buffer {
     pub buffer: wl_buffer::WlBuffer,
     pub damage: Vec<Rect>,
     pub size: (u32, u32),
+    /// EGL import of `backing`, created on first use by the GL pass and
+    /// kept for the buffer's lifetime (imports are per buffer, not per frame).
+    pub source: Option<super::gl::SourceTexture>,
 }
 
 impl Drop for Buffer {
@@ -85,6 +88,7 @@ impl AppData {
             buffer,
             damage: full_damage((width, height)),
             size: (width, height),
+            source: None,
         }))
     }
 
@@ -102,6 +106,7 @@ impl AppData {
             buffer,
             damage: full_damage((width, height)),
             size: (width, height),
+            source: None,
         })
     }
 

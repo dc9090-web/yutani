@@ -32,6 +32,7 @@ use cosmic::iced::{
     futures::{FutureExt, SinkExt, channel::mpsc, executor::block_on},
 };
 use cosmic::cctk::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1;
+use anyhow::Context as _;
 use calloop_wayland_source::WaylandSource;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -40,6 +41,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::{hash::Hash, thread};
 
 use crate::model::client::{Login, classify};
+use buffer::Buffer;
 
 mod toplevels;
 mod buffer;
@@ -87,6 +89,11 @@ pub enum Cmd {
     SetFps(u32),
     PauseCapture(Handle),
     ResumeCapture(Handle),
+    /// Physical-pixel size of this client's thumbnail surface; the GL pass
+    /// renders into buffers of exactly this size.
+    SetThumbSize(Handle, (u32, u32)),
+    /// Corner mask radius in physical pixels (0 = square).
+    SetCornerRadius(u32),
 }
 
 /// iced subscription that owns the backend thread for the app's lifetime.
@@ -118,6 +125,18 @@ pub fn subscription(conn: Connection, app_ids: Vec<String>, fps: u32) -> iced::S
     iced::Subscription::run_with(Key { conn, app_ids, fps }, run)
 }
 
+/// The GL thumbnail pass is created lazily on the first dmabuf frame (it
+/// needs the compositor's main device) and disabled for good after
+/// repeated failures.
+pub enum GlState {
+    Untried,
+    Ready { gl: gl::Gl, consecutive_failures: u32 },
+    Disabled,
+}
+
+/// Consecutive per-frame GL failures before the pass is switched off.
+pub const GL_MAX_FAILURES: u32 = 3;
+
 pub struct AppData {
     pub qh: QueueHandle<Self>,
     pub registry_state: RegistryState,
@@ -135,6 +154,9 @@ pub struct AppData {
     pub app_ids: Vec<String>,
     pub fps: Arc<AtomicU32>,
     pub capabilities: HashSet<zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1>,
+    pub gl: GlState,
+    pub thumb_sizes: HashMap<Handle, (u32, u32)>,
+    pub corner_radius_px: u32,
 }
 
 impl AppData {
@@ -195,7 +217,104 @@ impl AppData {
             Cmd::ResumeCapture(handle) => {
                 self.set_paused(&handle, false, conn);
             }
+            Cmd::SetThumbSize(handle, size) => {
+                self.thumb_sizes.insert(handle, size);
+            }
+            Cmd::SetCornerRadius(px) => {
+                self.corner_radius_px = px;
+            }
         }
+    }
+
+    /// The GL pass, initialising it on first call. `false` when unavailable.
+    fn gl_init(&mut self) -> bool {
+        if !matches!(self.gl, GlState::Untried) {
+            return matches!(self.gl, GlState::Ready { .. });
+        }
+        let Some(dev) = self.dmabuf_feedback.as_ref().map(|f| f.main_device()) else { return false };
+        let gbm = match self.gbm_devices.gbm_device(dev) {
+            Ok(Some((_, gbm))) => gbm,
+            Ok(None) => {
+                tracing::warn!("no gbm device for the compositor's main device; thumbnails will have square corners");
+                self.gl = GlState::Disabled;
+                return false;
+            }
+            Err(err) => {
+                tracing::warn!("cannot open gbm device: {err}; thumbnails will have square corners");
+                self.gl = GlState::Disabled;
+                return false;
+            }
+        };
+        match gl::Gl::new(gbm) {
+            Ok(gl) => {
+                self.gl = GlState::Ready { gl, consecutive_failures: 0 };
+                true
+            }
+            Err(err) => {
+                tracing::warn!("GL thumbnail pass unavailable: {err:#}; thumbnails will have square corners");
+                self.gl = GlState::Disabled;
+                false
+            }
+        }
+    }
+
+    /// Record a per-frame GL failure; after `GL_MAX_FAILURES` in a row the
+    /// pass is disabled for the rest of the session.
+    fn gl_failed(&mut self, err: anyhow::Error) {
+        if let GlState::Ready { consecutive_failures, .. } = &mut self.gl {
+            *consecutive_failures += 1;
+            if *consecutive_failures >= GL_MAX_FAILURES {
+                tracing::warn!("GL thumbnail pass failed {GL_MAX_FAILURES} times ({err:#}); disabling, thumbnails will have square corners");
+                self.gl = GlState::Disabled;
+            } else {
+                tracing::debug!("GL thumbnail pass failed: {err:#}; raw frame this time");
+            }
+        }
+    }
+
+    /// Modifiers the compositor accepts for ABGR8888, from its feedback.
+    fn thumb_modifiers(&self) -> Vec<u64> {
+        let Some(fb) = self.dmabuf_feedback.as_ref() else { return Vec::new() };
+        let table: Vec<(u32, u64)> = fb.format_table().iter().map(|f| (f.format, f.modifier)).collect();
+        let tranches: Vec<&[u16]> = fb.tranches().iter().map(|t| t.formats.as_slice()).collect();
+        gl::modifiers_for(&table, &tranches, gl::ABGR8888)
+    }
+
+    /// Run the GL pass for `front` into `thumb` (allocating or re-allocating
+    /// the pool for `size`), returning the buffer to ship. `Err` means the
+    /// caller ships the raw frame.
+    fn gl_process(
+        &mut self,
+        front: &mut Buffer,
+        thumb: &mut Option<capture::ThumbPool>,
+        size: (u32, u32),
+        transform: wl_output::Transform,
+    ) -> anyhow::Result<Arc<cosmic::iced::platform_specific::shell::subsurface_widget::BufferSource>> {
+        if !self.gl_init() {
+            anyhow::bail!("GL pass unavailable");
+        }
+        let modifiers = self.thumb_modifiers();
+        let dev = self.dmabuf_feedback.as_ref().map(|f| f.main_device()).context("no dmabuf feedback")?;
+        let radius = self.corner_radius_px;
+        let AppData { gl, gbm_devices, .. } = self;
+        let GlState::Ready { gl, .. } = gl else { anyhow::bail!("GL pass unavailable") };
+        let (_, gbm) = gbm_devices.gbm_device(dev)?.context("gbm device vanished")?;
+
+        if thumb.as_ref().is_none_or(|t| t.size != size) {
+            *thumb = Some(capture::ThumbPool {
+                size,
+                targets: [gl.create_target(gbm, &modifiers, size)?, gl.create_target(gbm, &modifiers, size)?],
+                release: None,
+            });
+        }
+        let pool = thumb.as_mut().unwrap();
+        if front.source.is_none() {
+            front.source = Some(gl.import_source(&front.backing)?);
+        }
+        // Render into the back target, then make it the front.
+        gl.render(front.source.as_ref().unwrap(), &pool.targets[1], transform, radius)?;
+        pool.targets.rotate_left(1);
+        Ok(pool.targets[0].backing.clone())
     }
 }
 
@@ -255,6 +374,9 @@ fn start(conn: Connection, app_ids: Vec<String>, fps: u32) -> mpsc::Receiver<Eve
                     app_ids,
                     fps: Arc::new(AtomicU32::new(fps)),
                     capabilities: HashSet::new(),
+                    gl: GlState::Untried,
+                    thumb_sizes: HashMap::new(),
+                    corner_radius_px: 8,
                 };
 
                 let (cmd_sender, cmd_channel) = calloop::channel::channel();

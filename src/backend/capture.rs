@@ -11,7 +11,7 @@ use cosmic::cctk::{
     },
     wayland_client::{Connection, QueueHandle, WEnum},
 };
-use cosmic::iced::platform_specific::shell::subsurface_widget::{SubsurfaceBuffer, SubsurfaceBufferRelease};
+use cosmic::iced::platform_specific::shell::subsurface_widget::{BufferSource, SubsurfaceBuffer, SubsurfaceBufferRelease};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -20,6 +20,15 @@ use super::buffer::Buffer;
 use super::{AppData, CaptureImage, Event, Handle};
 
 const BUFFER_COUNT: usize = 2;
+
+/// Thumbnail-sized GL targets for one session: [front, back], rotated on
+/// every processed frame. `release` is the compositor's release of the
+/// front target (the next render into it must wait for that).
+pub struct ThumbPool {
+    pub size: (u32, u32),
+    pub targets: [super::gl::Target; BUFFER_COUNT],
+    pub release: Option<SubsurfaceBufferRelease>,
+}
 
 pub struct Capture {
     pub handle: Handle,
@@ -56,6 +65,8 @@ pub struct ScreencopySession {
     buffers: Option<[Buffer; BUFFER_COUNT]>,
     session: CaptureSession,
     release: Option<SubsurfaceBufferRelease>,
+    /// GL thumbnail targets, allocated on the first processed frame.
+    pub thumb: Option<ThumbPool>,
     last_submit: Instant,
     consecutive_failures: u32,
     /// At most one `ext_image_copy_capture_frame` may be outstanding per
@@ -74,6 +85,7 @@ impl ScreencopySession {
                 buffers: None,
                 session,
                 release: None,
+                thumb: None,
                 last_submit: Instant::now(),
                 consecutive_failures: 0,
                 in_flight: false,
@@ -231,19 +243,54 @@ impl ScreencopyHandler for AppData {
         for buffer in &mut buffers[1..] {
             buffer.damage.extend_from_slice(&frame.damage);
         }
-
-        let front = &buffers[0];
-        let (subsurface_buffer, release) = SubsurfaceBuffer::new(front.backing.clone());
-        let image = CaptureImage {
-            buffer: subsurface_buffer,
-            width: front.size.0,
-            height: front.size.1,
-            transform: match frame.transform {
-                WEnum::Value(t) => t,
-                WEnum::Unknown(_) => cctk::wayland_client::protocol::wl_output::Transform::Normal,
-            },
+        let transform = match frame.transform {
+            WEnum::Value(t) => t,
+            WEnum::Unknown(_) => cctk::wayland_client::protocol::wl_output::Transform::Normal,
         };
-        let previous_release = state.release.replace(release);
+
+        // GL pass: the front capture buffer → a thumbnail-sized, corner-masked
+        // target. Falls back to the raw frame if the pass is unavailable, the
+        // UI hasn't told us a size yet, or this frame's render failed.
+        let thumb_size = self.thumb_sizes.get(&capture.handle).copied();
+        let front_size = buffers[0].size;
+        let mut processed: Option<(Arc<BufferSource>, (u32, u32))> = None;
+        let mut gl_error = None;
+        if let Some(size) = thumb_size {
+            let ScreencopySession { buffers: bufs, thumb, .. } = state;
+            let front = &mut bufs.as_mut().unwrap()[0];
+            match self.gl_process(front, thumb, size, transform) {
+                Ok(backing) => processed = Some((backing, size)),
+                Err(err) => gl_error = Some(err),
+            }
+        }
+        let Some(buffers) = state.buffers.as_mut() else { return };
+
+        let was_processed = processed.is_some();
+        let (release, image) = match processed {
+            Some((backing, (w, h))) => {
+                let (sb, release) = SubsurfaceBuffer::new(backing);
+                let image = CaptureImage {
+                    buffer: sb,
+                    width: w,
+                    height: h,
+                    transform: cctk::wayland_client::protocol::wl_output::Transform::Normal,
+                };
+                (release, image)
+            }
+            None => {
+                let (sb, release) = SubsurfaceBuffer::new(buffers[0].backing.clone());
+                let image = CaptureImage { buffer: sb, width: front_size.0, height: front_size.1, transform };
+                (release, image)
+            }
+        };
+        // What the next submit must wait for: the buffer the compositor is
+        // now holding — the GL target if we rendered, else the raw front.
+        let previous_release = if was_processed {
+            let pool = state.thumb.as_mut().unwrap();
+            pool.release.replace(release)
+        } else {
+            state.release.replace(release)
+        };
         let last_submit = state.last_submit;
         let session_id = state.session.clone();
 
@@ -277,6 +324,9 @@ impl ScreencopyHandler for AppData {
         });
 
         drop(guard);
+        if let Some(err) = gl_error {
+            self.gl_failed(err);
+        }
         self.send_event(Event::Frame(capture.handle.clone(), image));
     }
 
