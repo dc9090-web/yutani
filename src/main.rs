@@ -43,6 +43,11 @@ enum Command {
         #[command(subcommand)]
         action: ShortcutsAction,
     },
+    /// EVE-only WireGuard tunnel
+    Tunnel {
+        #[command(subcommand)]
+        action: TunnelAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -51,6 +56,43 @@ enum ShortcutsAction {
     Install,
     /// Remove Yutani's bindings, leaving everything else untouched
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum TunnelAction {
+    /// Install the tunnel from a wg-quick .conf (asks for your password once)
+    Install {
+        conf: std::path::PathBuf,
+        /// Print what would be installed instead of installing (no root needed)
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove the tunnel unit, conf and polkit rule
+    Uninstall,
+    /// Start the tunnel (EVE traffic goes via London)
+    Connect,
+    /// Stop the tunnel (EVE traffic goes direct)
+    Disconnect,
+    /// Show tunnel state as JSON
+    Status,
+    /// [root] the worker behind yutani-tunnel.service
+    #[command(hide = true)]
+    Run,
+    /// [root] called by `install` through pkexec
+    #[command(hide = true)]
+    InstallRoot {
+        #[arg(long)]
+        conf: std::path::PathBuf,
+        #[arg(long)]
+        uid: u32,
+        #[arg(long)]
+        user: String,
+        #[arg(long)]
+        exe: String,
+    },
+    /// [root] called by `uninstall` through pkexec
+    #[command(hide = true)]
+    UninstallRoot,
 }
 
 fn main() -> ExitCode {
@@ -87,6 +129,42 @@ fn main() -> ExitCode {
             println!("removed {n} shortcuts from {}", shortcuts::custom_path().display());
             ExitCode::SUCCESS
         }),
+        Some(Command::Tunnel { action }) => match action {
+            TunnelAction::Install { conf, dry_run: true } => {
+                let (uid, user) = (ipc::uid(), std::env::var("USER").unwrap_or_default());
+                let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+                tunnel::install::install_root(&conf.canonicalize().unwrap_or(conf.clone()), uid, &user, &exe, true)
+                    .and_then(|report| {
+                        print!("{report}");
+                        tunnel::worker::dry_run(&conf, uid)
+                    })
+                    .map(|plan| {
+                        print!("\n{plan}");
+                        ExitCode::SUCCESS
+                    })
+            }
+            TunnelAction::Install { conf, dry_run: false } => tunnel::install::install(&conf).map(|()| ExitCode::SUCCESS),
+            TunnelAction::Uninstall => tunnel::install::uninstall().map(|()| ExitCode::SUCCESS),
+            TunnelAction::Connect => tunnel::control::connect().map(|()| ExitCode::SUCCESS),
+            TunnelAction::Disconnect => tunnel::control::disconnect().map(|()| ExitCode::SUCCESS),
+            TunnelAction::Status => {
+                let config = model::config::Config::load();
+                let st = tunnel::control::current_tunnel_status(&config.tunnel.location);
+                println!("{}", serde_json::to_string_pretty(&st).unwrap_or_default());
+                Ok(ExitCode::SUCCESS)
+            }
+            TunnelAction::Run => tunnel::worker::run().map(|()| ExitCode::SUCCESS),
+            TunnelAction::InstallRoot { conf, uid, user, exe } => {
+                tunnel::install::install_root(&conf, uid, &user, &exe, false).map(|report| {
+                    print!("{report}");
+                    ExitCode::SUCCESS
+                })
+            }
+            TunnelAction::UninstallRoot => tunnel::install::uninstall_root(false).map(|r| {
+                print!("{r}");
+                ExitCode::SUCCESS
+            }),
+        },
         None => {
             if cli::is_running() {
                 eprintln!("yutani is already running");

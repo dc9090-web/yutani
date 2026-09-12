@@ -15,7 +15,7 @@ pub fn socket_path() -> PathBuf {
     }
 }
 
-fn uid() -> u32 {
+pub fn uid() -> u32 {
     // SAFETY: getuid has no preconditions and cannot fail.
     unsafe { libc_getuid() }
 }
