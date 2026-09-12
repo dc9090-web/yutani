@@ -344,7 +344,7 @@ goes to the first.
 
 *Status after plan 4:* implemented as `yutani shortcuts install|uninstall`
 (CLI; the settings-window buttons come with plan 5). Commands are written
-with the absolute path of the installed binary.
+with the absolute path of the installed binary. The file is written in place (not tmp+rename): cosmic-config's watcher ignores paired rename events and keys changes by the touched file's name, so only a direct write makes cosmic-comp reload `custom` (verified live 2026-09-12). The window in which a concurrent reader could see a partial file is accepted for this rare, interactive operation.
 
 ## 8. IPC
 

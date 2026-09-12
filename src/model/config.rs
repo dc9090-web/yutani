@@ -176,9 +176,15 @@ impl Config {
             tracing::warn!("config: app_ids is empty; using default");
             self.app_ids = d.app_ids.clone();
         }
-        if self.shortcuts.next.trim().is_empty() || self.shortcuts.prev.trim().is_empty() {
-            tracing::warn!("config: shortcuts.next/prev must not be empty; using defaults");
-            self.shortcuts = ShortcutsConfig::default();
+        {
+            let (next, prev) = (self.shortcuts.next.trim(), self.shortcuts.prev.trim());
+            // Two bindings on one key would silently overwrite each other in
+            // the shortcuts file; the digits are taken by `focus 1..9`.
+            let is_digit = |k: &str| k.len() == 1 && k.as_bytes()[0].is_ascii_digit() && k != "0";
+            if next.is_empty() || prev.is_empty() || next.eq_ignore_ascii_case(prev) || is_digit(next) || is_digit(prev) {
+                tracing::warn!("config: shortcuts.next/prev must be distinct, non-empty and not 1-9; using defaults");
+                self.shortcuts = ShortcutsConfig::default();
+            }
         }
         self
     }
@@ -353,10 +359,20 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_empty_shortcut_keys() {
+    fn validate_rejects_empty_equal_or_digit_shortcut_keys() {
         let mut c = Config::default();
         c.shortcuts.next = String::new();
-        let c = c.validate();
-        assert_eq!(c.shortcuts.next, "Right");
+        assert_eq!(c.validate().shortcuts.next, "Right");
+        let mut c = Config::default();
+        c.shortcuts.next = "Tab".into();
+        c.shortcuts.prev = "tab".into();
+        assert_eq!(c.validate().shortcuts.prev, "Left");
+        let mut c = Config::default();
+        c.shortcuts.prev = "3".into();
+        assert_eq!(c.validate().shortcuts.prev, "Left");
+        let mut c = Config::default();
+        c.shortcuts.next = "Tab".into();
+        c.shortcuts.prev = "grave".into();
+        assert_eq!(c.clone().validate(), c);
     }
 }
