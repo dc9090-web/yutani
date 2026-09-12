@@ -84,11 +84,11 @@ pub fn parse_shortcut_key(text: &str, other: &str) -> Result<String, String> {
     Ok(key.to_string())
 }
 
-/// Whether the *Install shortcuts* / *Uninstall shortcuts* buttons are
-/// pressable. Both write (or remove) bindings built from `config.shortcuts`,
-/// which only ever holds accepted values — so while a key field is refused,
-/// pressing Install would install a binding other than the one on screen.
-/// Disabled until both fields parse.
+/// Whether the *Install shortcuts* button is pressable. It writes bindings
+/// built from `config.shortcuts`, which only ever holds accepted values — so
+/// while a key field is refused, pressing Install would install a binding
+/// other than the one on screen. Disabled until both fields parse.
+/// (*Uninstall* never reads the keys, so it stays pressable.)
 pub fn install_enabled(next_field: &str, prev_field: &str) -> bool {
     parse_shortcut_key(next_field, prev_field).is_ok() && parse_shortcut_key(prev_field, next_field).is_ok()
 }
@@ -476,7 +476,7 @@ fn behavior_page<'a>(state: &'a State, config: &'a Config) -> Element<'a, Msg> {
             .on_press_maybe(pressable.then_some(Msg::InstallShortcuts))
             .into(),
         widget::button::destructive("Uninstall shortcuts")
-            .on_press_maybe(pressable.then_some(Msg::UninstallShortcuts))
+            .on_press(Msg::UninstallShortcuts)
             .into(),
     ]);
     widget::settings::view_column(vec![
