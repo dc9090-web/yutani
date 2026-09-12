@@ -202,6 +202,20 @@ impl Config {
             self.app_ids = d.app_ids.clone();
         }
         {
+            // An empty/whitespace-only entry is almost always a stray blank
+            // line from hand-editing the RON file; drop it rather than let
+            // it sit there matching nothing.
+            let before = self.tunnel.adopt_processes.len();
+            self.tunnel.adopt_processes.retain(|p| !p.trim().is_empty());
+            if self.tunnel.adopt_processes.len() != before {
+                tracing::warn!("config: tunnel.adopt_processes had empty/whitespace-only entries; dropping them");
+            }
+            if self.tunnel.adopt_processes.is_empty() {
+                tracing::warn!("config: tunnel.adopt_processes is empty; using defaults");
+                self.tunnel.adopt_processes = d.tunnel.adopt_processes.clone();
+            }
+        }
+        {
             // Trimmed, because what is left here is what gets written to the
             // shortcuts file verbatim, and " Right " is no keysym name.
             let (next, prev) = (self.shortcuts.next.trim().to_string(), self.shortcuts.prev.trim().to_string());
@@ -481,5 +495,16 @@ mod tests {
         assert_eq!(c.tunnel.location, "Amsterdam");
         assert!(!c.tunnel.auto_adopt);
         assert_eq!(c.tunnel.adopt_processes.len(), 3);
+    }
+
+    #[test]
+    fn validate_drops_blank_adopt_process_entries_and_falls_back_when_all_blank() {
+        let mut c = Config::default();
+        c.tunnel.adopt_processes = vec!["  ".into(), "real.exe".into(), "".into()];
+        assert_eq!(c.validate().tunnel.adopt_processes, vec!["real.exe"]);
+
+        let mut c = Config::default();
+        c.tunnel.adopt_processes = vec!["".into(), "   ".into()];
+        assert_eq!(c.validate().tunnel.adopt_processes, Config::default().tunnel.adopt_processes);
     }
 }
