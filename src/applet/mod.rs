@@ -4,6 +4,7 @@
 //! See docs/superpowers/specs/2026-09-12-yutani-applet-design.md.
 
 pub mod client;
+pub mod display;
 pub mod format;
 pub mod icon;
 pub mod rate;
@@ -58,6 +59,17 @@ pub fn poll_interval(popup_open: bool) -> Duration {
     Duration::from_secs(if popup_open { 1 } else { 5 })
 }
 
+/// The daemon binary: the `yutani` next to this applet if it is there
+/// (a cargo target dir, a prefix bin dir), else whatever `yutani` `PATH`
+/// finds.
+pub fn daemon_exe() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("yutani")))
+        .filter(|sibling| sibling.is_file())
+        .unwrap_or_else(|| std::path::PathBuf::from("yutani"))
+}
+
 /// An error note is shown for [`NOTE_MS`] after it was set.
 pub fn note_visible(set_at_ms: u64, now_ms: u64) -> bool {
     now_ms.saturating_sub(set_at_ms) < NOTE_MS
@@ -84,6 +96,14 @@ mod tests {
     fn poll_is_one_second_open_and_five_closed() {
         assert_eq!(poll_interval(true), Duration::from_secs(1));
         assert_eq!(poll_interval(false), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_daemon_is_a_sibling_binary_or_just_a_name() {
+        let exe = daemon_exe();
+        assert_eq!(exe.file_name().unwrap(), "yutani");
+        // Either an absolute sibling that exists, or the bare name for PATH.
+        assert!(exe.is_absolute() && exe.is_file() || exe == std::path::PathBuf::from("yutani"));
     }
 
     #[test]
