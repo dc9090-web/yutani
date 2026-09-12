@@ -1,3 +1,5 @@
 reference/
 .superpowers/
 target/
+vpn/
+design/*.zip
