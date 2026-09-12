@@ -328,7 +328,16 @@ impl App {
     /// `new_client_anchor` first. Refuses outright while the file on disk
     /// is poisoned (spec §10: never overwrite a hand-edited file that
     /// failed to parse), warning about it exactly once.
+    ///
+    /// The refresh happens whether or not the write does: `settings_save_as`
+    /// copies `self.layout` to a named file, which is a different file and
+    /// so always allowed — it must not carry a stale order or anchor just
+    /// because `current.ron` is poisoned.
     fn save_current_layout(&mut self) {
+        let live = self.layout_order_names();
+        let (order, anchor) = layout::refresh_order(&live, &self.layout.order, &self.layout.thumbs);
+        self.layout.order = order;
+        self.layout.new_client_anchor = anchor;
         match Layout::save_gate(self.layout_poisoned, self.layout_poison_warned) {
             layout::SaveGate::RefuseAndWarn => {
                 tracing::warn!(
@@ -341,10 +350,6 @@ impl App {
             layout::SaveGate::RefuseSilently => return,
             layout::SaveGate::Proceed => {}
         }
-        let live = self.layout_order_names();
-        let order = layout::merge_order(&live, &self.layout.order, layout::MAX_ORDER);
-        self.layout.order = order;
-        self.layout.new_client_anchor = layout::derive_anchor(&self.layout.thumbs);
         if let Err(e) = self.layout.save() {
             tracing::warn!("cannot save layout: {e:#}");
         }

@@ -1,7 +1,7 @@
 //! Thumbnail geometry (snapping) and persisted per-character positions.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +41,11 @@ impl Default for Anchor {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Layout {
-    /// Keyed by character name.
+    /// Keyed by character name. Uncapped by design: one entry per character
+    /// ever positioned, at ~50 bytes each, so even a decade of alts is a
+    /// few kilobytes — and an entry is exactly what makes a character come
+    /// back to their own spot, so there is no sound rule for dropping one.
+    /// Delete `current.ron` (or hand-edit it) to forget them.
     pub thumbs: BTreeMap<String, ThumbPos>,
     /// Layout order by character name (spec §9). A character listed here
     /// ranks by its place in the list; anyone else follows by label. This
@@ -124,20 +128,53 @@ pub fn derive_anchor(thumbs: &BTreeMap<String, ThumbPos>) -> Anchor {
 /// after it, in live order. Live characters that *are* already recorded
 /// stay at their recorded slot rather than jumping to the front.
 /// Deduplicated and capped at `cap`.
-pub fn merge_order(live: &[String], previous: &[String], cap: usize) -> Vec<String> {
+///
+/// When the cap bites, the newest names are the last thing to go: a
+/// recorded name that is neither live (`live`) nor holds a saved position
+/// (`positioned`) is only remembered, so those are evicted first, oldest
+/// (front-most) first, until the list fits. Only if that is not enough —
+/// every name is live or positioned — is the tail truncated.
+pub fn merge_order(live: &[String], previous: &[String], positioned: &BTreeSet<String>, cap: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(live.len() + previous.len());
     for name in previous {
         if !out.iter().any(|n| n == name) {
             out.push(name.clone());
         }
     }
+    // Everything appended from here on is a live name with no recorded
+    // slot; `recorded` marks where that tail starts, and eviction only
+    // ever looks before it.
+    let mut recorded = out.len();
     for name in live {
-        if !previous.iter().any(|n| n == name) && !out.iter().any(|n| n == name) {
+        if !out.iter().any(|n| n == name) {
             out.push(name.clone());
+        }
+    }
+    let mut i = 0;
+    while out.len() > cap && i < recorded {
+        if live.contains(&out[i]) || positioned.contains(&out[i]) {
+            i += 1;
+        } else {
+            out.remove(i);
+            recorded -= 1;
         }
     }
     out.truncate(cap);
     out
+}
+
+/// Everything a save of `current.ron` records beyond the thumbnails
+/// themselves: the refreshed [`merge_order`] and [`derive_anchor`]. Kept
+/// pure and separate from the write so the in-memory layout is up to date
+/// even when the write is refused (spec §10) — a named layout saved from
+/// the settings window then carries today's order, not a stale one.
+pub fn refresh_order(
+    live: &[String],
+    previous: &[String],
+    thumbs: &BTreeMap<String, ThumbPos>,
+) -> (Vec<String>, Anchor) {
+    let positioned: BTreeSet<String> = thumbs.keys().cloned().collect();
+    (merge_order(live, previous, &positioned, MAX_ORDER), derive_anchor(thumbs))
 }
 
 /// Where an unnamed client's thumbnail goes (spec §4): the anchor, then
@@ -153,11 +190,27 @@ pub fn merge_order(live: &[String], previous: &[String], cap: usize) -> Vec<Stri
 /// two neighbouring slots that way.
 pub fn stacked_position(anchor: (i32, i32), taken: &[(i32, i32)], step: i32) -> (i32, i32) {
     let step = step.max(1);
-    let radius = (step / 2).max(1);
-    (0..)
-        .map(|k| (anchor.0 + k * step, anchor.1 + k * step))
-        .find(|&(x, y)| !taken.iter().any(|&(tx, ty)| (x - tx).abs() < radius && (y - ty).abs() < radius))
-        .expect("the candidate walks away from a finite set of occupied slots")
+    let radius = i64::from((step / 2).max(1));
+    // Saturating, because the anchor comes from a file a hand can edit: a
+    // walk from i32::MAX must stand still at the edge of the coordinate
+    // space rather than overflow. That is also why the search is bounded
+    // instead of endless — each occupied point can block at most one
+    // candidate (see above), so one of the first `taken.len() + 1` is
+    // free *unless* saturation has collapsed them onto each other, and
+    // then the edge is the only answer left.
+    let slot = |k: i32| {
+        let d = k.saturating_mul(step);
+        (anchor.0.saturating_add(d), anchor.1.saturating_add(d))
+    };
+    // Distances in i64: the two far corners of the space are further apart
+    // than an i32 can express.
+    let free = |&(x, y): &(i32, i32)| {
+        !taken.iter().any(|&(tx, ty)| {
+            (i64::from(x) - i64::from(tx)).abs() < radius && (i64::from(y) - i64::from(ty)).abs() < radius
+        })
+    };
+    let last = i32::try_from(taken.len()).unwrap_or(i32::MAX);
+    (0..=last).map(slot).find(free).unwrap_or_else(|| slot(last))
 }
 
 /// Spec §9: a thumbnail whose saved connector is not connected goes to the
@@ -244,7 +297,10 @@ pub fn list_names_in(dir: &Path) -> Vec<String> {
         .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "ron"))
-        .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        // A stem that is not UTF-8 could never be typed back as a layout
+        // name, so it is skipped rather than listed under a lossy spelling
+        // that names no file.
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_owned))
         .filter(|s| validate_name(s).is_ok_and(|v| v == *s))
         .collect();
     names.sort_by_key(|n| n.to_lowercase());
@@ -271,11 +327,13 @@ pub fn delete_named(name: &str) -> Result<(), String> {
 pub fn rename_named_in(dir: &Path, from: &str, to: &str) -> Result<(), String> {
     let from_path = named_path_in(dir, from)?;
     let to_path = named_path_in(dir, to)?;
-    if from_path == to_path {
-        return Ok(());
-    }
+    // Existence first: renaming a layout that isn't there to its own name
+    // is still an error, not a silent success.
     if !from_path.exists() {
         return Err(format!("no such layout {from}"));
+    }
+    if from_path == to_path {
+        return Ok(());
     }
     if to_path.exists() {
         return Err(format!("layout {} already exists", validate_name(to)?));
@@ -539,6 +597,10 @@ mod tests {
         assert_eq!(derive_anchor(&thumbs), Anchor { output: "DP-1".into(), x: 40, y: 40 });
     }
 
+    fn names(list: &[&str]) -> BTreeSet<String> {
+        list.iter().map(|n| n.to_string()).collect()
+    }
+
     #[test]
     fn merge_order_keeps_recorded_slots_and_appends_new_live_names() {
         let live = ["Kel".to_string(), "Aria".to_string()];
@@ -546,11 +608,45 @@ mod tests {
         // Aria keeps her recorded slot (does not jump to the front just
         // because she's live); Zoe (logged out) keeps hers too; Kel (live,
         // never recorded) is appended after.
-        assert_eq!(merge_order(&live, &previous, MAX_ORDER), vec!["Aria", "Zoe", "Kel"]);
-        // The cap bounds the file even after years of characters: it drops
-        // from the newly-appended end, not out of the recorded order.
-        assert_eq!(merge_order(&live, &previous, 2), vec!["Aria", "Zoe"]);
-        assert!(merge_order(&[], &[], MAX_ORDER).is_empty());
+        assert_eq!(merge_order(&live, &previous, &names(&[]), MAX_ORDER), vec!["Aria", "Zoe", "Kel"]);
+        assert!(merge_order(&[], &[], &names(&[]), MAX_ORDER).is_empty());
+        // A name recorded twice by a hand edit is kept once.
+        let twice = ["Aria".to_string(), "Aria".to_string()];
+        assert_eq!(merge_order(&live, &twice, &names(&[]), MAX_ORDER), vec!["Aria", "Kel"]);
+    }
+
+    /// When the cap bites, a live character is never dropped for the sake of
+    /// one who is merely remembered: the recorded names that are neither
+    /// live nor hold a saved position go first, oldest (front) first.
+    #[test]
+    fn merge_order_evicts_forgettable_recorded_names_before_truncating() {
+        let live = ["Kel".to_string(), "Aria".to_string()];
+        let previous = ["Zoe".to_string(), "Aria".to_string(), "Ven".to_string()];
+        // Cap 2: Zoe and Ven are both forgettable, Zoe is older → she goes
+        // first, then Ven, leaving the two live names in recorded order.
+        assert_eq!(merge_order(&live, &previous, &names(&[]), 2), vec!["Aria", "Kel"]);
+        // Ven has a saved position, so Zoe (nothing saved) is evicted first
+        // and Ven stays even though she is not logged in.
+        assert_eq!(merge_order(&live, &previous, &names(&["Ven"]), 3), vec!["Aria", "Ven", "Kel"]);
+        // Nothing is forgettable and the cap still bites: the tail is cut.
+        assert_eq!(merge_order(&live, &previous, &names(&["Zoe", "Ven"]), 2), vec!["Zoe", "Aria"]);
+    }
+
+    /// The pure half of `save_current_layout`: what a save records, whether
+    /// or not the write itself is allowed to happen.
+    #[test]
+    fn refresh_order_gives_todays_order_and_anchor() {
+        let mut thumbs = BTreeMap::new();
+        thumbs.insert("Aria".to_string(), pos("DP-1", 40, 40));
+        let (order, anchor) = refresh_order(&["Kel".to_string()], &["Aria".to_string()], &thumbs);
+        assert_eq!(order, vec!["Aria", "Kel"]);
+        assert_eq!(anchor, Anchor { output: "DP-1".into(), x: 40, y: 40 });
+        // A saved position keeps its owner's slot even under the real cap.
+        let previous: Vec<String> = (0..MAX_ORDER).map(|i| format!("ghost{i}")).collect();
+        let (order, _) = refresh_order(&["Kel".to_string()], &previous, &thumbs);
+        assert_eq!(order.len(), MAX_ORDER);
+        assert_eq!(order.last().unwrap(), "Kel");
+        assert!(!order.contains(&"ghost0".to_string()));
     }
 
     #[test]
@@ -563,6 +659,19 @@ mod tests {
         assert_eq!(stacked_position((40, 40), &[(50, 45)], 24), (64, 64));
         // Far away on one axis only: not a collision.
         assert_eq!(stacked_position((40, 40), &[(400, 45)], 24), (40, 40));
+    }
+
+    /// A hand-edited anchor at the edge of the coordinate space must not
+    /// overflow the walk (nor the occupied-slot distance): the walk stands
+    /// still at the edge instead.
+    #[test]
+    fn stacked_position_saturates_instead_of_overflowing() {
+        let corner = (i32::MAX - 5, i32::MAX - 5);
+        assert_eq!(stacked_position(corner, &[corner], 24), (i32::MAX, i32::MAX));
+        // The distance between the two far corners does not fit an i32.
+        assert_eq!(stacked_position((i32::MIN, i32::MIN), &[(i32::MAX, i32::MAX)], 24), (i32::MIN, i32::MIN));
+        let low = (i32::MIN, i32::MIN);
+        assert_eq!(stacked_position(low, &[low], 24), (i32::MIN + 24, i32::MIN + 24));
     }
 
     #[test]
@@ -637,6 +746,32 @@ mod tests {
         delete_named_in(&dir, "Mining").unwrap();
         assert_eq!(list_names_in(&dir), vec!["pvp fleet".to_string()]);
         assert_eq!(delete_named_in(&dir, "Mining").unwrap_err(), "no such layout Mining");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file whose name is not UTF-8 is not a layout we could ever open by
+    /// name, so it is skipped rather than listed under a lossy spelling.
+    #[test]
+    #[cfg(unix)]
+    fn list_names_in_skips_non_utf8_stems() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tmpdir("layout-non-utf8");
+        Layout::default().save_named_in(&dir, "pvp").unwrap();
+        let bad = dir.join(std::ffi::OsStr::from_bytes(b"bad\xffname.ron"));
+        std::fs::write(&bad, "()").unwrap();
+        assert_eq!(list_names_in(&dir), vec!["pvp".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Renaming a layout that does not exist says so even when the new name
+    /// is the old one — the no-op shortcut must not claim success.
+    #[test]
+    fn renaming_a_missing_layout_says_so_even_when_the_name_is_unchanged() {
+        let dir = tmpdir("layout-rename-missing");
+        assert_eq!(rename_named_in(&dir, "pvp", "pvp").unwrap_err(), "no such layout pvp");
+        Layout::default().save_named_in(&dir, "pvp").unwrap();
+        assert_eq!(rename_named_in(&dir, "pvp", "pvp"), Ok(()));
+        assert_eq!(list_names_in(&dir), vec!["pvp".to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
