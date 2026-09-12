@@ -35,6 +35,13 @@ cosmic-panel ──spawns──▶ yutani-applet (libcosmic applet, own process)
   `Core::applet` helpers for the panel button and the popup surface). The
   popup is a shell-owned surface (position, blur, radius, shadow supplied by
   libcosmic — per the handoff, only the *contents* are ours).
+- **Popup width is 360 px, not the handoff's 336.** `Core::applet
+  ::popup_container` pins its autosize limits to `min_width(360) …
+  max_width(360)`, so the width is libcosmic's to give, not ours to ask
+  for. Every section fills that width; the handoff's paddings are unchanged.
+  The same limits cap the height at 1000 px **by clipping**, which is why
+  the expanded account list scrolls inside its own capped container rather
+  than being allowed to push the rows below it off the bottom.
 - Polling: `status` every 1 s while the popup is open, every 5 s while
   closed (icon state only). Rates are deltas of `rx_bytes`/`tx_bytes`
   between polls divided by elapsed seconds. Totals are cumulative and stay
@@ -57,13 +64,32 @@ yutani-applet>`) that the panel needs to list it.
 | daemon running, tunnel connected & handshake < 180 s | `y-symbolic` | plain |
 | daemon running, tunnel disconnected (deliberately) | `y-symbolic` | plain |
 | tunnel connecting/disconnecting (unit activating/deactivating, ≤ 10 s) | `y-sync-symbolic` | spinner badge, 1.1 s rotation |
-| tunnel up but no handshake for ≥ 180 s, or unit failed | `y-attention-symbolic` | attention badge |
+| tunnel up but no handshake for ≥ 180 s (including one that never handshaked at all), or unit failed | `y-attention-symbolic` | attention badge |
 | daemon not running / tunnel not installed | `y-symbolic` | 38 % opacity |
 
 Button 26×26, radius 7, hover/active fills per handoff; sibling gap is the
 panel's.
 
-## 4. Popup contents (336 px wide)
+Two `TunnelStatus` fields exist for this table and nothing else, both
+`#[serde(default)]` so an older daemon's `status` reply still parses in a
+newer applet (they are separate binaries and upgrade independently):
+
+- `up_for_s: Option<u64>` — seconds since the link came up
+  (`TunnelFile::since_unix`), `None` while down. It bounds the sync badge: a
+  link that is up with *no* handshake is settling only while `up_for_s <
+  180`; past that it is not handshaking, it is broken, and the icon goes to
+  attention. A reply without the field keeps the pre-`up_for_s` behaviour
+  rather than raising a false alarm.
+- `failed: bool` — the unit is installed, the interface is absent, and
+  `systemctl --no-ask-password is-failed yutani-tunnel.service` exits 0
+  (only a zero exit is the failed state; 3 is inactive, 4 is no such unit).
+  Read-only and unprivileged, bounded by `proc::output_with_timeout` at 1 s
+  because it runs on every `status` request, and short-circuited so the
+  common paths never spawn it. It outranks every link check in the icon
+  table. The popup's status text stays `Disconnected` — the handoff defines
+  no failed colour, so nothing else in the popup changes.
+
+## 4. Popup contents (360 px wide — see §2)
 
 Vertical order and copy exactly as the handoff; data sources:
 
@@ -96,10 +122,25 @@ Vertical order and copy exactly as the handoff; data sources:
    in the panel and switches to the daemon-offline state, whose menu has a
    single `Start Yutani` item (spawns `yutani` detached).
 
-Typography: COSMIC's UI font (the handoff allows substituting the
-codebase's font); monospace (`JetBrains Mono` if installed, else the system
-monospace) for numbers, IDs, rates. Colours are the handoff's tokens, used
-as literals in a `theme.rs` table so they're in one place.
+Typography — **decided**: the handoff asks for Space Grotesk and JetBrains
+Mono and allows substituting the codebase's own fonts; we substitute, and
+ship neither. UI text is COSMIC's UI font (`cosmic::font::default()`, with
+`Weight::Medium` for the handoff's "500"); every number, id, rate and
+interface name is `cosmic::font::mono()`, which resolves to whatever
+monospace the system has. Nothing is bundled and nothing is downloaded, so
+the applet inherits the user's font settings the way every other COSMIC
+applet does. Line heights are set per helper: libcosmic's `monotext` preset
+pins an *absolute* 20 px line box, which at 10.5–22 px would wreck every gap
+in the popup, so each text helper passes its own factor.
+
+Colours are the handoff's tokens, used as literals in a `theme.rs` table so
+they're in one place. One token is *derived* rather than taken from the
+handoff — `HELD_HOVER_FILL` `#FFFFFF29`, the hover fill of the expanded
+`Accounts…` header, because the handoff has no row that is both held and
+hovered and the ordinary hover fill would make such a row darken under the
+pointer. The popup's corner radius follows the COSMIC theme's `radius_m`
+(what libcosmic rounds the container behind it to), with the handoff's 14 as
+the fallback.
 
 ## 5. IPC additions
 

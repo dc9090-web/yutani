@@ -1,6 +1,6 @@
 //! The popup's menu, as data. Spec §4.4–§4.5: the tunnel row, Accounts…
 //! (expanding in place to one row per client), Preferences…, the
-//! thumbnails row that replaces the old tray's Show/Hide, and Quit — or,
+//! thumbnails row (`show`/`hide` over IPC), and Quit — or,
 //! with no daemon, a single "Start Yutani".
 
 use crate::applet::Action;

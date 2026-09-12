@@ -117,7 +117,8 @@ event queues (the pattern System76's own cosmic-workspaces uses):
 │  • toplevel_info  (list)    │   (Activate, Minimize,            │    surfaces (both modes;   │
 │  • toplevel_mgmt  (focus)   │    SetAppIds, SetFps)             │    dock = layout policy)   │
 │  • screencopy     (capture) │                                   │                            │
-│  • gbm buffer pools         │                                   │  • tray icon               │
+│  • gbm buffer pools         │                                   │  (the panel applet is its  │
+│                             │                                   │   own process — see §6)    │
 └─────────────────────────────┘                                   └────────────────────────────┘
 ```
 
@@ -154,7 +155,10 @@ yutani/
       floating.rs    — per-client layer surfaces, drag/snap/pin
       dock.rs        — dock layout policy (centred along an edge)
       settings.rs    — settings window pages
-      tray.rs        — StatusNotifierItem (ksni)
+    applet/          — the panel applet's pure model (see
+                       2026-09-12-yutani-applet-design.md)
+    bin/
+      yutani-applet/ — the applet binary: cosmic::Application + rendering
     model/
       client.rs      — EveClient, title parsing
       layout.rs      — Layout, ThumbPos, ordering, snapping maths
@@ -167,8 +171,7 @@ yutani/
 
 Key dependencies: `libcosmic` (wayland, wgpu, tokio features),
 `cosmic-client-toolkit`, `cosmic-protocols`, `wayland-client`,
-`wayland-protocols`, `gbm`, `ksni`, `ron`, `serde`, `notify`, `tracing`,
-`clap`.
+`wayland-protocols`, `gbm`, `ron`, `serde`, `notify`, `tracing`, `clap`.
 
 ## 4. Client detection
 
@@ -294,7 +297,7 @@ no pins, positions are not persisted; clicks still activate/minimise.
 - `visibility = EveFocusedOnly`: shown iff the activated toplevel is an EVE
   client or Yutani itself.
 - `hide_active = true`: the activated client's own thumbnail is unmapped.
-- Tray Hide / `yutani hide`: all unmapped until Show.
+- The applet's Hide thumbnails / `yutani hide`: all unmapped until Show.
 
 Unmapping never destroys layer surfaces or capture sessions (except the
 `hide_active` pause in §5). Implementation note: layer-shell surfaces have no

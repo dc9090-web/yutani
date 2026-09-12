@@ -103,7 +103,7 @@ mod tests {
         assert!(should_show(Visibility::Always, false, false, true, true));
         assert!(!should_show(Visibility::Always, true, false, true, true)); // hide_active + this is active
         assert!(should_show(Visibility::Always, true, false, true, false));
-        assert!(!should_show(Visibility::Always, false, true, true, false)); // tray hidden
+        assert!(!should_show(Visibility::Always, false, true, true, false)); // hidden via IPC
     }
 
     #[test]

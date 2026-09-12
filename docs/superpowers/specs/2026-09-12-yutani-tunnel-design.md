@@ -2,7 +2,7 @@
 
 **Status:** approved (Daniel, 2026-09-12)
 **Depends on:** plan 4 (IPC socket, CLI)
-**Companion:** `2026-09-12-yutani-applet-design.md` (the tray applet that shows and controls this)
+**Companion:** `2026-09-12-yutani-applet-design.md` (the panel applet that shows and controls this)
 
 ## 1. Goal
 

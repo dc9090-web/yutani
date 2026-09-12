@@ -101,8 +101,10 @@ pub struct App {
     pub outputs: Vec<Output>,
     pub layout: Layout,
     pub drag: Option<pointer::DragState>,
-    /// Tray/IPC-toggled visibility: when true, no thumbnail is shown
-    /// regardless of `Visibility`/`hide_active`. Only `set_hidden` writes it.
+    /// IPC-toggled visibility: when true, no thumbnail is shown regardless
+    /// of `Visibility`/`hide_active`. The panel applet and the CLI both go
+    /// through IPC, so this is the only route in; only `set_hidden` writes
+    /// it.
     pub hidden: bool,
 }
 
