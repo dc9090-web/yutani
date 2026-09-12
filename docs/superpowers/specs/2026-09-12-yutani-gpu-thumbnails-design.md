@@ -45,9 +45,11 @@ captured frame:
   `Buffer`) imported with `eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)` and bound
   via `glEGLImageTargetTexture2DOES`. Cached per capture buffer (the pool has
   two), so imports happen twice per client, not per frame.
-- **Output:** per client, a pool of two thumbnail-sized gbm BOs, ARGB8888,
-  modifier chosen from the intersection of the dmabuf-feedback tranches and
-  `eglQueryDmaBufModifiersEXT`, `LINEAR` as the fallback. Each is imported as
+- **Output:** per client, a pool of two thumbnail-sized gbm BOs, ABGR8888
+  (the capture format; GL RGBA byte order), modifier chosen by gbm from the
+  compositor's dmabuf-feedback modifiers for ABGR8888
+  (`create_buffer_object_with_modifiers2`), implicit + `LINEAR` when the
+  feedback has none. Each is imported as
   an EGLImage → renderbuffer → FBO, and wrapped as a `wl_buffer` through the
   existing `zwp_linux_dmabuf` path so it can be shipped to the UI as a
   `SubsurfaceBuffer` exactly like today's raw buffers. After rendering,
@@ -55,8 +57,12 @@ captured frame:
   no longer waits on the compositor releasing a full-resolution buffer. The
   next render into an output buffer waits for the compositor's release of it
   (same `SubsurfaceBufferRelease` await as today, moved to the output pool).
-- `CaptureImage` for a processed frame carries the output size and
-  `Transform::Normal`.
+- `CaptureImage` for a processed frame carries `Transform::Normal` and the
+  **source** window's size in display orientation (axes swapped for a
+  90°/270° capture transform) — not the target's. `width`/`height` exist
+  only so the UI can derive the thumbnail's aspect; reporting the target size
+  (which includes the border) fed back into that computation and grew the
+  thumbnail by 1 px per frame (found in the Task 5 smoke test).
 
 New commands from the UI:
 
@@ -100,7 +106,10 @@ Pure, unit-tested in `gl.rs`:
 
 - `uv_matrix(transform) -> [f32; 6]` for all eight `wl_output::Transform`
   values (table test against known corner mappings).
-- `mask_radius(corner_radius, scale, size)` clamping.
+- `mask_radius(radius_px, size)` clamping.
+- `dmabuf_image_attribs` (EGL attribute list for a dmabuf import) and
+  `buffer_coords` (per-transform UV mapping behind `uv_matrix`;
+  `swaps_axes` alongside it).
 - `pick_modifier(feedback_mods, egl_mods) -> Modifier` (intersection, LINEAR
   fallback, INVALID handling).
 

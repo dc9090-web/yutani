@@ -119,6 +119,34 @@ impl App {
         }
     }
 
+    /// Integer scale of the output `client` is (or would be) shown on.
+    fn scale_for(&self, client: &Client) -> i32 {
+        self.output_for(&client.info)
+            .and_then(|handle| self.outputs.iter().find(|o| o.handle == handle))
+            .map_or(1, |o| o.scale)
+    }
+
+    /// Tell the backend the physical size to render this client's frames at.
+    fn send_thumb_size(&self, handle: &Handle, logical: (u32, u32)) {
+        let Some(client) = self.clients.get(handle) else { return };
+        let s = self.scale_for(client) as u32;
+        let physical = (logical.0 * s, logical.1 * s);
+        tracing::debug!(?handle, ?logical, scale = s, ?physical, "thumb size");
+        self.send(Cmd::SetThumbSize(handle.clone(), physical));
+    }
+
+    /// Mask radius in physical pixels. Outputs may differ in scale; the
+    /// radius is global, so use the largest scale in use (a 1 px error on
+    /// a lower-scale output is invisible). Nothing to do before the backend
+    /// has handed over its channel: the `CmdSender` handler sends it then.
+    fn send_corner_radius(&self) {
+        if self.cmd.is_none() {
+            return;
+        }
+        let s = self.outputs.iter().map(|o| o.scale).max().unwrap_or(1) as u32;
+        self.send(Cmd::SetCornerRadius(self.config.corner_radius * s));
+    }
+
     fn on_output(&mut self, event: OutputEvent, output: WlOutput) {
         // Recover iced's connection from the first output we see.
         if self.conn.is_none()
@@ -271,6 +299,7 @@ impl App {
         client.position = position;
         client.last_size = Some((width, height));
         tracing::info!(?id, x = position.0, y = position.1, width, height, "create_surface");
+        self.send_thumb_size(handle, (width, height));
         let create = get_layer_surface(SctkLayerSurfaceSettings {
             id,
             layer: Layer::Overlay,
@@ -414,6 +443,7 @@ impl App {
         let (w, h) = self.surface_size(client);
         let (x, y) = client.position;
         self.clients.get_mut(handle).unwrap().last_size = Some((w, h));
+        self.send_thumb_size(handle, (w, h));
         Task::batch([
             set_anchor(id, Anchor::TOP | Anchor::LEFT),
             set_size(id, Some(w), Some(h)),
@@ -440,6 +470,7 @@ impl App {
             return Task::none();
         }
         self.clients.get_mut(handle).unwrap().last_size = Some(size);
+        self.send_thumb_size(handle, size);
         set_size(id, Some(size.0), Some(size.1))
     }
 
@@ -572,6 +603,7 @@ impl App {
         match event {
             Event::CmdSender(sender) => {
                 self.cmd = Some(sender);
+                self.send_corner_radius();
                 Task::none()
             }
             Event::ClientAdded(handle, info) | Event::ClientUpdated(handle, info) => {
@@ -649,6 +681,10 @@ impl App {
         if new.fps != self.config.fps {
             self.send(Cmd::SetFps(new.fps));
         }
+        if new.corner_radius != self.config.corner_radius {
+            self.config.corner_radius = new.corner_radius;
+            self.send_corner_radius();
+        }
         let mode_changed = new.mode != self.config.mode;
         self.config = new;
         let mut tasks = Vec::new();
@@ -723,6 +759,7 @@ impl Application for App {
                 // that handler recreates them via output_for); a size change
                 // moves the dock layout. `reconcile_surfaces` covers all.
                 self.on_output(event, output);
+                self.send_corner_radius();
                 self.reconcile_surfaces()
             }
             Msg::Wayland(WaylandEvent::Layer(LayerEvent::Done, _, id)) => {

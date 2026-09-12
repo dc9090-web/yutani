@@ -229,6 +229,11 @@ Capture continues for the active client (it is shown in the dock) unless
 submitted), not destroyed. *Implemented in plan 3* (`Cmd::PauseCapture` /
 `ResumeCapture`, edge-triggered from surface reconciliation).
 
+Captured frames are post-processed on the GPU (EGL/GLES2 on the render node,
+`backend/gl.rs`) into thumbnail-sized ABGR8888 dmabufs with the corner mask
+baked into alpha before they reach the UI; if GL is unavailable the raw frame
+is shown (square corners). See `2026-09-12-yutani-gpu-thumbnails-design.md`.
+
 ## 6. UI
 
 ### Thumbnail widget (shared by both modes)
@@ -236,12 +241,15 @@ submitted), not destroyed. *Implemented in plan 3* (`Cmd::PauseCapture` /
 ```
 container (border: border_px, colour = active ? active_border : inactive_border, radius corner_radius)
   └ stack
-      ├ Subsurface(frame, content_fit: Contain, alpha: opacity)
+      ├ Subsurface(frame, content_fit: Contain, z: -1)
       ├ text(character_name | "Logging in…")  bottom-left pill, hidden if !show_names
       └ pin glyph                              top-right, only when pinned (floating mode)
 ```
 
 Width is `config.thumb_width`; height follows the captured window's aspect.
+The image subsurface sits below the parent (`z = -1`); border, name label and
+pin are iced-drawn over it; corners are rounded in the buffer itself (the
+backend's GL pass masks each frame with `corner_radius`, see §5).
 `CaptureState::Unavailable` replaces the subsurface with a grey placeholder
 and the name.
 
@@ -250,14 +258,13 @@ and the name.
 One `zwlr_layer_surface` per client: layer **Overlay**, anchor top-left,
 exclusive zone 0, keyboard interactivity **None**, positioned with margins,
 on the output the layout names (fallback: the output the client was first
-seen on; then the primary output). Every thumbnail surface asks cosmic-comp
-for rounded corners (`cosmic_corner_radius_layer_v1`, `corner_radius`), in
-both modes — this is why the dock is not one wide strip: the compositor
-rounds a whole layer surface, subsurfaces included, so per-thumbnail
-rounding needs per-thumbnail surfaces. The radius is requested only after
-the surface has presented its first frame: cosmic-comp 1.7 validates it
-against the surface's current (pre-commit) bounding box, which is 0×0
-before the first buffer, and a too-large radius is a fatal protocol error.
+seen on; then the primary output). Rounded corners are not a compositor
+request (cosmic-comp's `cosmic_corner_radius_layer_v1` is a blur-shape hint
+that never clips a layer surface's pixels): the image subsurface sits below
+the parent (`z = -1`), border, name label and pin are iced-drawn over it, and
+corners are rounded in the buffer itself. The dock is still one layer surface
+per thumbnail (not one wide strip) so each can be positioned, sized and
+stacked independently.
 
 ### Dock mode (default)
 
@@ -299,8 +306,8 @@ thumbnail reappears in the same place.
 
 libcosmic window, opened from the tray or `yutani settings`. Pages:
 
-- **Display** — thumb width, opacity, active/inactive border colour, border
-  px, show names, zoom factor.
+- **Display** — thumb width, active/inactive border colour, border px,
+  show names, zoom factor, corner radius.
 - **Behavior** — mode, dock edge, FPS (10/15/30/60), visibility, hide
   active, snap grid, snap edges, shortcut prefix/keys, *Install shortcuts* /
   *Uninstall shortcuts* buttons.
@@ -356,14 +363,13 @@ if the socket is absent it prints "yutani is not running" and exits 1.
   mode: Dock,                // Floating | Dock
   dock_edge: Top,            // Top | Bottom | Left | Right
   thumb_width: 480,
-  opacity: 1.0,
   fps: 30,                   // 10 | 15 | 30 | 60
   active_border: None,        // None = COSMIC theme accent (focused-window outline colour)
   inactive_border: "#404040",
   border_px: 2,
   show_names: true,
   zoom_factor: 1.0,          // 1.0 = no hover zoom
-  corner_radius: 8,
+  corner_radius: 8,          // px, baked into the frame on the GPU
   visibility: Always,        // Always | EveFocusedOnly
   hide_active: false,
   snap_grid: true,
