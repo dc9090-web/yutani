@@ -15,7 +15,7 @@
 - Constants (verbatim from the spec): interface `yutani0`; fwmark `0x59`; routing table `51820`; slice `yutani-eve.slice`; cgroup path `user.slice/user-<uid>.slice/user@<uid>.service/yutani.slice/yutani-eve.slice` (nft `socket cgroupv2 level 5`; systemd nests `yutani-eve.slice` under `yutani.slice` because of the dash, hence five components); conf `/etc/yutani/tunnel.conf` (0600 root); status `/run/yutani/tunnel.json` (0644, atomic rename); unit `/etc/systemd/system/yutani-tunnel.service`; polkit rule `/etc/polkit-1/rules.d/50-yutani-tunnel.rules`.
 - No shell scripts: the worker execs `ip`, `wg`, `nft`, `sysctl` with generated argv; any failure during *up* runs the full *down* and exits non-zero with the failing command and its stderr in the log.
 - The private key appears only in `/etc/yutani/tunnel.conf` and the transient 0600 `wg setconf` file; never in logs, `tunnel.json`, IPC replies or dry-run output (dry-run prints `PrivateKey = <redacted>`).
-- New direct deps: `serde_json = "1"`; `tokio` features become `["net", "io-util", "sync", "rt", "signal", "time"]`. No new `[[package]]` entries in `Cargo.lock`.
+- New direct deps: `serde_json = "1"`; `tokio` features become `["net", "io-util", "sync", "rt", "signal", "time", "macros"]` (`macros` for the worker's `tokio::select!`). No new `[[package]]` entries in `Cargo.lock`.
 - IPC protocol additions: requests `status`, `tunnel connect`, `tunnel disconnect`; reply form `ok <json>` for `status` (`Response::OkData(String)`).
 - `yutani launch` must never prevent the game from starting: if `systemd-run` is missing or fails, run the command directly and print a warning to stderr.
 - Every commit: `cargo build -q` warning-free for new code (pre-existing: `Config::save/save_to`), `cargo test -q` green.
@@ -1694,15 +1694,41 @@ Claude-Session: https://claude.ai/code/session_01R66vpAiTLPkLmk4SuttcFH"
 
 - [ ] **Step 1: Install and verify routing** (Daniel at the keyboard; Claude reads outputs)
 
+The binary the unit runs must be root-owned and not writable by others (spec
+§5 and §9), so install it before installing the tunnel — `yutani tunnel
+install` refuses a `target/debug/yutani` and says so:
+
+```bash
+cargo build --release
+sudo install -o root -g root -m 0755 target/release/yutani /usr/local/bin/yutani
+/usr/local/bin/yutani tunnel install --dry-run ~/Downloads/EVE-UK-455.conf   # no root: check what it would write
+```
+
 ```bash
 yutani tunnel install ~/Downloads/EVE-UK-455.conf          # password prompt; then delete the Downloads copy
 yutani tunnel connect && sleep 3 && yutani tunnel status   # connected: true, handshake_age_s small
 curl -s https://ifconfig.me; echo                          # home IP
 systemd-run --user --scope --quiet --slice=yutani-eve.slice curl -s https://ifconfig.me; echo    # London IP
-systemd-run --user --scope --quiet --slice=yutani-eve.slice sh -c 'cat /etc/resolv.conf >/dev/null; getent hosts ifconfig.me'   # resolves (via 10.2.0.1)
-sudo nft list table inet yutani | grep counter             # drop counter should stay ~0 during normal use
+sudo nft list table inet yutani                            # the three chains, as generated; drop counter ~0 in normal use
+ip rule show                                               # fwmark 0x59 -> 51820 (prio 1000), from 10.2.0.2 -> 51820 (prio 1001)
 yutani tunnel disconnect && systemd-run --user --scope --quiet --slice=yutani-eve.slice curl -s https://ifconfig.me; echo   # home IP again
 ```
+
+**DNS check — do not use `dig`.** `dig` speaks DNS directly and therefore
+goes through the DNAT, so it passes even while the real leak is open. The
+game uses glibc's `getaddrinfo`, which on this machine talks to
+`systemd-resolved` over a unix socket and emits no IP packet from the cgroup
+at all (spec §2, "Known gap"). Check that path instead, with
+`sudo resolvectl monitor` (or `journalctl -u systemd-resolved -f`) running in
+another terminal so you can see what resolved actually sent upstream:
+
+```bash
+systemd-run --user --scope --quiet --slice=yutani-eve.slice getent hosts whoami.akamai.net
+resolvectl query whoami.akamai.net
+```
+
+Expect the lookup to succeed and resolved to have queried over the *normal*
+route — that is the known gap, not a regression. Record what you observed.
 Kill-switch check: `yutani tunnel connect`, then `sudo ip link set yutani0 down` (simulating a dead tunnel) → the slice `curl` must time out (`curl -m 5 …` exit 28) while plain `curl` works; `sudo ip link set yutani0 up` restores. Then EVE: set the Steam launch option to `PROTON_ENABLE_WAYLAND=1 yutani launch -- %command%`, start EVE, log in; `yutani status` shows the client and `tx_bytes`/`rx_bytes` climbing; `journalctl -u yutani-tunnel -n 20` clean.
 
 - [ ] **Step 2: Spec status**

@@ -35,8 +35,12 @@ pub fn nft_ruleset(uid: u32, dns: Option<Ipv4Addr>) -> String {
         s.push_str(
             "    chain dns {\n        type nat hook output priority dstnat; policy accept;\n",
         );
+        // `meta nfproto ipv4` first: this is an `inet` table, so the chain
+        // also sees IPv6 packets, and `dnat ip to` is an IPv4-only statement.
+        // Without the guard nft is being asked to rewrite a v6 packet to a v4
+        // address — the rule is at best skipped and at worst an error.
         s.push_str(&format!(
-            "        {m} meta l4proto {{ tcp, udp }} th dport 53 dnat ip to {dns}\n    }}\n"
+            "        {m} meta nfproto ipv4 meta l4proto {{ tcp, udp }} th dport 53 dnat ip to {dns}\n    }}\n"
         ));
     }
     s.push_str(
@@ -129,7 +133,7 @@ mod tests {
              \x20   }\n\
              \x20   chain dns {\n\
              \x20       type nat hook output priority dstnat; policy accept;\n\
-             \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" meta l4proto { tcp, udp } th dport 53 dnat ip to 10.2.0.1\n\
+             \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" meta nfproto ipv4 meta l4proto { tcp, udp } th dport 53 dnat ip to 10.2.0.1\n\
              \x20   }\n\
              \x20   chain killswitch {\n\
              \x20       type filter hook output priority filter; policy accept;\n\

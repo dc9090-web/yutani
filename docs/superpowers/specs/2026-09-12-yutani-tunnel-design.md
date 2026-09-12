@@ -33,6 +33,26 @@ distributions without systemd, nftables and iproute2.
   `AllowedIPs = 0.0.0.0/0, ::/0`, `Endpoint = 198.51.100.10:51820`,
   `PersistentKeepalive = 25`. Comments carry the server label (`# UK#455`).
 
+**Known gap (2026-09-12): the NSS/resolved DNS path.** `/etc/nsswitch.conf`
+has `hosts: … resolve [!UNAVAIL=return] …`, so glibc's `getaddrinfo` does
+not send a DNS packet at all: it talks to `systemd-resolved` over a unix
+socket. No IP packet leaves the EVE cgroup, so neither the DNAT in the `dns`
+chain nor the kill-switch in the `killswitch` chain ever sees it. `resolved`
+then queries upstream from *its own* cgroup, unmarked, over the normal
+route — outside the tunnel. So while the tunnel is up, EVE's name lookups
+still leak to the machine's configured resolver, and while the tunnel is
+meant to be up but is broken, they still succeed instead of being blocked.
+Programs that speak DNS directly (`dig`, `nslookup`, Wine's own resolver if
+it bypasses NSS) do go through the DNAT and are unaffected by this gap —
+which is exactly why the acceptance check in §10 must not use `dig`.
+
+Planned remedy (follow-up task, not in plan A): either run each launched
+command in a mount namespace with an `nsswitch.conf` that has no `resolve`
+entry (so glibc falls back to `dns` and sends real packets the DNAT can
+catch), or give `yutani0` a per-link DNS in resolved and route the EVE
+cgroup's lookups to it. Until one of those lands, treat EVE's DNS as
+untunnelled.
+
 ## 3. Architecture
 
 ```
@@ -101,7 +121,7 @@ table inet yutani {
     }
     chain dns {
         type nat hook output priority dstnat; policy accept;
-        socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" meta l4proto { tcp, udp } th dport 53 dnat ip to 10.2.0.1
+        socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" meta nfproto ipv4 meta l4proto { tcp, udp } th dport 53 dnat ip to 10.2.0.1
     }
     chain killswitch {
         type filter hook output priority filter; policy accept;
@@ -114,7 +134,9 @@ table inet yutani {
    (`level 5` = number of path components; the path is built from the uid.
    Systemd nests `yutani-eve.slice` under `yutani.slice` because of the
    dash, hence five components. `meta nfproto ipv6` from the cgroup falls
-   under the last rule since v6 never routes via `yutani0`.) The encrypted
+   under the last rule since v6 never routes via `yutani0`. The DNS rule
+   carries `meta nfproto ipv4` because this is an `inet` table — the chain
+   also sees v6 packets and `dnat ip to` is an IPv4-only statement.) The encrypted
    UDP to the endpoint is emitted
    by the kernel's wg device, not from a cgroup socket, so it is unaffected.
 
@@ -147,9 +169,13 @@ Runs `pkexec <abs yutani> tunnel install-root --conf <abs conf> --uid <uid>
 1. Parses and validates the conf (exactly one `[Interface]` with
    `PrivateKey` and one IPv4 `Address`; one `[Peer]` with `PublicKey`,
    `Endpoint`, `AllowedIPs`); refuses anything else with a clear message.
-2. Writes `/etc/yutani/tunnel.conf` (dir 0755, file 0600 root:root) — a
+2. Writes `/etc/yutani/tunnel.conf` (dir 0700, file 0600 root:root) — a
    verbatim copy plus a `# yutani: label = UK#455` line derived from the
-   peer comment or the file name.
+   peer comment or the file name. The directory's mode is set explicitly
+   after creating it: `pkexec` does not reset the caller's umask, so
+   `create_dir_all` alone would give whatever mode that umask allows. An
+   *existing* `/etc/yutani` is verified root-owned and not group- or
+   world-writable, and refused otherwise.
 3. Writes `/etc/systemd/system/yutani-tunnel.service`:
    ```
    [Unit]
@@ -159,13 +185,20 @@ Runs `pkexec <abs yutani> tunnel install-root --conf <abs conf> --uid <uid>
    [Service]
    Type=simple
    ExecStart=<exe> tunnel run
+   Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+   RuntimeDirectory=yutani
+   RuntimeDirectoryMode=0755
    KillSignal=SIGTERM
    TimeoutStopSec=10
    Restart=no
    [Install]
    WantedBy=multi-user.target
    ```
-   (not enabled; started on demand.)
+   (not enabled; started on demand. `RuntimeDirectory=yutani` gives the
+   worker `/run/yutani` for `tunnel.json` and the transient `wg.conf`, and
+   systemd removes it on stop. `Environment=PATH=…` is explicit because
+   systemd's default PATH for system units does not include `/usr/sbin`,
+   where `ip`, `wg`, `nft` and `sysctl` live on some distributions.)
 4. Writes `/etc/polkit-1/rules.d/50-yutani-tunnel.rules`:
    ```js
    polkit.addRule(function(action, subject) {
@@ -184,9 +217,26 @@ Runs `pkexec <abs yutani> tunnel install-root --conf <abs conf> --uid <uid>
 `yutani tunnel uninstall` → `pkexec … tunnel uninstall-root`: stops the
 unit if active, removes the three files, `daemon-reload`.
 
-The `<exe>` path is whatever binary ran `install` (dev: `target/debug/
-yutani`); re-run `install` after moving the binary. `install` is
-idempotent.
+**The `<exe>` must be root-owned and not writable by group or others**, and
+so must every directory above it — `install-root` canonicalises the path and
+refuses otherwise, before writing anything, and the user side checks the
+same thing *before* the `pkexec` prompt so no password is wasted. The unit
+runs that binary as root and the polkit rule below lets the user start it
+without a password, so a binary the user can rewrite (`target/debug/yutani`,
+owned by the developer) would be passwordless root for anything running as
+that user.
+
+Dev workflow, therefore:
+
+```bash
+cargo build --release
+sudo install -o root -g root -m 0755 target/release/yutani /usr/local/bin/yutani
+/usr/local/bin/yutani tunnel install ~/Downloads/EVE-UK-455.conf
+```
+
+Re-run both steps after rebuilding. `install` is idempotent. `--dry-run`
+needs no root and reports the trust check (and the uid↔user check) alongside
+everything it would write, so the refusal is visible before the prompt.
 
 ## 6. User side
 
@@ -265,6 +315,25 @@ the already-running client without a second adoption.
   `ip`, `wg`, `nft`, `sysctl` with arguments it generated.
 - `install-root` refuses relative paths and confs it cannot fully parse;
   it never executes anything from the conf.
+- **Invariant: nothing the user can write is executed or read by root.**
+  The unit's `ExecStart` binary and every directory above it must be
+  root-owned and not group/world-writable (§5), and `/etc/yutani` is held to
+  the same standard. The one deliberate crossing is the conf the user hands
+  to `install`: it is read once, at install time, parsed and validated, and
+  copied under root's control — never executed, and never read again by the
+  running worker, which reads only `/etc/yutani/tunnel.conf`.
+- `install-root` also resolves `--uid` to a user name itself (`id -un`) and
+  refuses a `--user` that disagrees: the polkit rule names a user while the
+  nft rules key on a uid, and those must be the same person.
+- Kill-switch blind spot: the `killswitch` chain matches
+  `socket cgroupv2`, which needs a socket to attribute the packet to. A few
+  packets the kernel emits without one — a late RST, retransmissions from a
+  TIME_WAIT socket after the process is gone — are therefore not matched and
+  can leave by the normal route. They carry no payload and reveal only that
+  an already-known connection existed; accepted residual.
+- DNS: see the known gap in §2 — with `resolve` in `nsswitch.conf`, EVE's
+  `getaddrinfo` lookups never become IP packets from its cgroup, so neither
+  the DNAT nor the kill-switch applies to them.
 
 ## 10. Testing
 
@@ -278,8 +347,18 @@ Integration (Daniel, once): `yutani tunnel install ~/Downloads/EVE-UK-455.conf`
 → `yutani tunnel connect` → `curl --interface` is not enough (curl isn't in
 the cgroup) — instead `systemd-run --user --scope --slice=yutani-eve.slice
 curl -s https://ifconfig.me` must print the London IP and `curl` outside the
-slice must print the home IP; `… --slice=yutani-eve.slice dig +short
-whoami.akamai.net` must resolve via `10.2.0.1`; `yutani tunnel disconnect`
+slice must print the home IP. **DNS must not be checked with `dig`**: `dig`
+speaks DNS directly and so goes through the DNAT, while the game's
+`getaddrinfo` goes to `systemd-resolved` over a unix socket and does not
+(§2). Check the path EVE actually uses instead —
+`systemd-run --user --scope --quiet --slice=yutani-eve.slice getent hosts
+whoami.akamai.net` — together with `resolvectl query whoami.akamai.net`, and
+observe what resolved actually sent upstream with `sudo resolvectl monitor`
+(or `journalctl -u systemd-resolved -f`) in another terminal: if the query
+leaves from the host's normal route, the §2 gap is what you are looking at,
+not a regression. Also inspect the live ruleset and policy routing with
+`sudo nft list table inet yutani` and `ip rule show`. Then
+`yutani tunnel disconnect`
 → the slice `curl` prints the home IP again; with the unit up and the
 endpoint blocked (e.g. wrong endpoint in a scratch conf) the slice `curl`
 times out. Then EVE: launch through the wrapper, log in, check the applet

@@ -13,10 +13,13 @@ fn quote_exec(exe: &str) -> String {
     if exe.chars().any(|c| c.is_whitespace()) { format!("\"{exe}\"") } else { exe.to_string() }
 }
 
+/// `Environment=PATH=…` is explicit: systemd's default PATH for system
+/// units does not include `/usr/sbin`, where `ip`, `wg`, `nft` and `sysctl`
+/// live on some distributions, and the worker execs them by name.
 pub fn unit_text(exe: &str) -> String {
     format!(
         "[Unit]\nDescription=Yutani EVE tunnel (WireGuard, per-app routing)\nAfter=network-online.target\nWants=network-online.target\n\n\
-[Service]\nType=simple\nExecStart={} tunnel run\nRuntimeDirectory=yutani\nRuntimeDirectoryMode=0755\nKillSignal=SIGTERM\nTimeoutStopSec=10\nRestart=no\n\n\
+[Service]\nType=simple\nExecStart={} tunnel run\nEnvironment=PATH=/usr/sbin:/usr/bin:/sbin:/bin\nRuntimeDirectory=yutani\nRuntimeDirectoryMode=0755\nKillSignal=SIGTERM\nTimeoutStopSec=10\nRestart=no\n\n\
 [Install]\nWantedBy=multi-user.target\n",
         quote_exec(exe)
     )
@@ -314,6 +317,9 @@ mod tests {
         assert!(u.contains("[Unit]\nDescription=Yutani EVE tunnel (WireGuard, per-app routing)\n"));
         assert!(u.contains("After=network-online.target\nWants=network-online.target\n"));
         assert!(u.contains("[Service]\nType=simple\nExecStart=/opt/yutani/yutani tunnel run\n"));
+        // systemd's default PATH for system units has no /usr/sbin, where
+        // `ip`, `wg`, `nft` and `sysctl` live on some distributions.
+        assert!(u.contains("Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin\n"));
         assert!(u.contains("RuntimeDirectory=yutani\nRuntimeDirectoryMode=0755\n"));
         assert!(u.contains("KillSignal=SIGTERM\nTimeoutStopSec=10\nRestart=no\n"));
         assert!(u.contains("[Install]\nWantedBy=multi-user.target\n"));
