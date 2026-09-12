@@ -374,11 +374,11 @@ if the socket is absent it prints "yutani is not running" and exits 1.
   fps: 30,                   // 10 | 15 | 30 | 60
   active_border: None,        // None = COSMIC theme accent (focused-window outline colour)
   inactive_border: "#404040",
-  border_px: 2,
+  border_px: 0,                // 0 = no border (default since 2026-09-12); corners stay rounded
   show_names: true,
   zoom_factor: 1.0,          // 1.0 = no hover zoom
   corner_radius: 8,          // px, baked into the frame on the GPU
-  visibility: Always,        // Always | EveFocusedOnly
+  visibility: EveFocusedOnly, // Always | EveFocusedOnly (default since 2026-09-12: thumbnails only over EVE)
   hide_active: false,
   snap_grid: true,
   snap_edges: true,

@@ -65,6 +65,8 @@ pub struct Config {
     /// colour (the same colour the compositor outlines the focused window with).
     pub active_border: Option<String>,
     pub inactive_border: String,
+    /// Border width in logical px; 0 (default) draws no border at all —
+    /// corners are rounded in the frame itself.
     pub border_px: u32,
     pub show_names: bool,
     /// Hover zoom multiplier, 1.0–4.0 (1.0 = no hover zoom).
@@ -92,10 +94,10 @@ impl Default for Config {
             fps: 30,
             active_border: None,
             inactive_border: "#404040".to_string(),
-            border_px: 2,
+            border_px: 0,
             show_names: true,
             zoom_factor: 1.0,
-            visibility: Visibility::Always,
+            visibility: Visibility::EveFocusedOnly,
             hide_active: false,
             snap_grid: true,
             snap_edges: true,
@@ -211,7 +213,7 @@ mod tests {
         assert_eq!(c.fps, 30);
         assert_eq!(c.active_border, None);
         assert_eq!(c.inactive_border, "#404040");
-        assert_eq!(c.border_px, 2);
+        assert_eq!(c.border_px, 0);
         assert!(c.show_names);
     }
 
@@ -274,7 +276,7 @@ mod tests {
     fn plan2_defaults() {
         let c = Config::default();
         assert_eq!(c.zoom_factor, 1.0);
-        assert_eq!(c.visibility, Visibility::Always);
+        assert_eq!(c.visibility, Visibility::EveFocusedOnly);
         assert!(!c.hide_active);
         assert!(c.snap_grid);
         assert!(c.snap_edges);
