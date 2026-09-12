@@ -350,6 +350,9 @@ pub fn rename_named(from: &str, to: &str) -> Result<(), String> {
 pub enum SaveGate {
     /// Not poisoned: write normally.
     Proceed,
+    /// Was poisoned, but the file parses again (it was fixed, or deleted):
+    /// forget the poisoning — flag and one-time warning both — and write.
+    Unpoison,
     /// Poisoned and already warned about it: refuse without logging again.
     RefuseSilently,
     /// Poisoned and not yet warned: refuse, and this is the call that logs
@@ -403,11 +406,18 @@ impl Layout {
     /// Never overwrites a poisoned file (spec §10); warns about it exactly
     /// once, not on every add/remove event that would otherwise trigger a
     /// save.
-    pub fn save_gate(poisoned: bool, already_warned: bool) -> SaveGate {
-        match (poisoned, already_warned) {
-            (false, _) => SaveGate::Proceed,
-            (true, true) => SaveGate::RefuseSilently,
-            (true, false) => SaveGate::RefuseAndWarn,
+    ///
+    /// `readable_now` is the answer a fresh [`Layout::try_load`] gave —
+    /// `Some(true)` when it came back `Ok`, i.e. the file was fixed or
+    /// deleted by hand. Only worth asking while poisoned, hence the
+    /// `Option`: poisoning suspends saving until the file parses again, not
+    /// until the app restarts.
+    pub fn save_gate(poisoned: bool, already_warned: bool, readable_now: Option<bool>) -> SaveGate {
+        match (poisoned, readable_now, already_warned) {
+            (false, ..) => SaveGate::Proceed,
+            (true, Some(true), _) => SaveGate::Unpoison,
+            (true, _, true) => SaveGate::RefuseSilently,
+            (true, _, false) => SaveGate::RefuseAndWarn,
         }
     }
 
@@ -546,10 +556,24 @@ mod tests {
 
     #[test]
     fn save_gate_writes_normally_unless_poisoned_and_warns_at_most_once() {
-        assert_eq!(Layout::save_gate(false, false), SaveGate::Proceed);
-        assert_eq!(Layout::save_gate(false, true), SaveGate::Proceed);
-        assert_eq!(Layout::save_gate(true, false), SaveGate::RefuseAndWarn);
-        assert_eq!(Layout::save_gate(true, true), SaveGate::RefuseSilently);
+        assert_eq!(Layout::save_gate(false, false, None), SaveGate::Proceed);
+        assert_eq!(Layout::save_gate(false, true, None), SaveGate::Proceed);
+        assert_eq!(Layout::save_gate(true, false, Some(false)), SaveGate::RefuseAndWarn);
+        assert_eq!(Layout::save_gate(true, true, Some(false)), SaveGate::RefuseSilently);
+    }
+
+    /// A poisoned `current.ron` must not suspend auto-save for the rest of
+    /// the session: fixing (or deleting) the file resumes it, no restart.
+    #[test]
+    fn save_gate_resumes_once_current_ron_parses_again() {
+        assert_eq!(Layout::save_gate(true, false, Some(true)), SaveGate::Unpoison);
+        assert_eq!(Layout::save_gate(true, true, Some(true)), SaveGate::Unpoison);
+        // Not poisoned: the re-check is not worth making, and its answer
+        // changes nothing if one was made anyway.
+        assert_eq!(Layout::save_gate(false, true, Some(false)), SaveGate::Proceed);
+        // Poisoned and not re-checked: still refuse.
+        assert_eq!(Layout::save_gate(true, false, None), SaveGate::RefuseAndWarn);
+        assert_eq!(Layout::save_gate(true, true, None), SaveGate::RefuseSilently);
     }
 
     fn tmpdir(tag: &str) -> PathBuf {

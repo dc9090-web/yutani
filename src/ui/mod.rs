@@ -111,7 +111,8 @@ pub struct App {
     /// Set at startup when `current.ron` exists but failed to parse (spec
     /// §10). While true, `self.layout` is an empty stand-in and nothing may
     /// overwrite the file on disk — `save_current_layout` refuses every
-    /// write until it is fixed or deleted by hand and the app restarts.
+    /// write. It re-checks the file on each attempt, so fixing or deleting
+    /// it by hand resumes saving without a restart.
     pub layout_poisoned: bool,
     /// Whether the one-time "layout is poisoned, not saving" warning has
     /// already been logged, so repeated saves (one per client add/remove)
@@ -338,16 +339,27 @@ impl App {
         let (order, anchor) = layout::refresh_order(&live, &self.layout.order, &self.layout.thumbs);
         self.layout.order = order;
         self.layout.new_client_anchor = anchor;
-        match Layout::save_gate(self.layout_poisoned, self.layout_poison_warned) {
+        // Only worth a stat+parse while we believe the file is poisoned;
+        // a hand that fixed (or deleted) it must not have to restart us.
+        let readable_now = self.layout_poisoned.then(|| Layout::try_load().is_ok());
+        match Layout::save_gate(self.layout_poisoned, self.layout_poison_warned, readable_now) {
             layout::SaveGate::RefuseAndWarn => {
                 tracing::warn!(
-                    "{} is unparseable; not overwriting it — fix or delete it by hand and restart",
+                    "{} is unparseable; not overwriting it — fix or delete it by hand and saving resumes",
                     layout::current_path().display()
                 );
                 self.layout_poison_warned = true;
                 return;
             }
             layout::SaveGate::RefuseSilently => return,
+            layout::SaveGate::Unpoison => {
+                tracing::info!("{} parses again; resuming layout saves", layout::current_path().display());
+                self.layout_poisoned = false;
+                self.layout_poison_warned = false;
+                if let Some(state) = self.settings.as_mut() {
+                    state.layout_error = None;
+                }
+            }
             layout::SaveGate::Proceed => {}
         }
         if let Err(e) = self.layout.save() {
@@ -680,6 +692,9 @@ impl App {
             Ok(()) => {
                 self.layout_poisoned = false;
                 self.layout_poison_warned = false;
+                if let Some(state) = self.settings.as_mut() {
+                    state.layout_error = None;
+                }
             }
             // The write failed, so whatever was on disk is still there —
             // stay poisoned if we were.
@@ -1104,6 +1119,9 @@ impl App {
         if let Some(state) = self.settings.as_mut() {
             match &msg {
                 S::Opened | S::Raise(None) | S::Recheck => {
+                    if settings::clears_note(&msg) {
+                        state.note = None;
+                    }
                     state.refresh();
                     return Task::none();
                 }
@@ -1124,6 +1142,10 @@ impl App {
             S::Page(entity) => {
                 if let Some(state) = self.settings.as_mut() {
                     state.pages.activate(*entity);
+                    // The note was about the page being left behind.
+                    if settings::clears_note(&msg) {
+                        state.note = None;
+                    }
                 }
                 return Task::none();
             }

@@ -84,6 +84,15 @@ pub fn parse_shortcut_key(text: &str, other: &str) -> Result<String, String> {
     Ok(key.to_string())
 }
 
+/// Whether the *Install shortcuts* / *Uninstall shortcuts* buttons are
+/// pressable. Both write (or remove) bindings built from `config.shortcuts`,
+/// which only ever holds accepted values — so while a key field is refused,
+/// pressing Install would install a binding other than the one on screen.
+/// Disabled until both fields parse.
+pub fn install_enabled(next_field: &str, prev_field: &str) -> bool {
+    parse_shortcut_key(next_field, prev_field).is_ok() && parse_shortcut_key(prev_field, next_field).is_ok()
+}
+
 /// Everything the settings window owns. `None` on `App` while it is closed.
 pub struct State {
     pub window: SurfaceId,
@@ -106,6 +115,10 @@ pub struct State {
     pub prev_field: String,
     /// One line of feedback under the page.
     pub note: Option<String>,
+    /// Set when `current.ron` exists but does not parse: auto-save is
+    /// suspended until it does (spec §10), so every page says so and the
+    /// Layouts page shows the reason.
+    pub layout_error: Option<String>,
 }
 
 impl State {
@@ -125,16 +138,18 @@ impl State {
             next_field: config.shortcuts.next.clone(),
             prev_field: config.shortcuts.prev.clone(),
             note: None,
+            layout_error: None,
         };
         state.refresh();
         state
     }
 
-    /// Re-read what lives outside `Config`: the saved layout names and
-    /// whether `config.ron` currently parses.
+    /// Re-read what lives outside `Config`: the saved layout names, whether
+    /// `config.ron` currently parses, and whether `current.ron` does.
     pub fn refresh(&mut self) {
         self.layouts = layout::list_names();
         self.refresh_from(&config_path());
+        self.refresh_layout_from(&layout::current_path());
     }
 
     /// The "does `config.ron` parse?" half of [`State::refresh`], against an
@@ -143,6 +158,12 @@ impl State {
     /// without a real `~/.config`.
     pub fn refresh_from(&mut self, config: &Path) {
         self.config_error = Config::try_load_from(config).err();
+    }
+
+    /// The same seam for `current.ron`. A missing file is not an error — it
+    /// is simply the state before the first save.
+    pub fn refresh_layout_from(&mut self, current: &Path) {
+        self.layout_error = layout::Layout::try_load_from(current).err();
     }
 }
 
@@ -240,6 +261,14 @@ pub fn is_live_only(msg: &Msg) -> bool {
     matches!(msg, Msg::ThumbWidth(_) | Msg::Zoom(_))
 }
 
+/// True for the messages that make the note line stale: a page the note
+/// was about is going away, or the files it was about have just been
+/// re-read. (A config field clears the note too, but through
+/// `apply_config_field`'s answer rather than this predicate.)
+pub fn clears_note(msg: &Msg) -> bool {
+    matches!(msg, Msg::Page(_) | Msg::Recheck)
+}
+
 /// Apply one settings change to `config`. `Ok(true)` = the config changed
 /// and must be applied live and written; `Ok(false)` = the message was not
 /// a config field; `Err` = a message for the note line, nothing changed.
@@ -291,7 +320,15 @@ pub fn view<'a>(state: &'a State, config: &'a Config, focused: bool) -> Element<
         (Page::Display, None) => display_page(state, config),
         (Page::Behavior, None) => behavior_page(state, config),
     };
-    let note: Element<'a, Msg> = match (&state.note, &state.config_error) {
+    let mut notes: Vec<Element<'a, Msg>> = Vec::new();
+    // A suspended auto-save is worth saying on every page, not only on the
+    // Layouts one that explains it: the user is about to drag a thumbnail.
+    if state.layout_error.is_some() {
+        notes.push(
+            widget::text::caption("current.ron cannot be read; thumbnail positions are not being saved.").into(),
+        );
+    }
+    notes.push(match (&state.note, &state.config_error) {
         (Some(note), _) => widget::text::caption(note.as_str()).into(),
         // Nothing is written while the file cannot be read, so the usual
         // "changes are written to …" line would be a lie.
@@ -304,7 +341,8 @@ pub fn view<'a>(state: &'a State, config: &'a Config, focused: bool) -> Element<
              Comments and unknown keys in that file are not preserved.",
         )
         .into(),
-    };
+    });
+    let note: Element<'a, Msg> = widget::column::with_children(notes).spacing(4).into();
     // Three pages now, the longest of which does not fit 700 px.
     let scrolled: Element<'a, Msg> = widget::scrollable(body).height(Length::Fill).into();
     let tabs: Element<'a, Msg> =
@@ -432,9 +470,14 @@ fn behavior_page<'a>(state: &'a State, config: &'a Config) -> Element<'a, Msg> {
         "Previous client key",
         widget::text_input("Left", state.prev_field.as_str()).on_input(Msg::PrevKey).width(Length::Fixed(160.0)),
     );
+    let pressable = install_enabled(&state.next_field, &state.prev_field);
     let buttons = widget::settings::item_row(vec![
-        widget::button::standard("Install shortcuts").on_press(Msg::InstallShortcuts).into(),
-        widget::button::destructive("Uninstall shortcuts").on_press(Msg::UninstallShortcuts).into(),
+        widget::button::standard("Install shortcuts")
+            .on_press_maybe(pressable.then_some(Msg::InstallShortcuts))
+            .into(),
+        widget::button::destructive("Uninstall shortcuts")
+            .on_press_maybe(pressable.then_some(Msg::UninstallShortcuts))
+            .into(),
     ]);
     widget::settings::view_column(vec![
         widget::settings::section().title("Arrangement").add(mode).add(edge).add(fps).into(),
@@ -453,6 +496,21 @@ fn behavior_page<'a>(state: &'a State, config: &'a Config) -> Element<'a, Msg> {
 
 fn layouts_page(state: &State) -> Element<'_, Msg> {
     let named = !state.name_field.trim().is_empty();
+    // Not fatal to this page — a named layout is a different file — but the
+    // arrangement being saved under that name is the in-memory one, and the
+    // auto-save behind it is suspended until `current.ron` parses again.
+    let broken_layout = state.layout_error.as_ref().map(|error| {
+        widget::settings::section()
+            .title("current.ron cannot be read")
+            .add(widget::text::body(error.as_str()))
+            .add(widget::text::body(
+                "Thumbnail positions are not being saved: the file is never overwritten while it cannot be read. \
+                 Fix or delete it and saving resumes by itself — press Re-check to confirm.",
+            ))
+            .add(widget::settings::item_row(vec![
+                widget::button::standard("Re-check").on_press(Msg::Recheck).into(),
+            ]))
+    });
     let mut saved = widget::settings::section().title("Saved layouts");
     if state.layouts.is_empty() {
         saved = saved.add(widget::text::body(
@@ -477,16 +535,19 @@ fn layouts_page(state: &State) -> Element<'_, Msg> {
             .into(),
         widget::button::suggested("Save current as…").on_press_maybe(named.then_some(Msg::SaveAs)).into(),
     ]));
-    widget::settings::view_column(vec![
-        saved.into(),
-        save.into(),
+    let mut rows: Vec<Element<'_, Msg>> = Vec::new();
+    rows.extend(broken_layout.map(Into::into));
+    rows.push(saved.into());
+    rows.push(save.into());
+    rows.push(
         widget::text::caption(
             "Rename uses the name typed in the field. Applying a layout copies it to current.ron and moves the \
-             thumbnails; a layout that names a disconnected monitor lands on the primary one.",
+             thumbnails; a layout that names a disconnected monitor lands on the primary one — and it replaces an \
+             unreadable current.ron, because asking for it is asking for that.",
         )
         .into(),
-    ])
-    .into()
+    );
+    widget::settings::view_column(rows).into()
 }
 
 #[cfg(test)]
@@ -507,7 +568,77 @@ mod tests {
             next_field: String::new(),
             prev_field: String::new(),
             note: None,
+            layout_error: None,
         }
+    }
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("yutani-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The layout warning is whatever `current.ron` says *now*: a file the
+    /// user fixed (or deleted) by hand stops the warning, because saving
+    /// resumes at the same moment.
+    #[test]
+    fn the_layout_warning_reads_the_current_ron_it_is_given() {
+        let dir = tmpdir("settings-layout-error");
+        let path = dir.join("current.ron");
+        let mut state = test_state();
+
+        // No file yet: nothing is wrong, positions will be saved.
+        state.refresh_layout_from(&path);
+        assert_eq!(state.layout_error, None);
+
+        // It parses.
+        layout::Layout::default().save_to(&path).unwrap();
+        state.refresh_layout_from(&path);
+        assert_eq!(state.layout_error, None);
+
+        // Hand-edited into something unparseable.
+        std::fs::write(&path, "(thumbs: ").unwrap();
+        state.refresh_layout_from(&path);
+        assert!(state.layout_error.as_deref().unwrap().contains("cannot parse"));
+
+        // Deleted: back to "nothing is wrong".
+        std::fs::remove_file(&path).unwrap();
+        state.refresh_layout_from(&path);
+        assert_eq!(state.layout_error, None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Install would write `config.shortcuts`, not what is in the fields, so
+    /// pressing it while a field is refused would install a binding the
+    /// window is not showing. The buttons are disabled instead.
+    #[test]
+    fn the_shortcut_buttons_are_disabled_while_either_key_field_is_refused() {
+        assert!(install_enabled("Right", "Left"));
+        assert!(install_enabled("  Tab  ", "Left"));
+        assert!(!install_enabled("", "Left"));
+        assert!(!install_enabled("Right", ""));
+        assert!(!install_enabled("Rihgt", "Left"));
+        assert!(!install_enabled("Right", "Lfet"));
+        // The two fields naming the same key is refused from either side.
+        assert!(!install_enabled("Left", "left"));
+        assert!(!install_enabled("3", "Left"));
+    }
+
+    /// A note left by an earlier action is about the page that is going
+    /// away, or about a file that has just been re-read: either way it is
+    /// stale and must not linger.
+    #[test]
+    fn switching_page_or_rechecking_drops_a_stale_note() {
+        let mut state = test_state();
+        let mut entity = None;
+        state.pages.insert().text("Display").data(Page::Display).with_id(|e| entity = Some(e));
+        assert!(clears_note(&Msg::Page(entity.unwrap())));
+        assert!(clears_note(&Msg::Recheck));
+        assert!(!clears_note(&Msg::SaveAs));
+        assert!(!clears_note(&Msg::InstallShortcuts));
+        assert!(!clears_note(&Msg::Commit));
     }
 
     #[test]
