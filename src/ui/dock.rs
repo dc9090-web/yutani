@@ -9,7 +9,7 @@ use cosmic::Task;
 use cosmic::cctk::wayland_client::protocol::wl_output::WlOutput;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::set_margin;
 
-use super::{App, Msg, Output, rules};
+use super::{App, Msg, Output};
 use crate::backend::Handle;
 use crate::model::config::Edge;
 
@@ -49,11 +49,9 @@ pub fn layout(edge: Edge, output: (i32, i32), sizes: &[(u32, u32)], gap: i32, in
 impl App {
     /// Dock mode: the clients on `output` that have a surface, in dock order.
     pub(super) fn dock_order_for(&self, output: &WlOutput) -> Vec<Handle> {
-        let shown = self
-            .clients
-            .iter()
-            .filter(|(_, c)| c.surface.is_some() && self.output_for(&c.info).as_ref() == Some(output));
-        rules::dock_order(shown.map(|(h, c)| (h, c.info.login.label())))
+        self.ordered(super::Mode::Dock, |h, c| {
+            c.surface.is_some() && self.output_for_thumb(h).as_ref() == Some(output)
+        })
     }
 
     /// Where each of `output`'s docked surfaces goes, in dock order, at its
@@ -69,7 +67,7 @@ impl App {
     /// `client.surface` is already set (so the layout counts it).
     pub(super) fn dock_position_of(&self, handle: &Handle) -> (i32, i32) {
         let output = self
-            .output_for(&self.clients[handle].info)
+            .output_for_thumb(handle)
             .and_then(|o| self.outputs.iter().find(|k| k.handle == o));
         output
             .and_then(|o| self.dock_positions_for(o).into_iter().find(|(h, _)| h == handle))

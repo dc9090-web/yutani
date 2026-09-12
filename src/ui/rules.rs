@@ -1,7 +1,6 @@
 //! Pure decision rules for the UI, kept free of iced/Wayland types so they
 //! can be unit-tested.
 
-use crate::backend::Handle;
 use crate::model::config::{Mode, Visibility};
 use crate::model::layout::ThumbPos;
 
@@ -47,13 +46,6 @@ pub fn capture_transition(show: bool, paused: bool) -> Option<bool /* pause? */>
     if show == paused { Some(!show) } else { None }
 }
 
-/// Dock order: by label, case-insensitive, stable for equal labels.
-pub fn dock_order<'a>(labels: impl Iterator<Item = (&'a Handle, &'a str)>) -> Vec<Handle> {
-    let mut v: Vec<(&Handle, String)> = labels.map(|(h, l)| (h, l.to_lowercase())).collect();
-    v.sort_by(|a, b| a.1.cmp(&b.1));
-    v.into_iter().map(|(h, _)| h.clone()).collect()
-}
-
 /// What `focus_order` needs to know about one client.
 pub struct FocusItem<H> {
     pub handle: H,
@@ -64,11 +56,22 @@ pub struct FocusItem<H> {
     pub position: (i32, i32),
 }
 
-/// Layout order used by `focus <n>`, `next` and `prev` (spec §7): dock
-/// order by label; floating by (output, y, x). Stable for ties.
-pub fn focus_order<H: Clone>(mode: Mode, mut items: Vec<FocusItem<H>>) -> Vec<H> {
+/// Rank used for dock placement, `focus <n>` and the `order` list saved in
+/// `current.ron` (spec §7 and §9): a character the layout's `order` names
+/// ranks by its place in that list; anyone else follows, by label,
+/// case-insensitively. One comparator, so the dock arrangement and the
+/// focus order can never disagree.
+pub fn dock_rank(order: &[String], label: &str) -> (usize, String) {
+    let index = order.iter().position(|n| n.eq_ignore_ascii_case(label)).unwrap_or(order.len());
+    (index, label.to_lowercase())
+}
+
+/// Layout order used by `focus <n>`, `next`, `prev` and the dock (spec
+/// §7): dock mode by `dock_rank`; floating by (output, y, x). Stable for
+/// ties, so equal ranks keep their existing relative order.
+pub fn focus_order<H>(mode: Mode, order: &[String], mut items: Vec<FocusItem<H>>) -> Vec<H> {
     match mode {
-        Mode::Dock => items.sort_by_key(|i| i.label.to_lowercase()),
+        Mode::Dock => items.sort_by(|a, b| dock_rank(order, &a.label).cmp(&dock_rank(order, &b.label))),
         Mode::Floating => items.sort_by(|a, b| {
             (a.output.as_str(), a.position.1, a.position.0).cmp(&(b.output.as_str(), b.position.1, b.position.0))
         }),
@@ -134,20 +137,50 @@ mod tests {
     }
 
     #[test]
-    fn dock_focus_order_is_by_label_case_insensitive_and_stable() {
-        let items = vec![item(1, "kel", "DP-1", 0, 0), item(2, "Aria", "DP-1", 0, 0), item(3, "Kel", "DP-2", 0, 0)];
-        assert_eq!(focus_order(Mode::Dock, items), vec![2, 1, 3]);
+    fn dock_rank_matches_by_character_name_case_insensitively() {
+        let order = ["Aria Vex".to_string()];
+        assert_eq!(dock_rank(&order, "aria vex"), (0, "aria vex".to_string()));
+        assert_eq!(dock_rank(&order, "Kel"), (1, "kel".to_string()));
+        assert_eq!(dock_rank(&[], "Kel"), (0, "kel".to_string()));
     }
 
     #[test]
-    fn floating_focus_order_is_output_then_row_then_column() {
+    fn dock_order_is_by_label_when_the_layout_records_no_order() {
+        let items = vec![item(1, "kel", "DP-1", 0, 0), item(2, "Aria", "DP-1", 0, 0), item(3, "Kel", "DP-2", 0, 0)];
+        assert_eq!(focus_order(Mode::Dock, &[], items), vec![2, 1, 3]);
+    }
+
+    #[test]
+    fn a_recorded_order_comes_first_and_the_rest_follow_by_label() {
+        let order = ["Kel".to_string(), "Zoe".to_string()];
+        let items = vec![
+            item(1, "Aria", "DP-1", 0, 0),
+            item(2, "Zoe", "DP-1", 0, 0),
+            item(3, "Kel", "DP-1", 0, 0),
+            item(4, "bob", "DP-1", 0, 0),
+        ];
+        assert_eq!(focus_order(Mode::Dock, &order, items), vec![3, 2, 1, 4]);
+    }
+
+    #[test]
+    fn floating_focus_order_is_output_then_row_then_column_and_ignores_the_recorded_order() {
+        let order = ["z".to_string()];
         let items = vec![
             item(1, "z", "DP-2", 10, 10),
             item(2, "y", "DP-1", 500, 40),
             item(3, "x", "DP-1", 40, 40),
             item(4, "w", "DP-1", 40, 400),
         ];
-        assert_eq!(focus_order(Mode::Floating, items), vec![3, 2, 4, 1]);
+        assert_eq!(focus_order(Mode::Floating, &order, items), vec![3, 2, 4, 1]);
+    }
+
+    #[test]
+    fn a_name_the_order_lists_but_nobody_is_playing_does_not_disturb_the_rest() {
+        // A logged-out character keeps its slot in `order`; the live ones
+        // still sort among themselves in that same relative order.
+        let order = ["Zoe".to_string(), "Kel".to_string(), "Aria".to_string()];
+        let items = vec![item(1, "Aria", "DP-1", 0, 0), item(2, "Kel", "DP-1", 0, 0)];
+        assert_eq!(focus_order(Mode::Dock, &order, items), vec![2, 1]);
     }
 
     #[test]

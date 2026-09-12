@@ -265,22 +265,51 @@ impl App {
         Task::batch(tasks)
     }
 
-    /// Layout order of every known client (spec §7).
-    fn focus_order(&self) -> Vec<Handle> {
+    /// Layout order (spec §7) of every client for which `keep` is true,
+    /// honouring the layout's recorded `order` in dock mode.
+    fn ordered(&self, mode: Mode, keep: impl Fn(&Handle, &Client) -> bool) -> Vec<Handle> {
         let items = self
             .clients
             .iter()
+            .filter(|(h, c)| keep(h, c))
             .map(|(h, c)| rules::FocusItem {
                 handle: h.clone(),
                 label: c.info.login.label().to_string(),
-                output: self
-                    .output_for(&c.info)
-                    .and_then(|o| self.outputs.iter().find(|k| k.handle == o).map(|k| k.name.clone()))
-                    .unwrap_or_default(),
+                output: self.output_name_of(h).unwrap_or_default(),
                 position: c.position,
             })
             .collect();
-        rules::focus_order(self.config.mode, items)
+        rules::focus_order(mode, &self.layout.order, items)
+    }
+
+    /// Layout order of every known client (spec §7).
+    fn focus_order(&self) -> Vec<Handle> {
+        self.ordered(self.config.mode, |_, _| true)
+    }
+
+    /// Character names of every known client in layout order — the `order`
+    /// list `current.ron` records (spec §9).
+    fn layout_order_names(&self) -> Vec<String> {
+        self.focus_order()
+            .iter()
+            .filter_map(|h| match &self.clients.get(h)?.info.login {
+                Login::LoggedIn(name) => Some(name.clone()),
+                Login::LoggingIn => None,
+            })
+            .collect()
+    }
+
+    /// Write `current.ron` — spec §9 auto-saves it on every drag, pin or
+    /// order change — refreshing the recorded `order` and
+    /// `new_client_anchor` first.
+    fn save_current_layout(&mut self) {
+        let live = self.layout_order_names();
+        let order = layout::merge_order(&live, &self.layout.order, layout::MAX_ORDER);
+        self.layout.order = order;
+        self.layout.new_client_anchor = layout::derive_anchor(&self.layout.thumbs);
+        if let Err(e) = self.layout.save() {
+            tracing::warn!("cannot save layout: {e:#}");
+        }
     }
 
     fn active_client(&self) -> Option<Handle> {
@@ -391,17 +420,17 @@ impl App {
             .or_else(|| self.outputs.first().map(|o| o.handle.clone()))
     }
 
-    /// Next free slot: a row along the top, left to right, filling any gap
-    /// left by a removed client rather than always appending.
+    /// Where a thumbnail whose character is not known yet goes (spec §4):
+    /// the layout's `new_client_anchor`, then `STACK_STEP` px down-right
+    /// per occupied slot — occupied being any shown thumbnail **and** any
+    /// saved position, so a new client no longer lands on top of a
+    /// character's saved spot.
     fn next_position(&self) -> (i32, i32) {
-        let (w, _) = thumbnail::size(&self.config, None);
-        let taken: Vec<i32> = self
-            .clients
-            .values()
-            .filter(|c| c.surface.is_some())
-            .map(|c| c.position.0)
-            .collect();
-        (thumbnail::next_free_x(&taken, 40, w as i32 + 16), 40)
+        let anchor = &self.layout.new_client_anchor;
+        let mut taken: Vec<(i32, i32)> =
+            self.clients.values().filter(|c| c.surface.is_some()).map(|c| c.position).collect();
+        taken.extend(self.layout.thumbs.values().map(|t| (t.x, t.y)));
+        layout::stacked_position((anchor.x, anchor.y), &taken, layout::STACK_STEP)
     }
 
     /// Layer-surface size for `client`, zoomed if hovered.
@@ -432,7 +461,7 @@ impl App {
         if client.surface.is_some() || !self.should_show(client) {
             return Task::none();
         }
-        let Some(output) = self.output_for(&client.info) else {
+        let Some(output) = self.output_for_thumb(handle) else {
             tracing::debug!("no outputs yet; deferring surface");
             return Task::none();
         };
@@ -514,30 +543,53 @@ impl App {
         Rect { x: client.position.0, y: client.position.1, w: w as i32, h: h as i32 }
     }
 
-    fn output_name_of(&self, client: &Client) -> Option<String> {
+    /// The output this client's thumbnail belongs on. In floating mode the
+    /// layout decides: the character's saved connector, else the anchor's,
+    /// resolved against what is actually connected — an unplugged
+    /// connector falls back to the primary output at the same x/y (spec
+    /// §9). Otherwise (dock mode, or nothing saved) the output the
+    /// client's own window is on, else the first output we know of.
+    fn output_for_thumb(&self, handle: &Handle) -> Option<WlOutput> {
+        let client = self.clients.get(handle)?;
+        if self.config.mode == Mode::Floating {
+            let saved = match &client.info.login {
+                Login::LoggedIn(name) => self.layout.thumbs.get(name).map(|t| t.output.as_str()),
+                Login::LoggingIn => None,
+            };
+            let anchor = Some(self.layout.new_client_anchor.output.as_str()).filter(|o| !o.is_empty());
+            if let Some(wanted) = saved.or(anchor) {
+                let connected: Vec<String> = self.outputs.iter().map(|o| o.name.clone()).collect();
+                if let Some(resolved) = layout::resolve_output(wanted, &connected) {
+                    return self.outputs.iter().find(|o| o.name == resolved).map(|o| o.handle.clone());
+                }
+            }
+        }
         self.output_for(&client.info)
+    }
+
+    fn output_name_of(&self, handle: &Handle) -> Option<String> {
+        self.output_for_thumb(handle)
             .and_then(|o| self.outputs.iter().find(|k| k.handle == o).map(|k| k.name.clone()))
     }
 
     /// Remember this client's position (and pin state) under its character
-    /// name. Floating only: dock positions come from the layout.
+    /// name, then rewrite `current.ron`. Floating only: dock positions come
+    /// from the layout policy.
     fn persist_position(&mut self, handle: &Handle) {
         if self.config.mode == Mode::Dock {
             return;
         }
         let Some(client) = self.clients.get(handle) else { return };
-        let Login::LoggedIn(name) = &client.info.login else {
+        let Login::LoggedIn(name) = client.info.login.clone() else {
             tracing::debug!("position not saved: character name not resolved yet");
             return;
         };
-        let Some(output) = self.output_name_of(client) else { return };
-        self.layout.thumbs.insert(
-            name.clone(),
-            ThumbPos { output, x: client.position.0, y: client.position.1, pinned: client.pinned },
-        );
-        if let Err(e) = self.layout.save() {
-            tracing::warn!("cannot save layout: {e}");
-        }
+        let (position, pinned) = (client.position, client.pinned);
+        let Some(output) = self.output_name_of(handle) else { return };
+        self.layout
+            .thumbs
+            .insert(name, ThumbPos { output, x: position.0, y: position.1, pinned });
+        self.save_current_layout();
     }
 
     /// If we have a saved position for this character, move there. Floating
@@ -566,8 +618,7 @@ impl App {
     /// cleared on entering dock mode, so dock coordinates are never reused.
     /// Handles are visited in dock order so slot assignment is deterministic.
     fn refloat_surfaces(&mut self) -> Task<cosmic::Action<Msg>> {
-        let with_surface = self.clients.iter().filter(|(_, c)| c.surface.is_some());
-        let handles = rules::dock_order(with_surface.map(|(h, c)| (h, c.info.login.label())));
+        let handles = self.ordered(Mode::Dock, |_, c| c.surface.is_some());
         let mut tasks = Vec::new();
         for h in handles {
             let (position, pinned) = self.floating_position(&h);
@@ -792,10 +843,12 @@ impl App {
                 // reconcile every client's surface, not just this one's.
                 let reconciled = self.reconcile_surfaces();
                 if became_named {
-                    // A saved position must apply even if the surface was just
+                    // A new character name changes the layout order, and a
+                    // saved position must apply even if the surface was just
                     // created (or doesn't exist yet): `apply_saved_position`
                     // updates position/pinned regardless, and is a no-op on
                     // margin if there's no surface.
+                    self.save_current_layout();
                     Task::batch([reconciled, self.apply_saved_position(&handle)])
                 } else {
                     reconciled
@@ -804,6 +857,9 @@ impl App {
             Event::ClientRemoved(handle) => {
                 let task = self.destroy_surface(&handle);
                 self.clients.remove(&handle);
+                // The layout order changed; the saved position stays, so the
+                // character comes back to the same spot next launch.
+                self.save_current_layout();
                 // Dock mode: its neighbours close the gap.
                 Task::batch([task, self.relayout_dock()])
             }
