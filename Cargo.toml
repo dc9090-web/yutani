@@ -18,6 +18,8 @@ libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "a401af8b1c54a8
 calloop = { version = "0.14.4", features = ["executor"] }
 calloop-wayland-source = "0.4.1"
 gbm = "0.18.0"
+khronos-egl = { version = "6", features = ["dynamic"] }
+glow = "0.16"
 ksni = { version = "0.3", default-features = false, features = ["blocking", "tokio"] }
 futures-timer = "3"
 notify = "8"

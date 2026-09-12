@@ -6576,6 +6576,8 @@ dependencies = [
  "dirs",
  "futures-timer",
  "gbm",
+ "glow",
+ "khronos-egl",
  "ksni",
  "libcosmic",
  "notify",

@@ -46,6 +46,7 @@ mod buffer;
 mod capture;
 mod dmabuf;
 mod gbm_devices;
+pub mod gl;
 
 pub type Handle = ExtForeignToplevelHandleV1;
 
