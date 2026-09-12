@@ -358,7 +358,7 @@ if the socket is absent it prints "yutani is not running" and exits 1.
   thumb_width: 480,
   opacity: 1.0,
   fps: 30,                   // 10 | 15 | 30 | 60
-  active_border: "#ff8800",
+  active_border: None,        // None = COSMIC theme accent (focused-window outline colour)
   inactive_border: "#404040",
   border_px: 2,
   show_names: true,

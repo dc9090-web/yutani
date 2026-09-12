@@ -42,9 +42,12 @@ pub fn next_free_x(taken: &[i32], origin: i32, pitch: i32) -> i32 {
 }
 
 pub fn view<'a>(client: &'a Client, config: &Config) -> Element<'a, Msg> {
-    let border_hex = if client.info.activated { &config.active_border } else { &config.inactive_border };
-    let [r, g, b, a] = parse_color(border_hex).unwrap_or([1.0, 0.5, 0.0, 1.0]);
-    let border_color = cosmic::iced::Color { r, g, b, a };
+    // Active border: the configured colour, else the theme accent (what the
+    // compositor outlines the focused window with). Resolved inside the style
+    // closure because that is where the theme is available.
+    let active_override = client.info.activated.then(|| config.active_border.as_deref().and_then(parse_color)).flatten();
+    let inactive = parse_color(&config.inactive_border).unwrap_or([0.25, 0.25, 0.25, 1.0]);
+    let activated = client.info.activated;
     let border_px = config.border_px as f32;
 
     let image: Element<'a, Msg> = if client.unavailable {
@@ -61,7 +64,10 @@ pub fn view<'a>(client: &'a Client, config: &Config) -> Element<'a, Msg> {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .content_fit(ContentFit::Contain)
-                .alpha(config.opacity)
+                // cosmic-comp skips the rounded-corner clip for fully opaque
+                // subsurfaces (opaque fast path); 0.999 is indistinguishable
+                // from 1.0 and keeps the corners.
+                .alpha(if config.corner_radius > 0 { config.opacity.min(0.999) } else { config.opacity })
                 .transform(img.transform)
                 .into(),
             None => widget::container(widget::text("waiting for frame…").size(12))
@@ -105,9 +111,19 @@ pub fn view<'a>(client: &'a Client, config: &Config) -> Element<'a, Msg> {
     let framed = widget::container(stack)
         .width(Length::Fill)
         .height(Length::Fill)
-        .class(theme::Container::custom(move |_| widget::container::Style {
-            border: Border { color: border_color, width: border_px, radius: radius.into() },
-            ..Default::default()
+        .class(theme::Container::custom(move |theme| {
+            let [r, g, b, a] = match (activated, active_override) {
+                (true, Some(c)) => c,
+                (true, None) => {
+                    let accent = theme.cosmic().accent_color();
+                    [accent.red, accent.green, accent.blue, accent.alpha]
+                }
+                (false, _) => inactive,
+            };
+            widget::container::Style {
+                border: Border { color: cosmic::iced::Color { r, g, b, a }, width: border_px, radius: radius.into() },
+                ..Default::default()
+            }
         }));
 
     framed.into()

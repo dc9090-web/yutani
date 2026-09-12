@@ -38,8 +38,9 @@ pub struct Config {
     pub opacity: f32,
     /// Max capture rate: 10, 15, 30 or 60.
     pub fps: u32,
-    /// "#rrggbb" or "#rrggbbaa"
-    pub active_border: String,
+    /// "#rrggbb" or "#rrggbbaa"; `None` follows the COSMIC theme's accent
+    /// colour (the same colour the compositor outlines the focused window with).
+    pub active_border: Option<String>,
     pub inactive_border: String,
     pub border_px: u32,
     pub show_names: bool,
@@ -65,7 +66,7 @@ impl Default for Config {
             thumb_width: 480,
             opacity: 1.0,
             fps: 30,
-            active_border: "#ff8800".to_string(),
+            active_border: None,
             inactive_border: "#404040".to_string(),
             border_px: 2,
             show_names: true,
@@ -143,7 +144,7 @@ impl Config {
         check!(zoom_factor, |v: &f32| (1.0..=4.0).contains(v), "1.0..=4.0");
         check!(border_px, |v: &u32| *v <= 16, "0..=16");
         check!(corner_radius, |v: &u32| *v <= 64, "0..=64");
-        check!(active_border, |v: &String| parse_color(v).is_some(), "#rrggbb[aa]");
+        check!(active_border, |v: &Option<String>| v.as_deref().is_none_or(|h| parse_color(h).is_some()), "#rrggbb[aa] or absent");
         check!(inactive_border, |v: &String| parse_color(v).is_some(), "#rrggbb[aa]");
         if self.app_ids.is_empty() {
             tracing::warn!("config: app_ids is empty; using default");
@@ -181,7 +182,7 @@ mod tests {
         assert_eq!(c.thumb_width, 480);
         assert_eq!(c.opacity, 1.0);
         assert_eq!(c.fps, 30);
-        assert_eq!(c.active_border, "#ff8800");
+        assert_eq!(c.active_border, None);
         assert_eq!(c.inactive_border, "#404040");
         assert_eq!(c.border_px, 2);
         assert!(c.show_names);
@@ -259,7 +260,7 @@ mod tests {
             opacity: 7.0,
             fps: 17,
             zoom_factor: 0.2,
-            active_border: "nope".into(),
+            active_border: Some("nope".into()),
             border_px: 99,
             ..Config::default()
         }
