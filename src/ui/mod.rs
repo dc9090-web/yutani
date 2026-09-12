@@ -1079,7 +1079,19 @@ impl App {
         match &msg {
             S::Close => return cosmic::iced::window::close(window),
             S::Drag => return cosmic::iced::window::drag(window),
-            S::Raise(Some(token)) => return activation::activate(window, token.clone()),
+            S::Raise(Some(token)) => {
+                // A second `settings` request also re-reads what lives
+                // outside `Config` — the user may have fixed (or broken)
+                // `config.ron`, or saved a layout, since the window opened.
+                if let Some(state) = self.settings.as_mut() {
+                    state.refresh();
+                }
+                // Un-minimize first, then activate: a window the compositor
+                // minimised stays minimised if it is only activated. The
+                // same chain libcosmic's own `Action::Activate` does.
+                return cosmic::iced::window::minimize(window, false)
+                    .chain(activation::activate(window, token.clone()));
+            }
             _ => {}
         }
 
@@ -1092,8 +1104,46 @@ impl App {
                 }
                 S::ActiveBorder(text) => state.active_border_field = text.clone(),
                 S::InactiveBorder(text) => state.inactive_border_field = text.clone(),
+                S::NextKey(text) => state.next_field = text.clone(),
+                S::PrevKey(text) => state.prev_field = text.clone(),
+                S::Name(text) => {
+                    state.name_field = text.clone();
+                    return Task::none();
+                }
                 _ => {}
             }
+        }
+
+        // Pages and actions that are not config fields.
+        match &msg {
+            S::Page(entity) => {
+                if let Some(state) = self.settings.as_mut() {
+                    state.pages.activate(*entity);
+                }
+                return Task::none();
+            }
+            S::SaveAs => {
+                self.settings_save_as();
+                return Task::none();
+            }
+            S::Apply(name) => return self.settings_apply_layout(name.clone()),
+            S::Rename(from) => {
+                self.settings_rename_layout(from.clone());
+                return Task::none();
+            }
+            S::Delete(name) => {
+                self.settings_delete_layout(name.clone());
+                return Task::none();
+            }
+            S::InstallShortcuts => {
+                self.settings_shortcuts(true);
+                return Task::none();
+            }
+            S::UninstallShortcuts => {
+                self.settings_shortcuts(false);
+                return Task::none();
+            }
+            _ => {}
         }
 
         if matches!(msg, S::Commit) {
@@ -1109,7 +1159,12 @@ impl App {
                 self.settings_note(note);
                 Task::none()
             }
-            Ok(false) => Task::none(),
+            // Not a change — but a correction back to the previous valid
+            // value must still drop the note the bad one left behind.
+            Ok(false) => {
+                self.settings_note_clear();
+                Task::none()
+            }
             Ok(true) => {
                 self.settings_note_clear();
                 let task = self.apply_config(config);
@@ -1119,6 +1174,93 @@ impl App {
                 task
             }
         }
+    }
+
+    /// Layouts page: save the current arrangement under the typed name.
+    /// `current.ron` is refreshed first so the copy carries today's order
+    /// and anchor.
+    fn settings_save_as(&mut self) {
+        let typed = self.settings.as_ref().map(|s| s.name_field.clone()).unwrap_or_default();
+        // Checked before anything is written — including the `current.ron`
+        // refresh below, which is a file operation too.
+        let name = match layout::validate_name(&typed) {
+            Ok(name) => name,
+            Err(e) => return self.settings_note(e),
+        };
+        self.save_current_layout();
+        match self.layout.save_named(&name) {
+            Ok(()) => {
+                let note = format!("saved layout {name:?}");
+                if let Some(state) = self.settings.as_mut() {
+                    state.name_field.clear();
+                    state.layouts = layout::list_names();
+                    state.note = Some(note);
+                }
+            }
+            Err(e) => self.settings_note(e),
+        }
+    }
+
+    fn settings_apply_layout(&mut self, name: String) -> Task<cosmic::Action<Msg>> {
+        match self.apply_layout(&name) {
+            Ok(task) => {
+                self.settings_note(format!("applied layout {name:?}"));
+                task
+            }
+            Err(e) => {
+                self.settings_note(e);
+                Task::none()
+            }
+        }
+    }
+
+    fn settings_rename_layout(&mut self, from: String) {
+        let to = self.settings.as_ref().map(|s| s.name_field.clone()).unwrap_or_default();
+        match layout::rename_named(&from, &to) {
+            Ok(()) => {
+                let note = format!("renamed {:?} to {:?}", from, to.trim());
+                if let Some(state) = self.settings.as_mut() {
+                    state.name_field.clear();
+                    state.layouts = layout::list_names();
+                    state.note = Some(note);
+                }
+            }
+            Err(e) => self.settings_note(e),
+        }
+    }
+
+    fn settings_delete_layout(&mut self, name: String) {
+        match layout::delete_named(&name) {
+            Ok(()) => {
+                let note = format!("deleted layout {name:?}");
+                if let Some(state) = self.settings.as_mut() {
+                    state.layouts = layout::list_names();
+                    state.note = Some(note);
+                }
+            }
+            Err(e) => self.settings_note(e),
+        }
+    }
+
+    /// Behavior page: the *Install shortcuts* / *Uninstall shortcuts*
+    /// buttons of spec §6, over the same code path as
+    /// `yutani shortcuts install|uninstall`.
+    fn settings_shortcuts(&mut self, install: bool) {
+        let note = if install {
+            match crate::shortcuts::install(&self.config.shortcuts) {
+                Ok((installed, wanted)) if installed == wanted => format!("installed {installed} shortcuts"),
+                Ok((installed, wanted)) => {
+                    format!("installed {installed} of {wanted} shortcuts (the rest are bound by something else)")
+                }
+                Err(e) => format!("{e:#}"),
+            }
+        } else {
+            match crate::shortcuts::uninstall() {
+                Ok(n) => format!("removed {n} shortcuts"),
+                Err(e) => format!("{e:#}"),
+            }
+        };
+        self.settings_note(note);
     }
 
     fn settings_note(&mut self, note: String) {
@@ -1137,7 +1279,15 @@ impl App {
     /// unless the file on disk does not parse, in which case it is left
     /// exactly as the user wrote it (spec §9/§10).
     fn save_config(&mut self) {
-        if self.settings.as_ref().is_some_and(|s| s.config_error.is_some()) {
+        // The cached answer is up to a watcher debounce (200 ms) old, and
+        // this is the last moment before the file is overwritten: ask the
+        // file itself, and keep what it says on the window.
+        let error = Config::try_load().err();
+        let broken = error.is_some();
+        if let Some(state) = self.settings.as_mut() {
+            state.config_error = error;
+        }
+        if broken {
             return;
         }
         if let Err(e) = self.config.save() {

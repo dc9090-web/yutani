@@ -73,8 +73,8 @@ pub enum Msg {
 /// be), its own process group (so a signal aimed at the applet's process
 /// group — the panel's, at logout — does not also reach it), and reaped on
 /// a dedicated thread so a finished child never sits as a zombie under the
-/// applet's pid for as long as the applet keeps running. Used for both
-/// fire-and-forget spawns: `xdg-open` and `Start Yutani`.
+/// applet's pid for as long as the applet keeps running. Used for the one
+/// fire-and-forget spawn left: `Start Yutani`.
 fn spawn_detached(cmd: &mut Command) -> io::Result<()> {
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0);
     let mut child = cmd.spawn()?;
@@ -123,31 +123,6 @@ impl Applet {
     fn note(&mut self, text: String, action: Option<Action>) {
         let at_ms = self.now_ms();
         self.note = Some(Note { text, at_ms, action });
-    }
-
-    /// Open `~/.config/yutani/config.ron`, creating it with defaults first
-    /// (spec §4.4). Until plan 5's settings window exists this is the
-    /// Preferences… item.
-    fn open_preferences() -> Result<(), String> {
-        let path = yutani::model::config::config_path();
-        if !path.exists()
-            && let Err(err) = yutani::model::config::Config::default().save_to(&path)
-        {
-            return Err(format!("{err:#}"));
-        }
-        let mut cmd = Command::new("xdg-open");
-        cmd.arg(&path);
-        spawn_detached(&mut cmd).map_err(|err| {
-            // The note never spells the expanded path (that leaks the
-            // user's home directory into a UI string); it always says
-            // exactly what a person would type.
-            let reason = if err.kind() == io::ErrorKind::NotFound {
-                "xdg-open is missing".to_string()
-            } else {
-                format!("could not run xdg-open: {err}")
-            };
-            format!("{reason}: open ~/.config/yutani/config.ron manually")
-        })
     }
 }
 
@@ -248,12 +223,6 @@ impl cosmic::Application for Applet {
                 self.rates = Rates::default();
                 self.note(msg, None);
                 after_reply
-            }
-            Msg::Press(Action::Preferences) => {
-                if let Err(msg) = Self::open_preferences() {
-                    self.note(msg, Some(Action::Preferences));
-                }
-                Task::none()
             }
             Msg::Press(Action::StartDaemon) => {
                 let mut cmd = Command::new(daemon_exe());

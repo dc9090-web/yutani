@@ -23,7 +23,7 @@ pub const PENDING_S: u64 = 10;
 /// How long an `err …` note stays under the menu (spec §7).
 pub const NOTE_MS: u64 = 3_000;
 
-/// A menu press. `request()` is `None` for the two actions the applet
+/// A menu press. `request()` is `None` for the one action the applet
 /// performs itself instead of asking the daemon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -35,7 +35,7 @@ pub enum Action {
     /// lists clients in.
     Focus(usize),
     Quit,
-    /// Open `~/.config/yutani/config.ron` with `xdg-open`.
+    /// Ask the daemon to open its settings window (spec §6).
     Preferences,
     /// Spawn the daemon (offline state only).
     StartDaemon,
@@ -51,7 +51,8 @@ impl Action {
             Action::HideThumbs => Some(Request::Hide),
             Action::Focus(n) => Some(Request::Focus(*n)),
             Action::Quit => Some(Request::Quit),
-            Action::Preferences | Action::StartDaemon => None,
+            Action::Preferences => Some(Request::Settings),
+            Action::StartDaemon => None,
         }
     }
 }
@@ -157,7 +158,7 @@ mod tests {
         assert_eq!(Action::HideThumbs.request(), Some(Request::Hide));
         assert_eq!(Action::Focus(3).request(), Some(Request::Focus(3)));
         assert_eq!(Action::Quit.request(), Some(Request::Quit));
-        assert_eq!(Action::Preferences.request(), None);
+        assert_eq!(Action::Preferences.request(), Some(crate::ipc::Request::Settings));
         assert_eq!(Action::StartDaemon.request(), None);
     }
 
