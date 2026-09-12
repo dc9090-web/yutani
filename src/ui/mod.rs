@@ -3,11 +3,13 @@
 //! Floating mode: the user places them (drag/pin/persist). Dock mode: the
 //! same surfaces, auto-arranged and centred along `dock_edge` (see `dock`).
 
+use cosmic::app::ApplicationExt;
 use cosmic::cctk::sctk::shell::wlr_layer::{Anchor, KeyboardInteractivity, Layer};
 use cosmic::cctk::wayland_client::{Connection, Proxy, protocol::wl_output::WlOutput};
 use cosmic::iced::event::wayland::{Event as WaylandEvent, LayerEvent, OutputEvent};
 use cosmic::iced::mouse;
 use cosmic::iced::core::layout::Limits;
+use cosmic::iced::platform_specific::shell::commands::activation;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
     destroy_layer_surface, get_layer_surface, set_anchor, set_margin, set_size,
 };
@@ -30,6 +32,7 @@ pub mod dock;
 pub mod ipc;
 pub mod pointer;
 pub mod rules;
+pub mod settings;
 pub mod thumbnail;
 
 /// The daemon's flags. `Config` itself lives in the library now, and the
@@ -120,6 +123,8 @@ pub struct App {
     /// through IPC, so this is the only route in; only `set_hidden` writes
     /// it.
     pub hidden: bool,
+    /// The settings window while it is open (spec §6).
+    pub settings: Option<settings::State>,
 }
 
 #[derive(Clone, Debug)]
@@ -134,6 +139,7 @@ pub enum Msg {
     /// handle, so the answer still reaches exactly the client that asked.
     IpcReplyLater(ipc::Responder, Result<Option<String>, String>),
     Adopt(adopt::AdoptEvent),
+    Settings(settings::Msg),
 }
 
 /// How an IPC request is answered. Every request produces exactly one
@@ -391,11 +397,7 @@ impl App {
                 Ok(json) => (Reply::Now(Ok(Some(json))), Task::none()),
                 Err(e) => (Reply::Now(Err(format!("layouts: {e}"))), Task::none()),
             },
-            // Task 4 replaces this arm with the settings window.
-            Request::Settings => (
-                Reply::Now(Err("not supported yet (the settings window lands in the next commit)".into())),
-                Task::none(),
-            ),
+            Request::Settings => (Reply::Now(Ok(None)), self.open_settings()),
             Request::Quit => {
                 ipc::remove_socket();
                 (Reply::Now(Ok(None)), cosmic::iced::exit())
@@ -1046,6 +1048,103 @@ impl App {
         // and along the new edge.
         Task::batch(tasks)
     }
+
+    /// Open the settings window, or raise the one already open (spec §6: a
+    /// second `settings` request focuses it).
+    fn open_settings(&mut self) -> Task<cosmic::Action<Msg>> {
+        if let Some(state) = &self.settings {
+            // `window::gain_focus` does nothing on Wayland; raising a
+            // window is an xdg-activation token handed back to the
+            // compositor (the same dance libcosmic does for `Activate`).
+            let id = state.window;
+            return activation::request_token(Some(Self::APP_ID.to_string()), Some(id))
+                .map(|token| cosmic::Action::App(Msg::Settings(settings::Msg::Raise(token))));
+        }
+        let (id, open) = cosmic::iced::window::open(settings::window_settings(Self::APP_ID));
+        self.settings = Some(settings::State::new(id, &self.config));
+        let title = self.set_window_title("Yutani Settings".to_string(), id);
+        Task::batch([title, open.map(|_| cosmic::Action::App(Msg::Settings(settings::Msg::Opened)))])
+    }
+
+    fn on_settings(&mut self, msg: settings::Msg) -> Task<cosmic::Action<Msg>> {
+        use settings::Msg as S;
+        // The window is gone: only `Closed` still means anything.
+        if matches!(msg, S::Closed) {
+            self.settings = None;
+            return Task::none();
+        }
+        let Some(window) = self.settings.as_ref().map(|s| s.window) else { return Task::none() };
+
+        // Messages that only move the window around.
+        match &msg {
+            S::Close => return cosmic::iced::window::close(window),
+            S::Drag => return cosmic::iced::window::drag(window),
+            S::Raise(Some(token)) => return activation::activate(window, token.clone()),
+            _ => {}
+        }
+
+        // Messages that only touch the window's own state.
+        if let Some(state) = self.settings.as_mut() {
+            match &msg {
+                S::Opened | S::Raise(None) | S::Recheck => {
+                    state.refresh();
+                    return Task::none();
+                }
+                S::ActiveBorder(text) => state.active_border_field = text.clone(),
+                S::InactiveBorder(text) => state.inactive_border_field = text.clone(),
+                _ => {}
+            }
+        }
+
+        if matches!(msg, S::Commit) {
+            self.save_config();
+            return Task::none();
+        }
+
+        // A config field: apply live, and write `config.ron` unless this is
+        // a slider still being dragged (its release sends `Commit`).
+        let mut config = self.config.clone();
+        match settings::apply_config_field(&mut config, &msg) {
+            Err(note) => {
+                self.settings_note(note);
+                Task::none()
+            }
+            Ok(false) => Task::none(),
+            Ok(true) => {
+                self.settings_note_clear();
+                let task = self.apply_config(config);
+                if !settings::is_live_only(&msg) {
+                    self.save_config();
+                }
+                task
+            }
+        }
+    }
+
+    fn settings_note(&mut self, note: String) {
+        if let Some(state) = self.settings.as_mut() {
+            state.note = Some(note);
+        }
+    }
+
+    fn settings_note_clear(&mut self) {
+        if let Some(state) = self.settings.as_mut() {
+            state.note = None;
+        }
+    }
+
+    /// Write `config.ron` (atomically, through `model::write_atomic`) —
+    /// unless the file on disk does not parse, in which case it is left
+    /// exactly as the user wrote it (spec §9/§10).
+    fn save_config(&mut self) {
+        if self.settings.as_ref().is_some_and(|s| s.config_error.is_some()) {
+            return;
+        }
+        if let Err(e) = self.config.save() {
+            tracing::warn!("cannot save config: {e:#}");
+            self.settings_note(format!("cannot save config.ron: {e:#}"));
+        }
+    }
 }
 
 impl Application for App {
@@ -1083,6 +1182,7 @@ impl Application for App {
             layout_poison_warned: false,
             drag: None,
             hidden: false,
+            settings: None,
         };
         (app, Task::none())
     }
@@ -1112,7 +1212,16 @@ impl Application for App {
             Msg::Wayland(_) => Task::none(),
             Msg::Backend(event) => self.on_backend(event),
             Msg::Pointer(id, event) => self.on_pointer(id, event),
-            Msg::ConfigChanged(config) => self.apply_config(config),
+            Msg::ConfigChanged(config) => {
+                let task = self.apply_config(config);
+                // A hand edit may have fixed or broken the file; the text
+                // fields deliberately keep whatever is being typed.
+                if let Some(state) = self.settings.as_mut() {
+                    state.refresh();
+                }
+                task
+            }
+            Msg::Settings(msg) => self.on_settings(msg),
             Msg::Ipc(ev) => {
                 let (reply, task) = self.handle_request(&ev.request, &ev.reply);
                 if let Reply::Now(result) = reply {
@@ -1198,7 +1307,18 @@ impl Application for App {
         }
     }
 
+    /// Fires when a window is actually gone (libcosmic maps
+    /// `window::Event::Closed` here). `exit_on_close(false)` means closing
+    /// the settings window never exits the daemon.
+    fn on_close_requested(&self, id: SurfaceId) -> Option<Msg> {
+        self.settings.as_ref().filter(|s| s.window == id).map(|_| Msg::Settings(settings::Msg::Closed))
+    }
+
     fn view_window(&self, id: SurfaceId) -> Element<'_, Msg> {
+        if let Some(state) = self.settings.as_ref().filter(|s| s.window == id) {
+            let focused = self.core.focused_window() == Some(id);
+            return settings::view(state, &self.config, focused);
+        }
         let Some((_, client)) = self.clients.iter().find(|(_, c)| c.surface == Some(id)) else {
             return widget::text("").into();
         };

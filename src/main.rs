@@ -49,6 +49,8 @@ enum Command {
     },
     /// List the saved layouts, one per line
     Layouts,
+    /// Open the settings window
+    Settings,
     /// Ask the running instance to exit
     Quit,
     /// Print the daemon's status (clients, visibility, tunnel) as JSON
@@ -150,6 +152,7 @@ fn main() -> ExitCode {
         Some(Command::Toggle) => Ok(cli::send(&ipc::Request::Toggle)),
         Some(Command::Layout { name }) => Ok(cli::send(&ipc::Request::Layout(name))),
         Some(Command::Layouts) => Ok(cli::layouts()),
+        Some(Command::Settings) => Ok(cli::send(&ipc::Request::Settings)),
         Some(Command::Quit) => Ok(cli::send(&ipc::Request::Quit)),
         Some(Command::Status) => Ok(cli::send(&ipc::Request::Status)),
         Some(Command::Launch { command }) => Ok(launch::run(command)),
