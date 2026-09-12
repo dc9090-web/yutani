@@ -3,6 +3,7 @@ mod cli;
 mod doctor;
 mod ipc;
 mod model;
+mod shortcuts;
 mod ui;
 
 use clap::{Parser, Subcommand};
@@ -36,6 +37,19 @@ enum Command {
     Toggle,
     /// Ask the running instance to exit
     Quit,
+    /// Install or remove the COSMIC keyboard shortcuts (Ctrl+Alt+1..9, Right, Left by default)
+    Shortcuts {
+        #[command(subcommand)]
+        action: ShortcutsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ShortcutsAction {
+    /// Write Yutani's bindings into COSMIC's custom shortcuts (idempotent)
+    Install,
+    /// Remove Yutani's bindings, leaving everything else untouched
+    Uninstall,
 }
 
 fn main() -> ExitCode {
@@ -57,6 +71,17 @@ fn main() -> ExitCode {
         Some(Command::Hide) => Ok(cli::send(&ipc::Request::Hide)),
         Some(Command::Toggle) => Ok(cli::send(&ipc::Request::Toggle)),
         Some(Command::Quit) => Ok(cli::send(&ipc::Request::Quit)),
+        Some(Command::Shortcuts { action: ShortcutsAction::Install }) => {
+            let config = model::config::Config::load();
+            shortcuts::install(&config.shortcuts).map(|n| {
+                println!("installed {n} shortcuts into {}", shortcuts::custom_path().display());
+                ExitCode::SUCCESS
+            })
+        }
+        Some(Command::Shortcuts { action: ShortcutsAction::Uninstall }) => shortcuts::uninstall().map(|n| {
+            println!("removed {n} shortcuts from {}", shortcuts::custom_path().display());
+            ExitCode::SUCCESS
+        }),
         None => {
             if cli::is_running() {
                 eprintln!("yutani is already running");

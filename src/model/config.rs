@@ -23,6 +23,31 @@ pub enum Edge {
     Right,
 }
 
+/// Modifier names exactly as cosmic-settings writes them in the shortcuts file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum Modifier {
+    Super,
+    Ctrl,
+    Alt,
+    Shift,
+}
+
+/// Keys for `yutani shortcuts install` (spec §7). `next`/`prev` are xkb
+/// keysym names as COSMIC writes them ("Right", "Left", "Tab", "a").
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShortcutsConfig {
+    pub focus_prefix: Vec<Modifier>,
+    pub next: String,
+    pub prev: String,
+}
+
+impl Default for ShortcutsConfig {
+    fn default() -> Self {
+        Self { focus_prefix: vec![Modifier::Ctrl, Modifier::Alt], next: "Right".into(), prev: "Left".into() }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -55,6 +80,8 @@ pub struct Config {
     /// Corner radius of each thumbnail in logical px (COSMIC window radius is 8).
     pub corner_radius: u32,
     pub dock_edge: Edge,
+    /// Keyboard shortcuts written by `yutani shortcuts install`.
+    pub shortcuts: ShortcutsConfig,
 }
 
 impl Default for Config {
@@ -75,6 +102,7 @@ impl Default for Config {
             mode: Mode::Dock,
             corner_radius: 8,
             dock_edge: Edge::Top,
+            shortcuts: ShortcutsConfig::default(),
         }
     }
 }
@@ -145,6 +173,10 @@ impl Config {
         if self.app_ids.is_empty() {
             tracing::warn!("config: app_ids is empty; using default");
             self.app_ids = d.app_ids.clone();
+        }
+        if self.shortcuts.next.trim().is_empty() || self.shortcuts.prev.trim().is_empty() {
+            tracing::warn!("config: shortcuts.next/prev must not be empty; using defaults");
+            self.shortcuts = ShortcutsConfig::default();
         }
         self
     }
@@ -302,5 +334,27 @@ mod tests {
         assert_eq!(c.fps, 30);
         assert_eq!(c.thumb_width, 400);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shortcuts_default_and_parse() {
+        let c = Config::default();
+        assert_eq!(c.shortcuts.focus_prefix, vec![Modifier::Ctrl, Modifier::Alt]);
+        assert_eq!(c.shortcuts.next, "Right");
+        assert_eq!(c.shortcuts.prev, "Left");
+        let c: Config = ron::from_str("(shortcuts: (focus_prefix: [Super], next: \"n\", prev: \"p\"))").unwrap();
+        assert_eq!(c.shortcuts.focus_prefix, vec![Modifier::Super]);
+        assert_eq!(c.shortcuts.next, "n");
+        // Partial override keeps the other defaults.
+        let c: Config = ron::from_str("(shortcuts: (next: \"Tab\"))").unwrap();
+        assert_eq!(c.shortcuts.prev, "Left");
+    }
+
+    #[test]
+    fn validate_rejects_empty_shortcut_keys() {
+        let mut c = Config::default();
+        c.shortcuts.next = String::new();
+        let c = c.validate();
+        assert_eq!(c.shortcuts.next, "Right");
     }
 }

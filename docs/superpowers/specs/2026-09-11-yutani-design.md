@@ -342,6 +342,10 @@ floating thumbnails sorted by (output, y, x). `next`/`prev` cycle that order
 from the currently active client (wrapping); if no client is active, `next`
 goes to the first.
 
+*Status after plan 4:* implemented as `yutani shortcuts install|uninstall`
+(CLI; the settings-window buttons come with plan 5). Commands are written
+with the absolute path of the installed binary.
+
 ## 8. IPC
 
 Unix socket `$XDG_RUNTIME_DIR/yutani.sock`, mode 0600, removed on exit.
@@ -352,6 +356,10 @@ hide if shown),
 `layout <name>`, `settings`, `quit`.
 Reply: `ok\n` or `err <message>\n`. The CLI prints the error and exits 1;
 if the socket is absent it prints "yutani is not running" and exits 1.
+
+*Status after plan 4:* implemented; `layout` and `settings` reply
+`err not supported yet` until plan 5. A second `yutani` launch prints
+`yutani is already running`.
 
 ## 9. Config and layouts
 
