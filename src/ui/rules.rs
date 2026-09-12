@@ -2,7 +2,7 @@
 //! can be unit-tested.
 
 use crate::backend::Handle;
-use crate::model::config::Visibility;
+use crate::model::config::{Mode, Visibility};
 use crate::model::layout::ThumbPos;
 
 /// Whether a client's thumbnail should be on screen right now.
@@ -54,6 +54,45 @@ pub fn dock_order<'a>(labels: impl Iterator<Item = (&'a Handle, &'a str)>) -> Ve
     v.into_iter().map(|(h, _)| h.clone()).collect()
 }
 
+/// What `focus_order` needs to know about one client.
+pub struct FocusItem<H> {
+    pub handle: H,
+    pub label: String,
+    /// Connector name of the output the thumbnail is on.
+    pub output: String,
+    /// Thumbnail top-left, logical px (floating mode).
+    pub position: (i32, i32),
+}
+
+/// Layout order used by `focus <n>`, `next` and `prev` (spec §7): dock
+/// order by label; floating by (output, y, x). Stable for ties.
+pub fn focus_order<H: Clone>(mode: Mode, mut items: Vec<FocusItem<H>>) -> Vec<H> {
+    match mode {
+        Mode::Dock => items.sort_by_key(|i| i.label.to_lowercase()),
+        Mode::Floating => items.sort_by(|a, b| {
+            (a.output.as_str(), a.position.1, a.position.0).cmp(&(b.output.as_str(), b.position.1, b.position.0))
+        }),
+    }
+    items.into_iter().map(|i| i.handle).collect()
+}
+
+/// Next (or previous) handle in `order` after `active`, wrapping. With no
+/// active client — or one not in `order` — `next` is the first, `prev` the
+/// last.
+pub fn step<H: Clone + PartialEq>(order: &[H], active: Option<&H>, forward: bool) -> Option<H> {
+    if order.is_empty() {
+        return None;
+    }
+    let idx = active.and_then(|a| order.iter().position(|h| h == a));
+    let next = match (idx, forward) {
+        (Some(i), true) => (i + 1) % order.len(),
+        (Some(i), false) => (i + order.len() - 1) % order.len(),
+        (None, true) => 0,
+        (None, false) => order.len() - 1,
+    };
+    Some(order[next].clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +127,39 @@ mod tests {
         assert_eq!(choose_position(Some(((1, 2), false)), Some(&saved), (9, 9)), ((1, 2), false));
         assert_eq!(choose_position(None, Some(&saved), (9, 9)), ((5, 6), true));
         assert_eq!(choose_position(None, None, (9, 9)), ((9, 9), false));
+    }
+
+    fn item(h: u32, label: &str, output: &str, x: i32, y: i32) -> FocusItem<u32> {
+        FocusItem { handle: h, label: label.into(), output: output.into(), position: (x, y) }
+    }
+
+    #[test]
+    fn dock_focus_order_is_by_label_case_insensitive_and_stable() {
+        let items = vec![item(1, "kel", "DP-1", 0, 0), item(2, "Aria", "DP-1", 0, 0), item(3, "Kel", "DP-2", 0, 0)];
+        assert_eq!(focus_order(Mode::Dock, items), vec![2, 1, 3]);
+    }
+
+    #[test]
+    fn floating_focus_order_is_output_then_row_then_column() {
+        let items = vec![
+            item(1, "z", "DP-2", 10, 10),
+            item(2, "y", "DP-1", 500, 40),
+            item(3, "x", "DP-1", 40, 40),
+            item(4, "w", "DP-1", 40, 400),
+        ];
+        assert_eq!(focus_order(Mode::Floating, items), vec![3, 2, 4, 1]);
+    }
+
+    #[test]
+    fn step_wraps_and_handles_no_active() {
+        let order = [10, 20, 30];
+        assert_eq!(step(&order, Some(&20), true), Some(30));
+        assert_eq!(step(&order, Some(&30), true), Some(10));
+        assert_eq!(step(&order, Some(&10), false), Some(30));
+        assert_eq!(step(&order, None, true), Some(10));
+        assert_eq!(step(&order, None, false), Some(30));
+        // Active client unknown to the order (e.g. mid-update): treat as none.
+        assert_eq!(step(&order, Some(&99), true), Some(10));
+        assert_eq!(step::<u32>(&[], None, true), None);
     }
 }
