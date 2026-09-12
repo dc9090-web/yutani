@@ -516,7 +516,7 @@ fn cgroup_match(uid: u32) -> String {
 pub fn nft_ruleset(uid: u32, dns: Option<Ipv4Addr>) -> String {
     let m = cgroup_match(uid);
     let mut s = String::from("table inet yutani {\n");
-    s.push_str("    chain mark {\n        type route hook output priority mangle; policy accept;\n");
+    s.push_str("    chain setmark {\n        type route hook output priority mangle; policy accept;\n");
     s.push_str(&format!("        {m} meta mark set {FWMARK:#x}\n    }}\n"));
     if let Some(dns) = dns {
         s.push_str("    chain dns {\n        type nat hook output priority dstnat; policy accept;\n");

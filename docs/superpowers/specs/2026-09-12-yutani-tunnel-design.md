@@ -89,9 +89,11 @@ running the teardown for whatever was already created.
    `rp_filter` accept tunnel replies).
 6. `nft -f -` with:
 
+(`mark` is a reserved nft keyword, hence `setmark`.)
+
 ```
 table inet yutani {
-    chain mark {
+    chain setmark {
         type route hook output priority mangle; policy accept;
         socket cgroupv2 level 4 "user.slice/user-1000.slice/user@1000.service/yutani-eve.slice" meta mark set 0x59
     }
