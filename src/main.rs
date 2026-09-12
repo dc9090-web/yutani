@@ -1,7 +1,9 @@
+mod adopt;
 mod backend;
 mod cli;
 mod doctor;
 mod ipc;
+mod launch;
 mod model;
 mod shortcuts;
 mod tunnel;
@@ -40,6 +42,11 @@ enum Command {
     Quit,
     /// Print the daemon's status (clients, visibility, tunnel) as JSON
     Status,
+    /// Run a command (Steam's %command%) inside the tunnel cgroup
+    Launch {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
     /// Install or remove the COSMIC keyboard shortcuts (Ctrl+Alt+1..9, Right, Left by default)
     Shortcuts {
         #[command(subcommand)]
@@ -117,6 +124,7 @@ fn main() -> ExitCode {
         Some(Command::Toggle) => Ok(cli::send(&ipc::Request::Toggle)),
         Some(Command::Quit) => Ok(cli::send(&ipc::Request::Quit)),
         Some(Command::Status) => Ok(cli::send(&ipc::Request::Status)),
+        Some(Command::Launch { command }) => Ok(launch::run(command)),
         Some(Command::Shortcuts { action: ShortcutsAction::Install }) => {
             let config = model::config::Config::load();
             shortcuts::install(&config.shortcuts).map(|(installed, wanted)| {

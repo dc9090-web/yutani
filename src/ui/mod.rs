@@ -19,6 +19,7 @@ use cosmic::iced::{self, Length, Point, Subscription};
 use cosmic::{Application, Element, Task, widget};
 use std::collections::HashMap;
 
+use crate::adopt;
 use crate::backend::{self, CaptureImage, ClientInfo, Cmd, Event, Handle};
 use crate::model::client::Login;
 use crate::model::config::{Config, Mode};
@@ -107,6 +108,7 @@ pub enum Msg {
     ConfigChanged(Config),
     Tray(tray::TrayEvent),
     Ipc(ipc::IpcEvent),
+    Adopt(adopt::AdoptEvent),
 }
 
 impl App {
@@ -899,6 +901,13 @@ impl Application for App {
                 });
                 task
             }
+            Msg::Adopt(ev) => {
+                match ev.result {
+                    Ok(()) => tracing::info!(pid = ev.pid, name = %ev.name, "adopted into yutani-eve.slice"),
+                    Err(e) => tracing::warn!(pid = ev.pid, name = %ev.name, "adoption failed: {e}"),
+                }
+                Task::none()
+            }
         }
     }
 
@@ -923,6 +932,9 @@ impl Application for App {
                 backend::subscription(conn, self.config.app_ids.clone(), self.config.fps)
                     .map(Msg::Backend),
             );
+        }
+        if self.config.tunnel.auto_adopt {
+            subs.push(adopt::subscription(self.config.tunnel.adopt_processes.clone()).map(Msg::Adopt));
         }
         Subscription::batch(subs)
     }
