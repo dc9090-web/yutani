@@ -63,6 +63,12 @@ pub struct ClientInfo {
 #[derive(Clone, Debug)]
 pub struct CaptureImage {
     pub buffer: SubsurfaceBuffer,
+    /// Size of the captured window in buffer pixels, oriented as `transform`
+    /// says — the aspect the thumbnail should take. For a GL-processed frame
+    /// this is still the *source* size (already rotated upright, so
+    /// `transform` is `Normal`), never the target's: the target is whatever
+    /// size the UI asked for, and echoing it back would feed the border
+    /// into the next size computation, growing the thumbnail every frame.
     pub width: u32,
     pub height: u32,
     pub transform: wl_output::Transform,

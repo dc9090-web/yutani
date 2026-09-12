@@ -7,12 +7,18 @@ use cosmic::{Element, theme};
 
 use super::{Client, Msg};
 use crate::backend::CaptureImage;
+use crate::backend::gl::swaps_axes;
 use crate::model::config::{Config, Mode, parse_color};
 
-/// Layer-surface size (including border) for a thumbnail.
+/// Layer-surface size (including border) for a thumbnail: the captured
+/// window's aspect as displayed (a raw frame with a 90°/270° transform is
+/// shown with its axes swapped).
 pub fn size(config: &Config, image: Option<&CaptureImage>) -> (u32, u32) {
     match image {
-        Some(img) if img.width > 0 && img.height > 0 => size_for(config, img.width, img.height),
+        Some(img) if img.width > 0 && img.height > 0 => {
+            let (w, h) = if swaps_axes(img.transform) { (img.height, img.width) } else { (img.width, img.height) };
+            size_for(config, w, h)
+        }
         _ => size_for(config, 16, 9),
     }
 }

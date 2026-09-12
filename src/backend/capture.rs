@@ -275,12 +275,16 @@ impl ScreencopyHandler for AppData {
 
         let was_processed = processed.is_some();
         let (release, image) = match processed {
-            Some((backing, (w, h))) => {
+            Some((backing, _)) => {
                 let (sb, release) = SubsurfaceBuffer::new(backing);
+                // The pass renders the frame upright, so report the source
+                // size in display orientation (see `CaptureImage`).
+                let (width, height) =
+                    if super::gl::swaps_axes(transform) { (front_size.1, front_size.0) } else { front_size };
                 let image = CaptureImage {
                     buffer: sb,
-                    width: w,
-                    height: h,
+                    width,
+                    height,
                     transform: cctk::wayland_client::protocol::wl_output::Transform::Normal,
                 };
                 (release, image)
