@@ -95,11 +95,19 @@ pub enum Cmd {
     SetFps(u32),
     PauseCapture(Handle),
     ResumeCapture(Handle),
-    /// Physical-pixel size of this client's thumbnail surface; the GL pass
-    /// renders into buffers of exactly this size.
-    SetThumbSize(Handle, (u32, u32)),
-    /// Corner mask radius in physical pixels (0 = square).
-    SetCornerRadius(u32),
+    /// Physical-pixel size of this client's thumbnail surface and the
+    /// corner mask radius in physical pixels (0 = square). Both are
+    /// per-client because outputs can differ in scale; the GL pass renders
+    /// into buffers of exactly this size with exactly this radius.
+    SetThumbSize(Handle, (u32, u32), u32),
+}
+
+/// What the UI last asked for one client's thumbnail: the GL target size
+/// and the corner mask radius, both in physical pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThumbSpec {
+    pub size: (u32, u32),
+    pub radius_px: u32,
 }
 
 /// iced subscription that owns the backend thread for the app's lifetime.
@@ -161,8 +169,7 @@ pub struct AppData {
     pub fps: Arc<AtomicU32>,
     pub capabilities: HashSet<zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1>,
     pub gl: GlState,
-    pub thumb_sizes: HashMap<Handle, (u32, u32)>,
-    pub corner_radius_px: u32,
+    pub thumb_sizes: HashMap<Handle, ThumbSpec>,
 }
 
 impl AppData {
@@ -223,15 +230,12 @@ impl AppData {
             Cmd::ResumeCapture(handle) => {
                 self.set_paused(&handle, false, conn);
             }
-            Cmd::SetThumbSize(handle, size) => {
+            Cmd::SetThumbSize(handle, size, radius_px) => {
                 if size.0 == 0 || size.1 == 0 {
                     tracing::debug!("ignoring zero-sized thumb size {size:?} for {handle:?}");
                     return;
                 }
-                self.thumb_sizes.insert(handle, size);
-            }
-            Cmd::SetCornerRadius(px) => {
-                self.corner_radius_px = px;
+                self.thumb_sizes.insert(handle, ThumbSpec { size, radius_px });
             }
         }
     }
@@ -294,25 +298,25 @@ impl AppData {
     }
 
     /// Run the GL pass for `front` into `thumb` (allocating or re-allocating
-    /// the pool for `size`), returning the buffer to ship. `Err` means the
-    /// caller ships the raw frame.
+    /// the pool for `spec.size`), masking corners with `spec.radius_px`, and
+    /// return the buffer to ship. `Err` means the caller ships the raw frame.
     fn gl_process(
         &mut self,
         front: &mut Buffer,
         thumb: &mut Option<capture::ThumbPool>,
-        size: (u32, u32),
+        spec: ThumbSpec,
         transform: wl_output::Transform,
     ) -> anyhow::Result<Arc<cosmic::iced::platform_specific::shell::subsurface_widget::BufferSource>> {
         if !self.gl_init() {
             anyhow::bail!("GL pass unavailable");
         }
+        let ThumbSpec { size, radius_px } = spec;
         // Only (re)computed when the pool is about to be (re)allocated: this
         // walks the compositor's whole format table/tranches, which is
         // wasted work on the common per-frame path where the pool is reused.
         let needs_pool = thumb.as_ref().is_none_or(|t| t.size != size);
         let modifiers = if needs_pool { self.thumb_modifiers() } else { Vec::new() };
         let dev = self.dmabuf_feedback.as_ref().map(|f| f.main_device()).context("no dmabuf feedback")?;
-        let radius = self.corner_radius_px;
         let AppData { gl, gbm_devices, .. } = self;
         let GlState::Ready { gl, consecutive_failures } = gl else { anyhow::bail!("GL pass unavailable") };
         let (_, gbm) = gbm_devices.gbm_device(dev)?.context("gbm device vanished")?;
@@ -329,7 +333,7 @@ impl AppData {
             front.source = Some(gl.import_source(&front.backing)?);
         }
         // Render into the back target, then make it the front.
-        gl.render(front.source.as_ref().unwrap(), &pool.targets[1], transform, radius)?;
+        gl.render(front.source.as_ref().unwrap(), &pool.targets[1], transform, radius_px)?;
         pool.targets.rotate_left(1);
         *consecutive_failures = 0;
         Ok(pool.targets[0].backing.clone())
@@ -394,7 +398,6 @@ fn start(conn: Connection, app_ids: Vec<String>, fps: u32) -> mpsc::Receiver<Eve
                     capabilities: HashSet::new(),
                     gl: GlState::Untried,
                     thumb_sizes: HashMap::new(),
-                    corner_radius_px: 8,
                 };
 
                 let (cmd_sender, cmd_channel) = calloop::channel::channel();

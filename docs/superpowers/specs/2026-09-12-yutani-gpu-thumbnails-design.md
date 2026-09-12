@@ -40,7 +40,7 @@ captured frame:
 - One program. Vertex: full-screen triangle. Fragment: bilinear sample of the
   captured frame through a UV matrix that undoes the frame's
   `wl_output::Transform`, multiplied by a rounded-rect SDF alpha, written as
-  premultiplied ARGB.
+  premultiplied ABGR8888.
 - **Input:** the capture dmabuf (planes/fds/modifier from the existing
   `Buffer`) imported with `eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)` and bound
   via `glEGLImageTargetTexture2DOES`. Cached per capture buffer (the pool has
@@ -64,13 +64,16 @@ captured frame:
   (which includes the border) fed back into that computation and grew the
   thumbnail by 1 px per frame (found in the Task 5 smoke test).
 
-New commands from the UI:
+New command from the UI:
 
-- `Cmd::SetThumbSize(Handle, (u32, u32))` — target size in physical pixels.
-  Sent whenever a client's `last_size` is set or changes (create, hover zoom,
-  config). A change reallocates that client's output pool.
-- `Cmd::SetCornerRadius(u32)` — mask radius in physical pixels, sent at start
-  and on config change.
+- `Cmd::SetThumbSize(Handle, (u32, u32), u32)` — target size and corner mask
+  radius, both in physical pixels for *that client's* output (outputs can
+  differ in scale, so the radius is per client, not global). Sent whenever a
+  client's `last_size` is set or changes (create, hover zoom, config), when
+  `corner_radius` changes in the config (re-sent for every client with a
+  surface), and once for every sized client when the backend hands over its
+  command channel. The backend keeps a `ThumbSpec { size, radius_px }` per
+  client; a size change reallocates that client's output pool.
 
 A frame that arrives before a size is known ships raw (as today).
 
@@ -84,10 +87,12 @@ A frame that arrives before a size is known ships raw (as today).
 - Delete `round_surface`, `awaiting_radius`, `Client.rounded`, the
   `corner_radius` protocol request and its `RedrawRequested` hook.
 - `corner_radius` (config, default 8) stays and drives both the iced border
-  radius and the mask radius: `mask_radius = corner_radius × output scale`,
-  clamped to half the short side of the target. Output scale is the integer
-  `scale_factor` from the sctk `OutputInfo` the UI already receives
-  (`Output` gains a `scale: i32` field, default 1).
+  radius and the mask radius: per client,
+  `mask_radius = corner_radius × scale of the client's output`, sent with
+  the size in `SetThumbSize` and clamped by the backend to half the short
+  side of the target. Output scale is the integer `scale_factor` from the
+  sctk `OutputInfo` the UI already receives (`Output` gains a `scale: i32`
+  field, default 1); a scale change takes effect at the next size send.
 
 ### 2.3 Failure handling
 
@@ -110,8 +115,10 @@ Pure, unit-tested in `gl.rs`:
 - `dmabuf_image_attribs` (EGL attribute list for a dmabuf import) and
   `buffer_coords` (per-transform UV mapping behind `uv_matrix`;
   `swaps_axes` alongside it).
-- `pick_modifier(feedback_mods, egl_mods) -> Modifier` (intersection, LINEAR
-  fallback, INVALID handling).
+- `modifiers_for(table, tranches, format) -> Vec<u64>` (dmabuf-feedback only:
+  the format's explicit modifiers in tranche order, deduplicated, INVALID
+  dropped; gbm picks the modifier from that list, or implicit + LINEAR when
+  it is empty).
 
 GL itself is verified by `yutani doctor` and by the smoke test: a screenshot
 crop of a thumbnail corner shows a curve, the name label is visible, and

@@ -17,7 +17,6 @@ use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
-pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 /// DRM fourcc 'AB24': little-endian R, G, B, A bytes — GL RGBA order.
 pub const ABGR8888: u32 = 0x3432_4241;
 
@@ -33,18 +32,23 @@ const PLANE_ATTRIBS: [[egl::Attrib; 5]; 4] = [
 ];
 
 /// Normalised *output* coordinates (x right, y down, 0..1) → normalised
-/// *buffer* coordinates for a buffer carrying `transform`
-/// (`wl_surface.set_buffer_transform` semantics: the content was rendered
-/// already transformed, the compositor applies the inverse to display it,
-/// and 90 means a quarter turn counter-clockwise going buffer → output).
+/// *buffer* coordinates for a buffer carrying `transform`.
+///
+/// `wl_surface.set_buffer_transform` semantics: the client has *already*
+/// rotated its content by `transform` (`_90` = a quarter turn
+/// counter-clockwise), so the compositor — and this pass — apply the
+/// *inverse* to show it upright. Hence for `_90` output `(x, y)` samples
+/// buffer `(y, 1 − x)` (output top-left ← buffer bottom-left) and for
+/// `_270` buffer `(1 − y, x)`; this matches Smithay's `Transform::_90` /
+/// `_270` texture matrices, which cosmic-comp uses for the same buffers.
 pub fn buffer_coords(transform: Transform, x: f32, y: f32) -> (f32, f32) {
     match transform {
         Transform::Normal => (x, y),
         Transform::Flipped => (1.0 - x, y),
         Transform::_180 => (1.0 - x, 1.0 - y),
         Transform::Flipped180 => (x, 1.0 - y),
-        Transform::_90 => (1.0 - y, x),
-        Transform::_270 => (y, 1.0 - x),
+        Transform::_90 => (y, 1.0 - x),
+        Transform::_270 => (1.0 - y, x),
         Transform::Flipped90 => (y, x),
         Transform::Flipped270 => (1.0 - y, 1.0 - x),
         _ => (x, y),
@@ -338,10 +342,11 @@ impl Gl {
             (program, vbo, a_pos, u_uv, u_size, u_radius, u_tex)
         };
 
-        // Bound outside the macro: `tracing::info!` brings `tracing::field::display`
+        // Bound outside the macro: `tracing::debug!` brings `tracing::field::display`
         // into scope, which would shadow the local `display`.
         let vendor = egl.query_string(Some(display), egl::VENDOR).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        tracing::info!("GL thumbnail pass ready ({vendor})");
+        // debug, not info: `yutani doctor` builds a `Gl` while printing its table.
+        tracing::debug!("GL thumbnail pass ready ({vendor})");
         Ok(Gl {
             egl,
             display,
@@ -585,9 +590,11 @@ mod tests {
 
     #[test]
     fn buffer_coords_quarter_turns_are_bijections_and_inverses() {
-        // Output top-left comes from the buffer's top-right for a 90° CCW turn.
-        assert_eq!(buffer_coords(Transform::_90, 0.0, 0.0), (1.0, 0.0));
-        assert_eq!(buffer_coords(Transform::_270, 0.0, 0.0), (0.0, 1.0));
+        // The client pre-rotated its content 90° CCW; undoing that puts the
+        // buffer's bottom-left at the output's top-left (and the buffer's
+        // top-right there for _270).
+        assert_eq!(buffer_coords(Transform::_90, 0.0, 0.0), (0.0, 1.0));
+        assert_eq!(buffer_coords(Transform::_270, 0.0, 0.0), (1.0, 0.0));
         for t in [Transform::_90, Transform::_270, Transform::Flipped90, Transform::Flipped270] {
             let mut c = corners(t).to_vec();
             c.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -602,7 +609,16 @@ mod tests {
 
     #[test]
     fn uv_matrix_matches_buffer_coords() {
-        for t in [Transform::Normal, Transform::_90, Transform::Flipped270] {
+        for t in [
+            Transform::Normal,
+            Transform::_90,
+            Transform::_180,
+            Transform::_270,
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ] {
             let m = uv_matrix(t);
             let (x, y) = (0.3f32, 0.8f32);
             let u = m[0] * x + m[3] * y + m[6];

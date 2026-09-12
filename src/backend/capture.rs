@@ -252,22 +252,22 @@ impl ScreencopyHandler for AppData {
         // GL pass: the front capture buffer → a thumbnail-sized, corner-masked
         // target. Falls back to the raw frame if the pass is unavailable, the
         // UI hasn't told us a size yet, or this frame's render failed.
-        let thumb_size = self.thumb_sizes.get(&capture.handle).copied();
+        let spec = self.thumb_sizes.get(&capture.handle).copied();
         let front_size = buffers[0].size;
-        let mut processed: Option<(Arc<BufferSource>, (u32, u32))> = None;
+        let mut processed: Option<Arc<BufferSource>> = None;
         let mut gl_error = None;
         // GL only works on dmabuf backings; a shm capture (fallback when the
         // compositor has no usable gbm device) or a not-yet-sized/zero-sized
         // thumbnail must silently take the raw path below without touching
         // the failure counter, so no `Err` is produced for either case.
-        let can_gl = thumb_size.is_some_and(|(w, h)| w > 0 && h > 0)
+        let can_gl = spec.is_some_and(|s| s.size.0 > 0 && s.size.1 > 0)
             && matches!(*buffers[0].backing, BufferSource::Dma(_));
         if can_gl {
-            let size = thumb_size.unwrap();
+            let spec = spec.unwrap();
             let ScreencopySession { buffers: bufs, thumb, .. } = state;
             let front = &mut bufs.as_mut().unwrap()[0];
-            match self.gl_process(front, thumb, size, transform) {
-                Ok(backing) => processed = Some((backing, size)),
+            match self.gl_process(front, thumb, spec, transform) {
+                Ok(backing) => processed = Some(backing),
                 Err(err) => gl_error = Some(err),
             }
         }
@@ -275,7 +275,7 @@ impl ScreencopyHandler for AppData {
 
         let was_processed = processed.is_some();
         let (release, image) = match processed {
-            Some((backing, _)) => {
+            Some(backing) => {
                 let (sb, release) = SubsurfaceBuffer::new(backing);
                 // The pass renders the frame upright, so report the source
                 // size in display orientation (see `CaptureImage`).
