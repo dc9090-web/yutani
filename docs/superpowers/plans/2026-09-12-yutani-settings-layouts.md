@@ -2512,25 +2512,54 @@ Display and Behavior pages are replaced by a notice and nothing is written
 at all (the Layouts page still works — layout files are separate).
 ```
 2. §7, in the *Status after plan 4* paragraph, replace `(CLI; the settings-window buttons come with plan 5)` with `(CLI, and the *Install shortcuts* / *Uninstall shortcuts* buttons on the settings window's Behavior page since plan 5)`.
-3. §8, after the *Status after plan 4* paragraph, add:
+3. §8, the command list and reply grammar are now out of date (`layouts` is
+   not in them, and a reply can carry data). Replace the `Commands:` /
+   `Reply:` paragraph with:
+```
+Commands: `focus <n>`, `next`, `prev`, `show`, `hide`, `toggle` (show if hidden,
+hide if shown),
+`layout <name>`, `layouts`, `settings`, `quit`.
+Reply: `ok\n`, `ok <data>\n` for a request that answers with something
+(`layouts` answers a JSON array of names) or `err <message>\n`. The CLI
+prints the error and exits 1; if the socket is absent it prints
+"yutani is not running" and exits 1.
+```
+   and, after the *Status after plan 4* paragraph, add:
 ```
 *Status after plan 5:* `layout <name>` and `settings` are implemented, and
-`layouts` was added (reply `ok <json array of names>`; `yutani layouts`
-prints one per line). `layout` answers `err no such layout <name>` for an
-unknown one and `err <reason>` for a name that is not a plain file stem.
+`layouts` was added (reply `ok <json array of names>`, the `OkData` form;
+`yutani layouts` prints one per line). `layout` answers
+`err no such layout <name>` for an unknown one and `err <reason>` for a
+name that is not a plain file stem.
 ```
 4. §9, replace the whole *Status after plan 2* paragraph (`*Status after plan 2:* `output` is saved but not yet used for placement … Both land with named layouts in plan 4.`) with:
 ```
-*Status after plan 5:* implemented. `order` and `new_client_anchor` are
-written on every drag, pin and order change; `order` lists the live
-characters in layout order followed by the saved names that are not logged
-in (capped at 64), and the anchor is the top-left-most saved thumbnail. A
-saved `output` now decides which output a floating thumbnail is created on,
-falling back to the primary output — the first one iced reports, since
-COSMIC advertises no primary-output protocol — at the same x/y. A new
-client stacks 24 px down-right of the anchor past occupied slots. Named
-layouts live in `~/.config/yutani/layouts/<name>.ron` (`<name>`: non-empty,
-≤ 64 characters, no path separators or control characters, not `current`).
+*Status after plan 5:* implemented. `order` is rewritten on every drag, pin
+and order change; previously recorded names keep their slots (a logged-out
+character does not lose its place), live characters not yet recorded are
+appended after them in layout order, and when the 64-name cap bites,
+recorded names that are neither live nor have a saved position are evicted
+first, oldest first. `thumbs` itself is uncapped: an entry is exactly what
+brings a character back to their own spot, and one costs ~50 bytes.
+`new_client_anchor` is rewritten at the same moments and is the
+top-left-most saved thumbnail; a new client stacks 24 px down-right of it
+past occupied slots. A saved `output` now decides which output a floating
+thumbnail is created on, falling back to the primary output — the first one
+iced reports, since COSMIC advertises no primary-output protocol — at the
+same x/y. Named layouts live in `~/.config/yutani/layouts/<name>.ron`
+(`<name>`: non-empty, ≤ 64 characters, no path separators or control
+characters, and not `current`, which is reserved for the auto-saved
+layout). Both files are written atomically: a sibling temporary, then a
+rename over the target.
+```
+5. §10, after the `Config/layout parse errors → warn and fall back to
+   defaults; never overwrite the offending file.` bullet, add:
+```
+- The one exception is `yutani layout <name>` / the Layouts page's *Apply*:
+  an explicit request to replace `current.ron`, so it does overwrite an
+  unparseable one. A `current.ron` that fails to parse suspends auto-save
+  until the file is fixed or deleted; the settings window shows a warning
+  and saving resumes automatically once it parses again.
 ```
 
 ```bash
