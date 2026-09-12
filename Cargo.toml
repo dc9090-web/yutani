@@ -14,6 +14,7 @@ libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "a401af8b1c54a8
     "winit",
     "wgpu",
     "single-instance",
+    "applet",
 ] }
 calloop = { version = "0.14.4", features = ["executor"] }
 calloop-wayland-source = "0.4.1"

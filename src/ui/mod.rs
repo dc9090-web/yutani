@@ -33,9 +33,16 @@ pub mod rules;
 pub mod thumbnail;
 pub mod tray;
 
+/// The daemon's flags. `Config` itself lives in the library now, and the
+/// orphan rule forbids implementing libcosmic's `CosmicFlags` for a foreign
+/// type here, so it travels into `run_single_instance` in this newtype. The
+/// trait is deliberately *not* implemented in the library: single-instance
+/// is the daemon's concern and the applet must never use it.
+pub struct AppFlags(pub Config);
+
 /// `Config` carries no CLI-parsed subcommand/args; only its file contents
 /// matter, so this satisfies `run_single_instance`'s bound trivially.
-impl cosmic::app::CosmicFlags for Config {
+impl cosmic::app::CosmicFlags for AppFlags {
     type SubCommand = String;
     type Args = Vec<String>;
 }
@@ -45,7 +52,7 @@ pub fn run(config: Config) -> iced::Result {
         cosmic::app::Settings::default()
             .no_main_window(true)
             .exit_on_close(false),
-        config,
+        AppFlags(config),
     )
 }
 
@@ -881,7 +888,7 @@ impl App {
 
 impl Application for App {
     type Executor = cosmic::executor::Default;
-    type Flags = Config;
+    type Flags = AppFlags;
     type Message = Msg;
     const APP_ID: &'static str = "io.github.yutani";
 
@@ -893,10 +900,10 @@ impl Application for App {
         &mut self.core
     }
 
-    fn init(core: cosmic::app::Core, config: Config) -> (Self, Task<cosmic::Action<Msg>>) {
+    fn init(core: cosmic::app::Core, flags: AppFlags) -> (Self, Task<cosmic::Action<Msg>>) {
         let app = App {
             core,
-            config,
+            config: flags.0,
             conn: None,
             cmd: None,
             clients: HashMap::new(),

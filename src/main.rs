@@ -2,13 +2,17 @@ mod adopt;
 mod backend;
 mod cli;
 mod doctor;
-mod ipc;
 mod launch;
-mod model;
 mod proc;
 mod shortcuts;
-mod tunnel;
 mod ui;
+
+// `ipc`, `model` and `tunnel` now live in the library (so `yutani-applet`
+// can share them). Re-binding them at the binary's crate root keeps every
+// `crate::ipc::…` / `crate::model::…` / `crate::tunnel::…` path in
+// `src/ui/`, `src/cli.rs`, `src/shortcuts.rs` and `src/adopt.rs` working
+// unchanged: a private `use` is visible to this module and its descendants.
+use yutani::{ipc, model, tunnel};
 
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
