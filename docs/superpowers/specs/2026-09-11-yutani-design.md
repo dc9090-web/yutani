@@ -304,7 +304,7 @@ thumbnail reappears in the same place.
 
 ### Settings window
 
-libcosmic window, opened from the tray or `yutani settings`. Pages:
+libcosmic window, opened from the applet or `yutani settings`. Pages:
 
 - **Display** — thumb width, active/inactive border colour, border px,
   show names, zoom factor, corner radius.
@@ -316,10 +316,14 @@ libcosmic window, opened from the tray or `yutani settings`. Pages:
 
 All changes apply live and write `config.ron`.
 
-### Tray
+### Panel applet
 
-StatusNotifierItem via `ksni`: Show/Hide, Layouts submenu (apply), Settings,
-Quit.
+Not a StatusNotifierItem: a COSMIC panel applet (`yutani-applet`, a second
+binary of this crate) showing the Y mark and, on click, tunnel status,
+connected accounts, traffic and the menu (Connect/Disconnect tunnel,
+Accounts…, Preferences…, Show/Hide thumbnails, Quit). Specified in full in
+`2026-09-12-yutani-applet-design.md`; the `ksni` path was removed, not kept
+as a fallback (decided 2026-09-12).
 
 ## 7. Hotkeys
 

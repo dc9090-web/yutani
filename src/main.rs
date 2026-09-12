@@ -58,6 +58,11 @@ enum Command {
         #[command(subcommand)]
         action: ShortcutsAction,
     },
+    /// Install or remove the COSMIC panel applet (icons and .desktop file)
+    Applet {
+        #[command(subcommand)]
+        action: AppletAction,
+    },
     /// EVE-only WireGuard tunnel
     Tunnel {
         #[command(subcommand)]
@@ -70,6 +75,14 @@ enum ShortcutsAction {
     /// Write Yutani's bindings into COSMIC's custom shortcuts (idempotent)
     Install,
     /// Remove Yutani's bindings, leaving everything else untouched
+    Uninstall,
+}
+
+#[derive(Subcommand)]
+enum AppletAction {
+    /// Copy the icons and write the applet's .desktop file (idempotent)
+    Install,
+    /// Remove the icons and the .desktop file
     Uninstall,
 }
 
@@ -147,6 +160,12 @@ fn main() -> ExitCode {
             println!("removed {n} shortcuts from {}", shortcuts::custom_path().display());
             ExitCode::SUCCESS
         }),
+        Some(Command::Applet { action: AppletAction::Install }) => {
+            yutani::applet::install::install().map(|()| ExitCode::SUCCESS)
+        }
+        Some(Command::Applet { action: AppletAction::Uninstall }) => {
+            yutani::applet::install::uninstall().map(|()| ExitCode::SUCCESS)
+        }
         Some(Command::Tunnel { action }) => match action {
             TunnelAction::Install { conf, dry_run: true } => {
                 // The same uid/name pair and canonical exe path the real

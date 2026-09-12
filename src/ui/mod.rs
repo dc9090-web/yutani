@@ -31,7 +31,6 @@ pub mod ipc;
 pub mod pointer;
 pub mod rules;
 pub mod thumbnail;
-pub mod tray;
 
 /// The daemon's flags. `Config` itself lives in the library now, and the
 /// orphan rule forbids implementing libcosmic's `CosmicFlags` for a foreign
@@ -113,7 +112,6 @@ pub enum Msg {
     Backend(Event),
     Pointer(SurfaceId, mouse::Event),
     ConfigChanged(Config),
-    Tray(tray::TrayEvent),
     Ipc(ipc::IpcEvent),
     /// The answer to an IPC request that could not be produced on the update
     /// thread (see [`Reply::Later`]). Carries the request's one-shot reply
@@ -373,7 +371,7 @@ impl App {
         }
     }
 
-    /// The one place `hidden` changes (tray and IPC both come through here).
+    /// The one place `hidden` changes (every IPC request comes through here).
     fn set_hidden(&mut self, hidden: bool) -> Task<cosmic::Action<Msg>> {
         if self.hidden == hidden {
             return Task::none();
@@ -941,15 +939,6 @@ impl Application for App {
             Msg::Backend(event) => self.on_backend(event),
             Msg::Pointer(id, event) => self.on_pointer(id, event),
             Msg::ConfigChanged(config) => self.apply_config(config),
-            Msg::Tray(tray::TrayEvent::ToggleVisibility) => {
-                let h = !self.hidden;
-                self.set_hidden(h)
-            }
-            Msg::Tray(tray::TrayEvent::SetHidden(h)) => self.set_hidden(h),
-            Msg::Tray(tray::TrayEvent::Quit) => {
-                ipc::remove_socket();
-                cosmic::iced::exit()
-            }
             Msg::Ipc(ev) => {
                 let (reply, task) = self.handle_request(&ev.request, &ev.reply);
                 if let Reply::Now(result) = reply {
@@ -984,7 +973,6 @@ impl Application for App {
         let mut subs = vec![
             events,
             config_watch::subscription().map(Msg::ConfigChanged),
-            tray::subscription().map(Msg::Tray),
             ipc::subscription().map(Msg::Ipc),
         ];
         if let Some(conn) = self.conn.clone() {
