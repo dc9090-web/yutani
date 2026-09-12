@@ -2,6 +2,8 @@
 //! See docs/superpowers/specs/2026-09-12-yutani-tunnel-design.md.
 
 pub mod conf;
+pub mod rules;
+pub mod status;
 
 pub const IFACE: &str = "yutani0";
 pub const FWMARK: u32 = 0x59;
