@@ -8,8 +8,6 @@ use cosmic::cctk::wayland_client::{Connection, Proxy, protocol::wl_output::WlOut
 use cosmic::iced::event::wayland::{Event as WaylandEvent, LayerEvent, OutputEvent};
 use cosmic::iced::mouse;
 use cosmic::iced::core::layout::Limits;
-use cosmic::iced::platform_specific::shell::commands::corner_radius::corner_radius;
-use cosmic::iced::runtime::platform_specific::wayland::CornerRadius;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
     destroy_layer_surface, get_layer_surface, set_anchor, set_margin, set_size,
 };
@@ -54,6 +52,7 @@ pub struct Output {
     pub handle: WlOutput,
     pub name: String,
     pub logical_size: (i32, i32),
+    pub scale: i32,
 }
 
 #[derive(Debug)]
@@ -79,9 +78,6 @@ pub struct Client {
     /// Last size sent via `set_size` (or the surface's creation size), so a
     /// resize to the same size can be skipped.
     pub last_size: Option<(u32, u32)>,
-    /// The current `corner_radius` has been requested for this surface
-    /// (see `round_surface`).
-    pub rounded: bool,
     /// Backend capture is paused for this client (last command we sent).
     /// Pause/resume is an edge on this, not on whether a surface exists, so
     /// a client born hidden is paused too.
@@ -109,9 +105,6 @@ pub enum Msg {
     Pointer(SurfaceId, mouse::Event),
     ConfigChanged(Config),
     Tray(tray::TrayEvent),
-    /// A surface is about to present a frame (`window::Event::RedrawRequested`);
-    /// only subscribed to while some surface still awaits its corner radius.
-    Redrawn(SurfaceId),
 }
 
 impl App {
@@ -137,12 +130,14 @@ impl App {
             OutputEvent::Created(Some(info)) | OutputEvent::InfoUpdate(info) => {
                 let name = info.name.clone().unwrap_or_else(|| format!("output-{}", info.id));
                 let logical_size = info.logical_size.unwrap_or((0, 0));
+                let scale = info.scale_factor.max(1);
                 if let Some(existing) = self.outputs.iter_mut().find(|o| o.handle == output) {
                     existing.name = name;
                     existing.logical_size = logical_size;
+                    existing.scale = scale;
                 } else {
-                    tracing::info!(%name, ?logical_size, "output");
-                    self.outputs.push(Output { handle: output, name, logical_size });
+                    tracing::info!(%name, ?logical_size, scale, "output");
+                    self.outputs.push(Output { handle: output, name, logical_size, scale });
                 }
             }
             OutputEvent::Created(None) => {}
@@ -290,36 +285,7 @@ impl App {
             size_limits: Limits::NONE,
             ..Default::default()
         });
-        // Corner rounding is requested later, once the surface has
-        // presented a frame: see `round_surface`.
         create
-    }
-
-    /// Any surface still waiting for its corner radius (see `round_surface`).
-    fn awaiting_radius(&self) -> bool {
-        self.clients.values().any(|c| c.surface.is_some() && !c.rounded)
-    }
-
-    /// `id` has just presented a frame: ask cosmic-comp to round its corners
-    /// (cosmic_corner_radius_layer_v1) if not done yet at the current
-    /// `corner_radius`. Not at creation: cosmic-comp 1.7 validates the radius
-    /// against the surface's *current* bounding box at the next commit, which
-    /// is 0×0 until a buffer has landed, so a radius requested before the
-    /// first frame is a fatal `radius_too_large` protocol error. iced
-    /// broadcasts `RedrawRequested` right before it presents, and this
-    /// message is handled afterwards, so our request is ordered after that
-    /// commit on the wire. The captured subsurface is clipped too —
-    /// compositor behaviour, verified by eye.
-    fn round_surface(&mut self, id: SurfaceId) -> Task<cosmic::Action<Msg>> {
-        let Some(c) = self.clients.values_mut().find(|c| c.surface == Some(id)) else { return Task::none() };
-        if c.rounded {
-            return Task::none();
-        }
-        c.rounded = true;
-        let r = self.config.corner_radius;
-        tracing::info!(?id, r, "corner_radius");
-        corner_radius(id, Some(CornerRadius { top_left: r, top_right: r, bottom_left: r, bottom_right: r }))
-            .map(|_| unreachable!("oneshot corner_radius never produces output"))
     }
 
     fn destroy_surface(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {
@@ -345,7 +311,6 @@ impl App {
         if let Some(c) = self.clients.get_mut(handle) {
             c.hovered = false;
             c.last_cursor = Point::ORIGIN;
-            c.rounded = false;
         }
         Some(id)
     }
@@ -621,7 +586,6 @@ impl App {
                     unavailable: false,
                     placed: false,
                     last_size: None,
-                    rounded: false,
                     paused: false,
                 });
                 let was_named = matches!(entry.info.login, Login::LoggedIn(_));
@@ -671,8 +635,8 @@ impl App {
         }
     }
 
-    /// Apply a freshly re-read (and validated) config. Border colours,
-    /// opacity and names apply on the next redraw automatically because
+    /// Apply a freshly re-read (and validated) config. Border colours and
+    /// names apply on the next redraw automatically because
     /// `view_window` reads `self.config`; sizes and visibility need pushing.
     fn apply_config(&mut self, new: Config) -> Task<cosmic::Action<Msg>> {
         if new == self.config {
@@ -686,10 +650,6 @@ impl App {
             self.send(Cmd::SetFps(new.fps));
         }
         let mode_changed = new.mode != self.config.mode;
-        if new.corner_radius != self.config.corner_radius {
-            // Re-request on every surface at its next frame (see `round_surface`).
-            self.clients.values_mut().for_each(|c| c.rounded = false);
-        }
         self.config = new;
         let mut tasks = Vec::new();
         if mode_changed {
@@ -792,7 +752,6 @@ impl Application for App {
                 }
             }
             Msg::Tray(tray::TrayEvent::Quit) => cosmic::iced::exit(),
-            Msg::Redrawn(id) => self.round_surface(id),
         }
     }
 
@@ -811,16 +770,6 @@ impl Application for App {
             config_watch::subscription().map(Msg::ConfigChanged),
             tray::subscription().map(Msg::Tray),
         ];
-        if self.awaiting_radius() {
-            // Redraw events are only forwarded while needed: each one is a
-            // message, and a message schedules a redraw, so a permanent
-            // subscription would be a (frame-callback-paced) loop.
-            // (`listen_with` drops redraw events; `listen_raw` forwards them.)
-            subs.push(iced::event::listen_raw(|event, _status, id| match event {
-                iced::Event::Window(iced::window::Event::RedrawRequested(_)) => Some(Msg::Redrawn(id)),
-                _ => None,
-            }));
-        }
         if let Some(conn) = self.conn.clone() {
             subs.push(
                 backend::subscription(conn, self.config.app_ids.clone(), self.config.fps)

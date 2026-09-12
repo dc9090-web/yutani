@@ -64,10 +64,11 @@ pub fn view<'a>(client: &'a Client, config: &Config) -> Element<'a, Msg> {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .content_fit(ContentFit::Contain)
-                // cosmic-comp skips the rounded-corner clip for fully opaque
-                // subsurfaces (opaque fast path); 0.999 is indistinguishable
-                // from 1.0 and keeps the corners.
-                .alpha(if config.corner_radius > 0 { config.opacity.min(0.999) } else { config.opacity })
+                // Below the parent (z < 0) so the iced border, name label and
+                // pin glyph paint over the image. The backend ships frames
+                // already upright and corner-masked; when it can't (no GL)
+                // the raw frame carries its own transform.
+                .z(-1)
                 .transform(img.transform)
                 .into(),
             None => widget::container(widget::text("waiting for frame…").size(12))

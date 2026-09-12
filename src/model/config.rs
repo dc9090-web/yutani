@@ -34,8 +34,6 @@ pub struct Config {
     pub app_ids: Vec<String>,
     /// Thumbnail width in logical pixels; height follows the window's aspect.
     pub thumb_width: u32,
-    /// 0.0–1.0
-    pub opacity: f32,
     /// Max capture rate: 10, 15, 30 or 60.
     pub fps: u32,
     /// "#rrggbb" or "#rrggbbaa"; `None` follows the COSMIC theme's accent
@@ -64,7 +62,6 @@ impl Default for Config {
         Self {
             app_ids: vec!["exefile.exe".to_string(), "steam_app_8500".to_string()],
             thumb_width: 480,
-            opacity: 1.0,
             fps: 30,
             active_border: None,
             inactive_border: "#404040".to_string(),
@@ -139,7 +136,6 @@ impl Config {
             };
         }
         check!(thumb_width, |v: &u32| (80..=1600).contains(v), "80..=1600");
-        check!(opacity, |v: &f32| (0.0..=1.0).contains(v), "0.0..=1.0");
         check!(fps, |v: &u32| [10, 15, 30, 60].contains(v), "10|15|30|60");
         check!(zoom_factor, |v: &f32| (1.0..=4.0).contains(v), "1.0..=4.0");
         check!(border_px, |v: &u32| *v <= 16, "0..=16");
@@ -180,7 +176,6 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.app_ids, vec!["exefile.exe".to_string(), "steam_app_8500".to_string()]);
         assert_eq!(c.thumb_width, 480);
-        assert_eq!(c.opacity, 1.0);
         assert_eq!(c.fps, 30);
         assert_eq!(c.active_border, None);
         assert_eq!(c.inactive_border, "#404040");
@@ -257,7 +252,6 @@ mod tests {
     fn validate_replaces_bad_values_with_defaults() {
         let c = Config {
             thumb_width: 10,
-            opacity: 7.0,
             fps: 17,
             zoom_factor: 0.2,
             active_border: Some("nope".into()),
@@ -267,7 +261,6 @@ mod tests {
         .validate();
         let d = Config::default();
         assert_eq!(c.thumb_width, d.thumb_width);
-        assert_eq!(c.opacity, d.opacity);
         assert_eq!(c.fps, d.fps);
         assert_eq!(c.zoom_factor, d.zoom_factor);
         assert_eq!(c.active_border, d.active_border);
@@ -276,7 +269,7 @@ mod tests {
 
     #[test]
     fn validate_keeps_good_values() {
-        let c = Config { thumb_width: 480, opacity: 0.5, fps: 60, zoom_factor: 2.0, border_px: 0, ..Config::default() };
+        let c = Config { thumb_width: 480, fps: 60, zoom_factor: 2.0, border_px: 0, ..Config::default() };
         assert_eq!(c.clone().validate(), c);
     }
 
@@ -290,6 +283,13 @@ mod tests {
         let c: Config = ron::from_str(text).unwrap();
         assert_eq!(c.mode, Mode::Floating);
         assert_eq!(c.dock_edge, Edge::Left);
+    }
+
+    #[test]
+    fn stale_opacity_field_is_ignored() {
+        // Removed in the GPU-thumbnails spec; old config files still parse.
+        let c: Config = ron::from_str("(opacity: 0.5, thumb_width: 300)").unwrap();
+        assert_eq!(c.thumb_width, 300);
     }
 
     #[test]
