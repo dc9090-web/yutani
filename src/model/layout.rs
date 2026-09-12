@@ -118,14 +118,21 @@ pub fn derive_anchor(thumbs: &BTreeMap<String, ThumbPos>) -> Anchor {
         .unwrap_or_default()
 }
 
-/// The `order` a save records: every live character in layout order, then
-/// the names the file already carried that are not running right now (a
-/// character who is merely logged out keeps their place), deduplicated and
-/// capped at `cap`.
+/// The `order` a save records: the previously recorded order is kept
+/// unchanged — a character who is merely logged out keeps their slot —
+/// with any live character not already in that recorded order appended
+/// after it, in live order. Live characters that *are* already recorded
+/// stay at their recorded slot rather than jumping to the front.
+/// Deduplicated and capped at `cap`.
 pub fn merge_order(live: &[String], previous: &[String], cap: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(live.len() + previous.len());
-    for name in live.iter().chain(previous.iter()) {
+    for name in previous {
         if !out.iter().any(|n| n == name) {
+            out.push(name.clone());
+        }
+    }
+    for name in live {
+        if !previous.iter().any(|n| n == name) && !out.iter().any(|n| n == name) {
             out.push(name.clone());
         }
     }
@@ -280,24 +287,70 @@ pub fn rename_named(from: &str, to: &str) -> Result<(), String> {
     rename_named_in(&layouts_dir(), from, to)
 }
 
+/// See [`Layout::save_gate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveGate {
+    /// Not poisoned: write normally.
+    Proceed,
+    /// Poisoned and already warned about it: refuse without logging again.
+    RefuseSilently,
+    /// Poisoned and not yet warned: refuse, and this is the call that logs
+    /// the one-time warning.
+    RefuseAndWarn,
+}
+
 impl Layout {
     pub fn load() -> Self {
         Self::load_from(&current_path())
     }
 
+    /// Lenient load: missing or unreadable/unparseable file all become
+    /// `Layout::default()`, with a warning for the latter two. The file
+    /// itself is never touched. Callers that need to tell "unparseable"
+    /// apart from "missing" — so they can refuse to overwrite a poisoned
+    /// file — use [`Layout::try_load_from`] instead.
     pub fn load_from(path: &Path) -> Self {
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
-            Err(e) => {
-                tracing::warn!("cannot read {}: {e}; starting with an empty layout", path.display());
-                return Self::default();
+        match Self::try_load_from(path) {
+            Ok(Some(layout)) => layout,
+            Ok(None) => Self::default(),
+            Err(msg) => {
+                tracing::warn!("{msg}; starting with an empty layout");
+                Self::default()
             }
-        };
-        ron::from_str(&text).unwrap_or_else(|e| {
-            tracing::warn!("cannot parse {}: {e}; starting with an empty layout", path.display());
-            Self::default()
-        })
+        }
+    }
+
+    /// Strict load, so a caller can tell a hand-edited `current.ron` with a
+    /// typo apart from one that simply doesn't exist yet: `Ok(None)` = no
+    /// file, `Ok(Some(layout))` = it parsed, `Err` = it exists but cannot be
+    /// read or parsed — in which case nothing may overwrite it (spec §10:
+    /// "never overwrite the offending file").
+    pub fn try_load_from(path: &Path) -> Result<Option<Layout>, String> {
+        match std::fs::read_to_string(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+            Ok(text) => ron::from_str::<Layout>(&text)
+                .map(Some)
+                .map_err(|e| format!("cannot parse {}: {e}", path.display())),
+        }
+    }
+
+    pub fn try_load() -> Result<Option<Layout>, String> {
+        Self::try_load_from(&current_path())
+    }
+
+    /// What `save_current_layout` does about a save attempt, given whether
+    /// `current.ron` is known to be poisoned (unparseable on disk) and
+    /// whether the one-time warning about that has already been logged.
+    /// Never overwrites a poisoned file (spec §10); warns about it exactly
+    /// once, not on every add/remove event that would otherwise trigger a
+    /// save.
+    pub fn save_gate(poisoned: bool, already_warned: bool) -> SaveGate {
+        match (poisoned, already_warned) {
+            (false, _) => SaveGate::Proceed,
+            (true, true) => SaveGate::RefuseSilently,
+            (true, false) => SaveGate::RefuseAndWarn,
+        }
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
@@ -410,6 +463,37 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn try_load_from_distinguishes_missing_from_broken() {
+        let dir = tmpdir("layout-try-load");
+        let path = dir.join("current.ron");
+
+        // Missing: Ok(None), and the file is not created by the check.
+        assert_eq!(Layout::try_load_from(&path), Ok(None));
+        assert!(!path.exists());
+
+        // Unparseable: Err, and the file is left untouched.
+        std::fs::write(&path, "garbage").unwrap();
+        assert!(Layout::try_load_from(&path).unwrap_err().contains("cannot parse"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "garbage");
+
+        // Valid: Ok(Some(..)).
+        let mut l = Layout::default();
+        l.thumbs.insert("Aria Vex".into(), pos("DP-1", 40, 40));
+        l.save_to(&path).unwrap();
+        assert_eq!(Layout::try_load_from(&path), Ok(Some(l)));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_gate_writes_normally_unless_poisoned_and_warns_at_most_once() {
+        assert_eq!(Layout::save_gate(false, false), SaveGate::Proceed);
+        assert_eq!(Layout::save_gate(false, true), SaveGate::Proceed);
+        assert_eq!(Layout::save_gate(true, false), SaveGate::RefuseAndWarn);
+        assert_eq!(Layout::save_gate(true, true), SaveGate::RefuseSilently);
+    }
+
     fn tmpdir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("yutani-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -456,12 +540,16 @@ mod tests {
     }
 
     #[test]
-    fn merge_order_keeps_logged_out_characters_behind_the_live_ones() {
+    fn merge_order_keeps_recorded_slots_and_appends_new_live_names() {
         let live = ["Kel".to_string(), "Aria".to_string()];
         let previous = ["Aria".to_string(), "Zoe".to_string()];
-        assert_eq!(merge_order(&live, &previous, MAX_ORDER), vec!["Kel", "Aria", "Zoe"]);
-        // The cap bounds the file even after years of characters.
-        assert_eq!(merge_order(&live, &previous, 2), vec!["Kel", "Aria"]);
+        // Aria keeps her recorded slot (does not jump to the front just
+        // because she's live); Zoe (logged out) keeps hers too; Kel (live,
+        // never recorded) is appended after.
+        assert_eq!(merge_order(&live, &previous, MAX_ORDER), vec!["Aria", "Zoe", "Kel"]);
+        // The cap bounds the file even after years of characters: it drops
+        // from the newly-appended end, not out of the recorded order.
+        assert_eq!(merge_order(&live, &previous, 2), vec!["Aria", "Zoe"]);
         assert!(merge_order(&[], &[], MAX_ORDER).is_empty());
     }
 

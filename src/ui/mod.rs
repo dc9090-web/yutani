@@ -100,6 +100,15 @@ pub struct App {
     pub clients: HashMap<Handle, Client>,
     pub outputs: Vec<Output>,
     pub layout: Layout,
+    /// Set at startup when `current.ron` exists but failed to parse (spec
+    /// §10). While true, `self.layout` is an empty stand-in and nothing may
+    /// overwrite the file on disk — `save_current_layout` refuses every
+    /// write until it is fixed or deleted by hand and the app restarts.
+    pub layout_poisoned: bool,
+    /// Whether the one-time "layout is poisoned, not saving" warning has
+    /// already been logged, so repeated saves (one per client add/remove)
+    /// don't spam the log.
+    layout_poison_warned: bool,
     pub drag: Option<pointer::DragState>,
     /// IPC-toggled visibility: when true, no thumbnail is shown regardless
     /// of `Visibility`/`hide_active`. The panel applet and the CLI both go
@@ -155,9 +164,13 @@ impl App {
         }
     }
 
-    /// Integer scale of the output `client` is (or would be) shown on.
-    fn scale_for(&self, client: &Client) -> i32 {
-        self.output_for(&client.info)
+    /// Integer scale of the output the thumbnail actually sits on (floating
+    /// mode may place it on a different output than the client's own
+    /// window, e.g. a saved position on another connector), falling back to
+    /// the client's own output when the thumbnail's isn't resolvable.
+    fn scale_for(&self, handle: &Handle, client: &Client) -> i32 {
+        self.output_for_thumb(handle)
+            .or_else(|| self.output_for(&client.info))
             .and_then(|handle| self.outputs.iter().find(|o| o.handle == handle))
             .map_or(1, |o| o.scale)
     }
@@ -172,7 +185,7 @@ impl App {
             return;
         }
         let Some(client) = self.clients.get(handle) else { return };
-        let s = self.scale_for(client) as u32;
+        let s = self.scale_for(handle, client) as u32;
         let physical = (logical.0 * s, logical.1 * s);
         let radius = self.config.corner_radius * s;
         tracing::debug!(?handle, ?logical, scale = s, ?physical, radius, "thumb size");
@@ -301,8 +314,22 @@ impl App {
 
     /// Write `current.ron` — spec §9 auto-saves it on every drag, pin or
     /// order change — refreshing the recorded `order` and
-    /// `new_client_anchor` first.
+    /// `new_client_anchor` first. Refuses outright while the file on disk
+    /// is poisoned (spec §10: never overwrite a hand-edited file that
+    /// failed to parse), warning about it exactly once.
     fn save_current_layout(&mut self) {
+        match Layout::save_gate(self.layout_poisoned, self.layout_poison_warned) {
+            layout::SaveGate::RefuseAndWarn => {
+                tracing::warn!(
+                    "{} is unparseable; not overwriting it — fix or delete it by hand and restart",
+                    layout::current_path().display()
+                );
+                self.layout_poison_warned = true;
+                return;
+            }
+            layout::SaveGate::RefuseSilently => return,
+            layout::SaveGate::Proceed => {}
+        }
         let live = self.layout_order_names();
         let order = layout::merge_order(&live, &self.layout.order, layout::MAX_ORDER);
         self.layout.order = order;
@@ -957,6 +984,14 @@ impl Application for App {
     }
 
     fn init(core: cosmic::app::Core, flags: AppFlags) -> (Self, Task<cosmic::Action<Msg>>) {
+        let (layout, layout_poisoned) = match Layout::try_load() {
+            Ok(Some(layout)) => (layout, false),
+            Ok(None) => (Layout::default(), false),
+            Err(msg) => {
+                tracing::warn!("{msg}; starting with an empty layout and refusing to save until it's fixed");
+                (Layout::default(), true)
+            }
+        };
         let app = App {
             core,
             config: flags.0,
@@ -964,7 +999,9 @@ impl Application for App {
             cmd: None,
             clients: HashMap::new(),
             outputs: Vec::new(),
-            layout: Layout::load(),
+            layout,
+            layout_poisoned,
+            layout_poison_warned: false,
             drag: None,
             hidden: false,
         };

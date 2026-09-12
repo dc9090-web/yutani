@@ -71,7 +71,7 @@ pub fn dock_rank(order: &[String], label: &str) -> (usize, String) {
 /// ties, so equal ranks keep their existing relative order.
 pub fn focus_order<H>(mode: Mode, order: &[String], mut items: Vec<FocusItem<H>>) -> Vec<H> {
     match mode {
-        Mode::Dock => items.sort_by(|a, b| dock_rank(order, &a.label).cmp(&dock_rank(order, &b.label))),
+        Mode::Dock => items.sort_by_key(|i| dock_rank(order, &i.label)),
         Mode::Floating => items.sort_by(|a, b| {
             (a.output.as_str(), a.position.1, a.position.0).cmp(&(b.output.as_str(), b.position.1, b.position.0))
         }),
