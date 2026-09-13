@@ -998,19 +998,21 @@ impl App {
 
     /// Resize `handle`'s surface to its current target size, but only if it
     /// isn't already that size and it isn't a full-output drag canvas.
-    fn resize_if_needed(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {
-        let Some(client) = self.clients.get(handle) else { return Task::none() };
-        let Some(id) = client.surface else { return Task::none() };
+    /// `None` when nothing was sent — the size is unchanged — so a caller
+    /// can skip the dock relayout that only a size change can move.
+    fn resize_if_needed(&mut self, handle: &Handle) -> Option<Task<cosmic::Action<Msg>>> {
+        let client = self.clients.get(handle)?;
+        let id = client.surface?;
         if self.in_canvas(id) {
-            return Task::none();
+            return None;
         }
         let size = self.surface_size(client);
         if client.last_size == Some(size) {
-            return Task::none();
+            return None;
         }
         self.clients.get_mut(handle).unwrap().last_size = Some(size);
         self.send_thumb_size(handle, size);
-        set_size(id, Some(size.0), Some(size.1))
+        Some(set_size(id, Some(size.0), Some(size.1)))
     }
 
     fn on_pointer(&mut self, id: SurfaceId, event: mouse::Event) -> Task<cosmic::Action<Msg>> {
@@ -1123,7 +1125,8 @@ impl App {
                 }
                 self.clients.get_mut(&handle).unwrap().hovered = true;
                 // Dock mode: a zoomed thumbnail shifts its neighbours.
-                Task::batch([self.resize_if_needed(&handle), self.relayout_dock()])
+                let resize = self.resize_if_needed(&handle).unwrap_or_else(Task::none);
+                Task::batch([resize, self.relayout_dock()])
             }
             mouse::Event::CursorLeft => {
                 // Releasing outside is delivered to us anyway (implicit grab); nothing
@@ -1132,7 +1135,8 @@ impl App {
                     return Task::none();
                 }
                 self.clients.get_mut(&handle).unwrap().hovered = false;
-                Task::batch([self.resize_if_needed(&handle), self.relayout_dock()])
+                let resize = self.resize_if_needed(&handle).unwrap_or_else(Task::none);
+                Task::batch([resize, self.relayout_dock()])
             }
             _ => Task::none(),
         }
@@ -1202,16 +1206,21 @@ impl App {
                 let Some(client) = self.clients.get_mut(&handle) else { return Task::none() };
                 client.image = Some(image);
                 client.unavailable = false;
-                let task = if client.surface.is_some() {
+                if client.surface.is_some() {
                     // `resize_if_needed` skips a drag canvas and dedupes
-                    // against the last size actually sent.
-                    self.resize_if_needed(&handle)
+                    // against the last size actually sent. Dock mode: only
+                    // a new aspect changes this thumbnail's size and so
+                    // moves its neighbours — at fps × clients frames a
+                    // second, an unchanged size must not cost a relayout.
+                    match self.resize_if_needed(&handle) {
+                        Some(resize) => Task::batch([resize, self.relayout_dock()]),
+                        None => Task::none(),
+                    }
                 } else {
-                    self.create_surface(&handle)
-                };
-                // Dock mode: a first frame (or a new aspect) changes this
-                // thumbnail's size, which moves its neighbours.
-                Task::batch([task, self.relayout_dock()])
+                    // Dock mode: a first frame sizes the thumbnail.
+                    let create = self.create_surface(&handle);
+                    Task::batch([create, self.relayout_dock()])
+                }
             }
             Event::CaptureUnavailable(handle) => {
                 if let Some(c) = self.clients.get_mut(&handle) {
@@ -1272,7 +1281,7 @@ impl App {
             // `resize_if_needed` skips a drag canvas (must keep its size
             // until the drag ends — `leave_canvas` applies the current size
             // then) and dedupes against the last size actually sent.
-            tasks.push(self.resize_if_needed(&h));
+            tasks.extend(self.resize_if_needed(&h));
         }
         // Dock mode: `reconcile_surfaces` already re-laid out every surface
         // at its new size (the layout reads `surface_size`, not `last_size`)
@@ -2354,6 +2363,25 @@ mod tests {
                 Reply::Later => "later".into(),
             });
         }
+    }
+
+    /// [P1] `relayout_dock` ran on every frame in dock mode (fps × clients
+    /// a second), though the size — the only thing a frame can change —
+    /// changes on the first frame or a new aspect only. `resize_if_needed`
+    /// says whether it sent a size, and the frame handler relays out only
+    /// then: unchanged is `None`, a zoom (hover) is `Some`.
+    #[test]
+    fn an_unchanged_size_sends_nothing_so_the_frame_path_skips_the_relayout() {
+        let fake = Fake::new();
+        let mut app = app(Config { visibility: Visibility::Always, zoom_factor: 1.5, ..Config::default() });
+        add_output(&mut app, &fake, "DP-1");
+        let a = fake.handle();
+        let _ = app.on_backend(Event::ClientAdded(a.clone(), info(true, Vec::new())));
+        assert!(surface_of(&app, &a).is_some());
+        assert!(app.resize_if_needed(&a).is_none(), "same size as at creation");
+        app.clients.get_mut(&a).unwrap().hovered = true;
+        assert!(app.resize_if_needed(&a).is_some(), "zoomed: a new size");
+        assert!(app.resize_if_needed(&a).is_none(), "and sent once");
     }
 
     /// [I3] The watcher's answer to a `config.ron` that does not parse:
