@@ -1,10 +1,12 @@
 //! The applet's `cosmic::Application`: poll `status`, keep the last reply,
 //! render it, send actions back. No domain state of its own.
 
-use std::io;
+use std::io::{self, Read as _};
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+
+use tokio::sync::oneshot;
 
 use cosmic::app::{Core, Task};
 use cosmic::iced::window::Id;
@@ -15,7 +17,7 @@ use yutani::applet::client::{self, IpcError};
 use yutani::applet::display::{Display, degrade, display};
 use yutani::applet::rate::{Rates, Sampler};
 use yutani::applet::{
-    Action, PENDING_S, Poll, daemon_exe, note_visible, pending_done, poll_interval, still_pending,
+    Action, PENDING_S, Poll, note_visible, pending_done, poll_interval, start_command, still_pending,
     waiting_note,
 };
 use yutani::tunnel::status::Status;
@@ -74,20 +76,78 @@ pub enum Msg {
     PopupClosed(Id),
 }
 
-/// Spawn `cmd` fully detached from the applet: no inherited stdio (so a
-/// noisy child cannot write to whatever the applet's own stdio happens to
-/// be), its own process group (so a signal aimed at the applet's process
-/// group — the panel's, at logout — does not also reach it), and reaped on
-/// a dedicated thread so a finished child never sits as a zombie under the
-/// applet's pid for as long as the applet keeps running. Used for the one
-/// fire-and-forget spawn left: `Start Yutani`.
-fn spawn_detached(cmd: &mut Command) -> io::Result<()> {
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0);
+/// How long "Start Yutani" watches the child before taking silence as
+/// success. `systemctl start` returns within this; an in-process daemon
+/// that is going to die at startup (config parse error, "already running",
+/// the compositor refusing it) does so within this too.
+const START_WINDOW: Duration = Duration::from_secs(2);
+
+/// How much of the child's stderr is kept for the note. The rest is read
+/// and dropped, so a chatty daemon never blocks on a full pipe.
+const STDERR_CAP: usize = 4096;
+
+/// What a detached child did, once it has exited: its status and what it
+/// wrote to stderr (the first [`STDERR_CAP`] bytes, lossily decoded).
+#[derive(Debug)]
+struct Exit {
+    status: ExitStatus,
+    stderr: String,
+}
+
+/// Spawn `cmd` detached from the applet: no inherited stdin/stdout, stderr
+/// on a pipe the applet drains (so a noisy child cannot write to whatever
+/// the applet's own stdio happens to be, and what it says as it dies is
+/// not lost), its own process group (so a signal aimed at the applet's
+/// process group — the panel's, at logout — does not also reach it), and
+/// reaped on a dedicated thread so a finished child never sits as a zombie
+/// under the applet's pid for as long as the applet keeps running. The
+/// receiver reports the child's [`Exit`]; a child that outlives the
+/// applet's interest simply finds it dropped. Used for the one spawn there
+/// is: `Start Yutani`.
+///
+/// The thread drains stderr to EOF *before* waiting: the daemon's own
+/// children are all short-lived or given their own stderr, so EOF follows
+/// its exit closely, and reading first means the whole of a short dying
+/// message is there when the status is.
+fn spawn_detached(cmd: &mut Command) -> io::Result<oneshot::Receiver<Exit>> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).process_group(0);
     let mut child = cmd.spawn()?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
+    let (tx, rx) = oneshot::channel();
+    let reap = move || {
+        let mut kept = Vec::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = stderr.read(&mut buf)
+                && n > 0
+            {
+                let room = STDERR_CAP.saturating_sub(kept.len());
+                kept.extend_from_slice(&buf[..n.min(room)]);
+            }
+        }
+        if let Ok(status) = child.wait() {
+            let _ = tx.send(Exit { status, stderr: String::from_utf8_lossy(&kept).into_owned() });
+        }
+    };
+    // A thread that cannot be spawned (`RLIMIT_NPROC`, cgroup `pids.max`)
+    // is an error to show, not a panic that takes the applet down; the
+    // child is left to init and its receiver reports nothing.
+    if let Err(err) = std::thread::Builder::new().name("reap-yutani".into()).spawn(reap) {
+        tracing::warn!("cannot spawn the reaper thread for yutani start: {err}");
+    }
+    Ok(rx)
+}
+
+/// What "Start Yutani" makes of the child's fate at the end of
+/// [`START_WINDOW`]: `None` (still running) or a clean exit is success —
+/// the polls that follow show the daemon — and a failed exit is the last
+/// thing it said, or its status when it said nothing.
+fn start_outcome(exit: Option<Exit>) -> Result<(), String> {
+    let Some(exit) = exit else { return Ok(()) };
+    if exit.status.success() {
+        return Ok(());
+    }
+    let last_line = exit.stderr.lines().rev().map(str::trim).find(|l| !l.is_empty());
+    Err(last_line.map_or_else(|| format!("yutani start: {}", exit.status), str::to_string))
 }
 
 impl Applet {
@@ -250,16 +310,22 @@ impl cosmic::Application for Applet {
                 self.note(msg, None);
                 after_reply
             }
-            Msg::Press(Action::StartDaemon) => {
-                let mut cmd = Command::new(daemon_exe());
-                match spawn_detached(&mut cmd) {
-                    Ok(()) => self.poll(),
-                    Err(err) => {
-                        self.note(format!("cannot start yutani: {err}"), Some(Action::StartDaemon));
-                        Task::none()
-                    }
+            Msg::Press(Action::StartDaemon) => match spawn_detached(&mut start_command()) {
+                // Watch it for the window off the UI thread: a start that
+                // fails is a note under the row, not a menu stuck on
+                // "Start Yutani" with the reason in /dev/null.
+                Ok(exit) => Task::batch([
+                    self.poll(),
+                    cosmic::task::future(async move {
+                        let exit = tokio::time::timeout(START_WINDOW, exit).await.ok().and_then(Result::ok);
+                        Msg::Done(Action::StartDaemon, start_outcome(exit))
+                    }),
+                ]),
+                Err(err) => {
+                    self.note(format!("cannot start yutani: {err}"), Some(Action::StartDaemon));
+                    Task::none()
                 }
-            }
+            },
             Msg::Press(action) => {
                 let Some(request) = action.request() else {
                     return Task::none();
@@ -398,6 +464,11 @@ mod tests {
             .count()
     }
 
+    /// A current-thread runtime, as `client.rs`'s tests use.
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_io().enable_time().build().unwrap().block_on(f)
+    }
+
     /// `/bin/true` exits immediately; a well-behaved detached spawn leaves
     /// no trace of it once its reaper thread has had a moment to run.
     #[test]
@@ -407,6 +478,9 @@ mod tests {
         let mut cmd = Command::new("/bin/true");
         let result = spawn_detached(&mut cmd);
         assert!(result.is_ok(), "{result:?}");
+        let exit = block_on(result.unwrap()).expect("the reaper reports the exit");
+        assert!(exit.status.success());
+        assert_eq!(exit.stderr, "");
 
         // spawn_detached must not itself block on the child, so this line
         // is reached immediately; give the background reaper thread a
@@ -426,6 +500,50 @@ mod tests {
         let mut cmd = Command::new("/no/such/binary-yutani-test");
         let err = spawn_detached(&mut cmd).expect_err("must not exist");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// I1: a daemon that dies at startup (config parse error, "yutani is
+    /// already running", a unit that fails to start) used to vanish into
+    /// /dev/null with the menu stuck on "Start Yutani". Its exit status and
+    /// what it said on stderr now come back, and the last line of that is
+    /// the note under the row.
+    #[test]
+    fn spawn_detached_reports_a_startup_failure_with_its_stderr() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "echo first >&2; echo yutani is already running >&2; exit 3"]);
+        let exit = block_on(spawn_detached(&mut cmd).unwrap()).unwrap();
+        assert_eq!(exit.status.code(), Some(3));
+        assert_eq!(exit.stderr, "first\nyutani is already running\n");
+        assert_eq!(start_outcome(Some(exit)), Err("yutani is already running".to_string()));
+    }
+
+    /// stderr is kept only up to `STDERR_CAP` but *drained* past it, so a
+    /// chatty child never blocks on a full pipe — and the child's exit is
+    /// still reported. A failure that said nothing is reported by status.
+    #[test]
+    fn spawn_detached_bounds_the_captured_stderr_without_blocking_the_child() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "head -c 200000 /dev/zero | tr '\\0' x >&2; exit 1"]);
+        let exit = block_on(spawn_detached(&mut cmd).unwrap()).unwrap();
+        assert_eq!(exit.status.code(), Some(1));
+        assert_eq!(exit.stderr.len(), STDERR_CAP);
+        assert!(exit.stderr.bytes().all(|b| b == b'x'));
+        assert_eq!(start_outcome(Some(exit)).unwrap_err().len(), STDERR_CAP, "the last line, however long");
+
+        let mut silent = Command::new("/bin/sh");
+        silent.args(["-c", "exit 2"]);
+        let exit = block_on(spawn_detached(&mut silent).unwrap()).unwrap();
+        assert_eq!(start_outcome(Some(exit)), Err("yutani start: exit status: 2".to_string()));
+    }
+
+    /// Still running when the window closes — the normal in-process start
+    /// — or exited cleanly (`systemctl start` returned 0): both are "it
+    /// started", and the polls that follow show the daemon.
+    #[test]
+    fn a_daemon_still_running_after_the_window_or_exited_cleanly_has_started() {
+        assert_eq!(start_outcome(None), Ok(()));
+        let exit = block_on(spawn_detached(&mut Command::new("/bin/true")).unwrap()).unwrap();
+        assert_eq!(start_outcome(Some(exit)), Ok(()));
     }
 
     fn applet() -> Applet {

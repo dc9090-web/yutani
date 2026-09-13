@@ -88,6 +88,17 @@ pub fn daemon_exe() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("yutani"))
 }
 
+/// What "Start Yutani" runs: `yutani start`, the same as the launcher
+/// entry — through the systemd user unit when `yutani service install`
+/// has been run (crash restart, journald, stoppable via the unit), else
+/// the daemon in that process. Bare `yutani` would bypass an installed
+/// unit and leave a daemon it cannot see.
+pub fn start_command() -> std::process::Command {
+    let mut cmd = std::process::Command::new(daemon_exe());
+    cmd.arg("start");
+    cmd
+}
+
 /// A pending connect/disconnect has got what it asked for: the tunnel a
 /// Connect wanted up is up, or the one a Disconnect wanted down is down.
 pub fn pending_done(want_connected: bool, observed_connected: bool) -> bool {
@@ -197,6 +208,17 @@ mod tests {
         assert_eq!(exe.file_name().unwrap(), "yutani");
         // Either an absolute sibling that exists, or the bare name for PATH.
         assert!(exe.is_absolute() && exe.is_file() || exe == std::path::Path::new("yutani"));
+    }
+
+    /// I1: "Start Yutani" runs `yutani start`, not bare `yutani` — that is
+    /// what routes through the systemd user unit when one is installed
+    /// (crash restart, journald, stoppable via the unit) and is byte-for-
+    /// byte the in-process daemon when none is.
+    #[test]
+    fn start_yutani_goes_through_yutani_start() {
+        let cmd = start_command();
+        assert_eq!(std::path::Path::new(cmd.get_program()).file_name().unwrap(), "yutani");
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["start"]);
     }
 
     #[test]
