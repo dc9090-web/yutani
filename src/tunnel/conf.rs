@@ -93,11 +93,21 @@ impl WgConf {
                 Some((ip.parse::<Ipv4Addr>().ok()?, len.parse::<u8>().ok()?))
             })
             .ok_or("[Interface] Address has no IPv4 entry")?;
+        // `ip address add` refuses these with `Invalid argument`, which
+        // would otherwise only show up on `connect`, as a failed unit.
+        if prefix_len > 32 {
+            return Err(format!("[Interface] Address {address}/{prefix_len}: an IPv4 prefix length is at most /32"));
+        }
         let dns = match get(iface, "DNS") {
             Some(v) => v.split(',').map(str::trim).find_map(|d| d.parse::<Ipv4Addr>().ok()),
             None => None,
         };
         let mtu = get(iface, "MTU").map(|m| m.parse::<u32>().map_err(|_| format!("bad MTU {m:?}"))).transpose()?;
+        if let Some(m) = mtu
+            && !(576..=65535).contains(&m)
+        {
+            return Err(format!("bad MTU {m}: must be between 576 and 65535"));
+        }
         let peer_public_key = get(peer, "PublicKey").ok_or("[Peer] needs PublicKey")?.to_string();
         let preshared_key = get(peer, "PresharedKey").map(str::to_string);
         let allowed_ips: Vec<String> =
@@ -173,6 +183,30 @@ mod tests {
         assert_eq!(c.address.to_string(), "10.9.8.7");
         assert_eq!(c.prefix_len, 24);
         assert_eq!(c.mtu, Some(1380));
+    }
+
+    /// `Address = 10.2.0.2/40` and `MTU = 0` used to pass the parse (and
+    /// `install-root`'s "fully parsed" check) and only fail on `connect`,
+    /// as `ip address add … Invalid argument` in the journal and a failed
+    /// unit. They are refused here, with the same clear message the other
+    /// fields get.
+    #[test]
+    fn address_prefix_and_mtu_are_range_checked_at_parse_time() {
+        for len in ["33", "40", "255"] {
+            let text = PROTON.replace("Address = 10.2.0.2/32", &format!("Address = 10.2.0.2/{len}"));
+            let e = WgConf::parse(&text, "x").unwrap_err();
+            assert!(e.contains("Address") && e.contains(&format!("/{len}")), "got {e}");
+        }
+        for mtu in ["0", "575", "65536", "100000"] {
+            let text = PROTON.replace("Address = 10.2.0.2/32", &format!("Address = 10.2.0.2/32\nMTU = {mtu}"));
+            let e = WgConf::parse(&text, "x").unwrap_err();
+            assert!(e.contains("MTU") && e.contains(mtu), "got {e}");
+        }
+        for mtu in ["576", "1380", "65535"] {
+            let text = PROTON.replace("Address = 10.2.0.2/32", &format!("Address = 10.2.0.2/32\nMTU = {mtu}"));
+            assert_eq!(WgConf::parse(&text, "x").unwrap().mtu, Some(mtu.parse().unwrap()));
+        }
+        assert_eq!(WgConf::parse(&PROTON.replace("10.2.0.2/32", "10.2.0.2/0"), "x").unwrap().prefix_len, 0);
     }
 
     /// Root reads whatever `--conf` names and `main` prints the parse error
