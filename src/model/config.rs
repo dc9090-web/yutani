@@ -123,6 +123,9 @@ pub struct Config {
     pub shortcuts: ShortcutsConfig,
     /// EVE-only WireGuard tunnel.
     pub tunnel: TunnelConfig,
+    /// EVE's profile directory (the one holding `core_char_*.dat`), when
+    /// Steam's library list cannot find it. Absolute path.
+    pub eve_settings_dir: Option<String>,
 }
 
 impl Default for Config {
@@ -145,6 +148,7 @@ impl Default for Config {
             dock_edge: Edge::Top,
             shortcuts: ShortcutsConfig::default(),
             tunnel: TunnelConfig::default(),
+            eve_settings_dir: None,
         }
     }
 }
@@ -309,6 +313,7 @@ impl Config {
                 self.shortcuts = ShortcutsConfig::default();
             }
         }
+        check!(eve_settings_dir, |v: &Option<String>| v.as_deref().is_none_or(|p| Path::new(p).is_absolute()), "absolute path or unset");
         self
     }
 }
@@ -441,6 +446,7 @@ mod tests {
             zoom_factor: 0.2,
             active_border: Some("nope".into()),
             border_px: 99,
+            eve_settings_dir: Some("relative/dir".into()),
             ..Config::default()
         }
         .validate();
@@ -450,11 +456,19 @@ mod tests {
         assert_eq!(c.zoom_factor, d.zoom_factor);
         assert_eq!(c.active_border, d.active_border);
         assert_eq!(c.border_px, d.border_px);
+        assert_eq!(c.eve_settings_dir, None);
     }
 
     #[test]
     fn validate_keeps_good_values() {
-        let c = Config { thumb_width: 480, fps: 60, zoom_factor: 2.0, border_px: 0, ..Config::default() };
+        let c = Config {
+            thumb_width: 480,
+            fps: 60,
+            zoom_factor: 2.0,
+            border_px: 0,
+            eve_settings_dir: Some("/abs".into()),
+            ..Config::default()
+        };
         assert_eq!(c.clone().validate(), c);
     }
 
