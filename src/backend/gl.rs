@@ -243,6 +243,64 @@ pub struct Gl {
     trash: TrashQueue,
 }
 
+/// What [`Gl::with_display`] builds on top of an initialised display; only
+/// assembled into a `Gl` (which then owns the display's lifetime) once
+/// everything has succeeded.
+struct GlParts {
+    context: egl::Context,
+    gl: glow::Context,
+    image_target_texture: ImageTargetFn,
+    image_target_renderbuffer: ImageTargetFn,
+    program: glow::Program,
+    vbo: glow::Buffer,
+    a_pos: u32,
+    u_uv: glow::UniformLocation,
+    u_size: glow::UniformLocation,
+    u_radius: glow::UniformLocation,
+    u_tex: glow::UniformLocation,
+}
+
+impl GlParts {
+    fn into_gl(self, egl: egl::DynamicInstance<egl::EGL1_5>, display: egl::Display) -> Gl {
+        let GlParts { context, gl, image_target_texture, image_target_renderbuffer, program, vbo, a_pos, u_uv, u_size, u_radius, u_tex } = self;
+        Gl { egl, display, _context: context, gl, image_target_texture, image_target_renderbuffer, program, vbo, a_pos, u_uv, u_size, u_radius, u_tex, trash: Arc::default() }
+    }
+}
+
+/// Everything `Gl` owns is freed here, on the thread that owns the
+/// context (a `Gl` lives in the backend thread's `AppData` or on `yutani
+/// doctor`'s stack and is dropped in place, never sent elsewhere): the
+/// trash that `Target`/`SourceTexture` drops have queued since the last
+/// `render`, the program and vbo, then the context and the display.
+/// Anything still referenced by a live `Target`/`SourceTexture` (the UI's
+/// `BufferSource` keeps the dmabuf itself alive independently) goes with
+/// `eglTerminate`; their later drops only push integers to a queue nobody
+/// reads. Without this a `GlState::Disabled` after `Ready` kept every
+/// EGLImage/FBO/texture of every client until process exit.
+impl Drop for Gl {
+    fn drop(&mut self) {
+        self.collect_trash();
+        // SAFETY: handles we created, on the context's thread.
+        unsafe {
+            self.gl.delete_program(self.program);
+            self.gl.delete_buffer(self.vbo);
+        }
+        release_display(&self.egl, self.display, Some(self._context));
+    }
+}
+
+/// Unbind and destroy `context` (if any) and terminate `display`. Shared by
+/// `Drop` and the error path of `Gl::new`, which otherwise leaked the
+/// initialised display (and any context) on every `?` after
+/// `eglInitialize`.
+fn release_display(egl: &egl::DynamicInstance<egl::EGL1_5>, display: egl::Display, context: Option<egl::Context>) {
+    let _ = egl.make_current(display, None, None, None);
+    if let Some(context) = context {
+        let _ = egl.destroy_context(display, context);
+    }
+    let _ = egl.terminate(display);
+}
+
 fn tex(id: u32) -> glow::Texture {
     glow::NativeTexture(NonZeroU32::new(id).expect("GL names are non-zero"))
 }
@@ -267,6 +325,26 @@ impl Gl {
         }
         .map_err(|e| anyhow!("eglGetPlatformDisplay(GBM): {e}"))?;
         egl.initialize(display).map_err(|e| anyhow!("eglInitialize: {e}"))?;
+        // From here on the display is initialised and must be released on
+        // every failure, so the rest runs in a function whose `?`s return
+        // to this one.
+        let mut context = None;
+        match Self::with_display(&egl, display, &mut context) {
+            Ok(parts) => Ok(parts.into_gl(egl, display)),
+            Err(err) => {
+                release_display(&egl, display, context);
+                Err(err)
+            }
+        }
+    }
+
+    /// The part of [`Gl::new`] after `eglInitialize`. `context` is set as
+    /// soon as one exists so the caller can destroy it on failure.
+    fn with_display(
+        egl: &egl::DynamicInstance<egl::EGL1_5>,
+        display: egl::Display,
+        context_out: &mut Option<egl::Context>,
+    ) -> anyhow::Result<GlParts> {
         let exts = egl.query_string(Some(display), egl::EXTENSIONS).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         ensure!(exts.contains("EGL_EXT_image_dma_buf_import"), "EGL lacks EGL_EXT_image_dma_buf_import");
         egl.bind_api(egl::OPENGL_ES_API).map_err(|e| anyhow!("eglBindAPI: {e}"))?;
@@ -288,6 +366,7 @@ impl Gl {
         let context = egl
             .create_context(display, config, None, &[egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE])
             .map_err(|e| anyhow!("eglCreateContext: {e}"))?;
+        *context_out = Some(context);
         if surfaceless {
             egl.make_current(display, None, None, Some(context)).map_err(|e| anyhow!("eglMakeCurrent: {e}"))?;
         } else {
@@ -347,22 +426,7 @@ impl Gl {
         let vendor = egl.query_string(Some(display), egl::VENDOR).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         // debug, not info: `yutani doctor` builds a `Gl` while printing its table.
         tracing::debug!("GL thumbnail pass ready ({vendor})");
-        Ok(Gl {
-            egl,
-            display,
-            _context: context,
-            gl,
-            image_target_texture,
-            image_target_renderbuffer,
-            program,
-            vbo,
-            a_pos,
-            u_uv,
-            u_size,
-            u_radius,
-            u_tex,
-            trash: Arc::default(),
-        })
+        Ok(GlParts { context, gl, image_target_texture, image_target_renderbuffer, program, vbo, a_pos, u_uv, u_size, u_radius, u_tex })
     }
 
     fn create_image(&self, dma: &Dmabuf) -> anyhow::Result<egl::Image> {
@@ -626,6 +690,22 @@ mod tests {
             let (bu, bv) = buffer_coords(t, x, y);
             assert!((u - bu).abs() < 1e-6 && (v - bv).abs() < 1e-6, "{t:?}");
         }
+    }
+
+    /// Needs a render node; skipped (passes) where there is none, as in a
+    /// headless CI. Exercises `Drop`: unbinding, destroying the context and
+    /// terminating the display must leave EGL in a state where the next
+    /// `Gl::new` on the same device succeeds, and a target dropped before
+    /// its `Gl` must not make the drop crash.
+    #[test]
+    fn a_gl_can_be_dropped_and_recreated_on_the_same_device() {
+        let Ok(gbm) = open_render_node() else { return };
+        let Ok(gl) = Gl::new(&gbm) else { return };
+        let target = gl.create_target(&gbm, &[], (16, 16)).expect("a small target");
+        drop(target);
+        drop(gl);
+        let gl = Gl::new(&gbm).expect("a second Gl after the first was released");
+        let _target = gl.create_target(&gbm, &[], (16, 16)).expect("a target on the second Gl");
     }
 
     #[test]
