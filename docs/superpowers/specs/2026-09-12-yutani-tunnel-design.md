@@ -33,7 +33,14 @@ distributions without systemd, nftables and iproute2.
   `AllowedIPs = 0.0.0.0/0, ::/0`, `Endpoint = 198.51.100.10:51820`,
   `PersistentKeepalive = 25`. Comments carry the server label (`# UK#455`).
 
-**Known gap (2026-09-12): the NSS/resolved DNS path.** `/etc/nsswitch.conf`
+**Known gap (2026-09-12), closed 2026-09-13: the NSS/resolved DNS path.**
+
+**Status: closed on 2026-09-13** — EVE-domain lookups go via resolved's
+per-link DNS on `yutani0` to 1.1.1.1/9.9.9.9 inside the tunnel; other
+lookups are unchanged; the stub-resolver DNAT exclusion stays. The
+description of the gap below is kept because it is why the remedy has the
+shape it has.
+ `/etc/nsswitch.conf`
 has `hosts: … resolve [!UNAVAIL=return] …`, so glibc's `getaddrinfo` does
 not send a DNS packet at all: it talks to `systemd-resolved` over a unix
 socket. No IP packet leaves the EVE cgroup, so neither the DNAT in the `dns`
@@ -62,12 +69,40 @@ CachyOS process it does not take the unix-socket path above — it sends raw
 DNS packets straight to the stub resolver, `127.0.0.53`, which is the path
 this exclusion is about.
 
-Planned remedy (follow-up task, not in plan A): either run each launched
-command in a mount namespace with an `nsswitch.conf` that has no `resolve`
-entry (so glibc falls back to `dns` and sends real packets the DNAT can
-catch), or give `yutani0` a per-link DNS in resolved and route the EVE
-cgroup's lookups to it. Until one of those lands, treat EVE's DNS as
-untunnelled.
+**The remedy (2026-09-13).** The second of the two options below was
+taken: `yutani0` gets a per-link DNS in `systemd-resolved`, with the EVE
+domains routed to it. While the tunnel is up the worker runs
+
+```
+resolvectl dns yutani0 1.1.1.1 9.9.9.9
+resolvectl domain yutani0 ~eveonline.com ~ccpgames.com ~evetech.net
+resolvectl default-route yutani0 false
+```
+
+so resolved sends lookups for those domains — and only those — to
+1.1.1.1/9.9.9.9, and one extra rule in `setmark` (§4) marks DNS aimed at
+those two addresses for the tunnel, whoever sent it. That last part is the
+point: the query that must be tunnelled is *resolved's*, sent from
+resolved's own cgroup, which no `socket cgroupv2` rule of ours can match —
+so the rule keys on the destination instead, which is safe precisely
+because `resolvectl domain` limits what is ever sent there. The masquerade
+in `postrouting` rewrites the source as usual. Every other lookup on the
+machine still goes to the machine's normal resolver
+(`default-route … false`), and the stub-resolver DNAT exclusion below
+stays exactly as it is — the Steam runtime's raw queries to `127.0.0.53`
+are answered by resolved, which now routes the EVE domains among them into
+the tunnel too.
+
+The per-link settings die with the interface, so teardown does not depend
+on cleaning them up; `resolvectl revert yutani0` runs first in the down
+sequence anyway, and its failure is ignored. A failure of any of the three
+`resolvectl` commands (resolved not running, say) is a `warn!` and nothing
+more: the tunnel is still up and correct, and DNS merely behaves as it did
+before this change.
+
+The other option — running each launched command in a mount namespace with
+an `nsswitch.conf` that has no `resolve` entry, so glibc falls back to
+`dns` and sends real packets the DNAT can catch — was not taken.
 
 ## 3. Architecture
 
@@ -141,6 +176,7 @@ table inet yutani {
     chain setmark {
         type route hook output priority mangle; policy accept;
         meta mark 0x5a return
+        ip daddr { 1.1.1.1, 9.9.9.9 } meta l4proto { tcp, udp } th dport 53 meta mark set 0x59
         socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" meta mark set 0x59
     }
     chain dns {
@@ -159,7 +195,16 @@ table inet yutani {
 }
 ```
 
-   (`level 5` = number of path components; the path is built from the uid.
+   (The `ip daddr { 1.1.1.1, 9.9.9.9 }` rule is the tunnel's DNS: those
+   are the resolvers `resolvectl dns yutani0 …` points `systemd-resolved`
+   at in step 8, and this rule is what puts resolved's queries to them into
+   the tunnel. It is deliberately not behind the cgroup match — resolved
+   sends them from its own cgroup — and deliberately ahead of it, next to
+   the other destination-keyed rule. The addresses come from the stored
+   conf (`# yutani: dns_servers`, §5); with no servers configured the rule
+   is omitted entirely (an empty nft set is a syntax error).
+
+   `level 5` = number of path components; the path is built from the uid.
    Systemd nests `yutani-eve.slice` under `yutani.slice` because of the
    dash, hence five components. `meta nfproto ipv6` from the cgroup falls
    under the last rule since v6 never routes via `yutani0`. The DNS rule
@@ -229,6 +274,17 @@ table inet yutani {
    `yutani0` rewrites the source to the interface's own address, and
    conntrack un-NATs the replies.
 
+8. `resolvectl dns yutani0 <dns_servers>`;
+   `resolvectl domain yutani0 ~<dns_domain>…`;
+   `resolvectl default-route yutani0 false` — the per-link DNS settings
+   that close §2's known gap (see the remedy there for why). They run after
+   the link exists and after the ruleset is loaded. Servers and domains
+   come from the stored conf (`# yutani: dns_servers` /
+   `# yutani: dns_domains`, §5), defaulting to 1.1.1.1/9.9.9.9 and
+   `eveonline.com ccpgames.com evetech.net`. A failure here is a `warn!`,
+   never a teardown: everything else about the tunnel is fine, and only the
+   DNS improvement is lost.
+
 **Loop**: every second run `ip route replace default dev yutani0 table
 51820` and then write `/run/yutani/tunnel.json` (0644, atomic rename) with
 
@@ -248,7 +304,9 @@ packets are dropped by the kill-switch for the rest of the session.
 `replace` is idempotent, and its failure while the link is genuinely down
 is expected: logged at debug, never a teardown.
 
-**Down** (on SIGTERM, and on any start failure): `nft delete table inet
+**Down** (on SIGTERM, and on any start failure): `resolvectl revert
+yutani0` (first, while the link still exists; failure ignored — the
+per-link settings die with the interface anyway); `nft delete table inet
 yutani`; both `ip rule del`; `ip route flush table 51820`; `ip link del
 yutani0`; remove `tunnel.json`. Each step is attempted even if an earlier
 one fails.
@@ -260,14 +318,33 @@ packets still go to `yutani0` and are lost — that *is* the kill-switch.
 ## 5. Privileged install: `yutani tunnel install <conf>`
 
 Runs `pkexec <abs yutani> tunnel install-root --conf <abs conf> --uid <uid>
---exe <abs yutani>` (one password prompt). `install-root` (root):
+--user <name> --exe <abs yutani> --dns-servers 1.1.1.1,9.9.9.9
+--dns-domains eveonline.com,ccpgames.com,evetech.net` (one password
+prompt; the two DNS options carry the user's validated
+`tunnel.dns_servers` / `tunnel.dns_domains`, and are omitted when empty).
+`install-root` (root):
 
 1. Parses and validates the conf (exactly one `[Interface]` with
    `PrivateKey` and one IPv4 `Address`; one `[Peer]` with `PublicKey`,
    `Endpoint`, `AllowedIPs`); refuses anything else with a clear message.
 2. Writes `/etc/yutani/tunnel.conf` (dir 0700, file 0600 root:root) — a
    verbatim copy plus a `# yutani: label = UK#455` line derived from the
-   peer comment or the file name. The directory's mode is set explicitly
+   peer comment or the file name, a `# yutani: uid = 1000` line, and the
+   two DNS lines the worker reads:
+   ```
+   # yutani: dns_servers = 1.1.1.1 9.9.9.9
+   # yutani: dns_domains = eveonline.com ccpgames.com evetech.net
+   ```
+   This is how the user's `config.ron` values reach root without root ever
+   reading a user-writable file (§9): they are validated on the way in and
+   copied into the file root owns. Each domain must be a plain host name
+   (letters, digits, `-`, `.`) or `install-root` refuses — a value with a
+   newline in it would otherwise forge a second `# yutani: …` line. An
+   omitted or empty option, and a conf written before this feature, both
+   mean "use the built-in defaults", so an older install keeps working.
+   **Changing `tunnel.dns_servers`/`tunnel.dns_domains` in `config.ron`
+   therefore takes effect only after re-running `yutani tunnel install`**
+   (and a `disconnect`/`connect`, like any other conf change). The directory's mode is set explicitly
    after creating it: `pkexec` does not reset the caller's umask, so
    `create_dir_all` alone would give whatever mode that umask allows. An
    *existing* `/etc/yutani` is verified root-owned and not group- or
@@ -357,7 +434,17 @@ everything it would write, so the refusal is visible before the prompt.
   (world-readable, no root needed) so rates keep working even if the status
   file is stale. `location` from config `tunnel.location` (default
   `"London"`), `iface`/`address`/`endpoint` from `tunnel.json`.
-- Config additions: `tunnel: ( location: "London", auto_adopt: true )`.
+- Config additions: `tunnel: ( location: "London", auto_adopt: true,
+  dns_servers: ["1.1.1.1", "9.9.9.9"], dns_domains: ["eveonline.com",
+  "ccpgames.com", "evetech.net"] )`. The two DNS keys are the resolvers
+  EVE's lookups are sent to inside the tunnel and the domains routed to
+  them (§2's remedy, §4 step 8). `validate` trims each domain, strips a
+  leading `~` or `.` (resolved's own spelling, and the `~` is ours to add),
+  drops anything that is not a plain host name with a warning, and falls
+  back to the defaults if either list ends up empty. They are read by the
+  *user* side only: `yutani tunnel install` copies them into
+  `/etc/yutani/tunnel.conf`, so editing them in `config.ron` requires
+  re-running `yutani tunnel install` to have any effect.
 
 ## 7. Tagging EVE processes
 
@@ -427,7 +514,20 @@ the already-running client without a second adoption.
   late RST, retransmissions from a TIME_WAIT socket after the process is
   gone — are therefore never marked, and can leave by the normal route. They carry no payload and reveal only that
   an already-known connection existed; accepted residual.
-- DNS: see the known gap in §2 — with `resolve` in `nsswitch.conf`, EVE's
+- DNS: while the tunnel is up, `1.1.1.1` and `9.9.9.9` are marked for the
+  tunnel by destination, not by cgroup (§2's remedy) — so any program on
+  the machine that queries those two addresses *directly* also goes through
+  the tunnel for that query, not just EVE's lookups. Nothing else changes
+  for other programs: resolved's own default route is left alone
+  (`default-route yutani0 false`) and only the EVE domains are routed to
+  the link. Accepted residual; the alternative (matching resolved's cgroup)
+  would tunnel every lookup the machine makes.
+- The `dns_servers`/`dns_domains` values originate in the user's
+  `config.ron`, which root never reads: they cross into root's world once,
+  as `install-root` arguments, are re-validated there (plain host names
+  only), and are stored in the root-owned conf — the same crossing the
+  wg-quick conf itself makes, and the same rules apply.
+- DNS, historical: see the known gap in §2 — with `resolve` in `nsswitch.conf`, EVE's
   `getaddrinfo` lookups never become IP packets from its cgroup, so neither
   the DNAT nor the kill-switch applies to them.
 
@@ -450,9 +550,12 @@ speaks DNS directly and so goes through the DNAT, while the game's
 `systemd-run --user --scope --quiet --slice=yutani-eve.slice getent hosts
 whoami.akamai.net` — together with `resolvectl query whoami.akamai.net`, and
 observe what resolved actually sent upstream with `sudo resolvectl monitor`
-(or `journalctl -u systemd-resolved -f`) in another terminal: if the query
-leaves from the host's normal route, the §2 gap is what you are looking at,
-not a regression. Also inspect the live ruleset and policy routing with
+(or `journalctl -u systemd-resolved -f`) in another terminal. Since
+2026-09-13 a lookup for an EVE domain must go to 1.1.1.1/9.9.9.9 through
+`yutani0` (`resolvectl status yutani0` shows the per-link DNS and the
+`~domain` routing; the `setmark` counter for the resolver rule moves), and
+a lookup for anything else must still leave by the host's normal route —
+that second half is by design, not a regression. Also inspect the live ruleset and policy routing with
 `sudo nft list table inet yutani` and `ip rule show`, and confirm the
 interface fwmark is in place with `sudo wg show yutani0 fwmark` (`0x5a`).
 If the slice has no connectivity at all while the tunnel is healthy from
