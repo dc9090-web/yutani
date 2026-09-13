@@ -145,6 +145,13 @@ pub struct App {
     /// behind the SCTK-thread use-after-free. Its id is never a client's,
     /// so `client_for_surface` and the pointer path ignore it.
     pub keepalive: Option<SurfaceId>,
+    /// When `save_config` last wrote `config.ron`, and what it wrote. The
+    /// watcher re-reads our own write within its 200 ms debounce; a
+    /// live-only change (a slider still being dragged) made meanwhile is
+    /// not in the file, and applying the re-read would revert it. A
+    /// `ConfigChanged` carrying exactly what we wrote, this soon after, is
+    /// that echo and is ignored (see `OWN_WRITE_ECHO`).
+    pub last_config_write: Option<(Instant, Config)>,
     /// The `.conf` a tunnel install/uninstall/connect/disconnect started
     /// from, while that action runs on the blocking pool. It lives here and
     /// not in the window's state because the window can be closed and
@@ -205,6 +212,11 @@ fn response_of(result: Result<Option<String>, String>) -> crate::ipc::Response {
         Err(m) => crate::ipc::Response::Err(m),
     }
 }
+
+/// How long after our own `save_config` a `ConfigChanged` carrying exactly
+/// what we wrote is taken for the watcher's echo of that write (its
+/// debounce is 200 ms) rather than an edit by hand.
+const OWN_WRITE_ECHO: Duration = Duration::from_millis(500);
 
 impl App {
     /// Hand a command to the backend. `false` when it could not be sent —
@@ -1866,9 +1878,12 @@ impl App {
         if broken {
             return;
         }
-        if let Err(e) = self.config.save() {
-            tracing::warn!("cannot save config: {e:#}");
-            self.settings_note(format!("cannot save config.ron: {e:#}"));
+        match self.config.save() {
+            Ok(()) => self.last_config_write = Some((Instant::now(), self.config.clone())),
+            Err(e) => {
+                tracing::warn!("cannot save config: {e:#}");
+                self.settings_note(format!("cannot save config.ron: {e:#}"));
+            }
         }
     }
 }
@@ -1912,6 +1927,7 @@ impl Application for App {
             tunnel_in_flight: None,
             settings: None,
             keepalive: None,
+            last_config_write: None,
         };
         (app, Task::none())
     }
@@ -1950,7 +1966,14 @@ impl Application for App {
             Msg::Backend(event) => self.on_backend(event),
             Msg::Pointer(id, event) => self.on_pointer(id, event),
             Msg::ConfigChanged(config) => {
-                let task = self.apply_config(config);
+                // The watcher re-reading what we just wrote: a live-only
+                // change made since (a slider still being dragged) is not
+                // in the file and must not be reverted by it.
+                let echo = self
+                    .last_config_write
+                    .as_ref()
+                    .is_some_and(|(at, written)| at.elapsed() < OWN_WRITE_ECHO && *written == config);
+                let task = if echo { Task::none() } else { self.apply_config(config) };
                 // A hand edit may have fixed or broken the file; the text
                 // fields deliberately keep whatever is being typed.
                 if let Some(state) = self.settings.as_mut() {
@@ -2188,6 +2211,7 @@ mod tests {
             settings: None,
             tunnel_in_flight: None,
             keepalive: None,
+            last_config_write: None,
         }
     }
 
@@ -2284,6 +2308,32 @@ mod tests {
         assert_eq!(client.output, "DP-2", "the thumbnail belongs on the saved output");
         assert_eq!(client.position, (100, 100));
         assert!(client.surface.is_some_and(|id| id != before), "recreated, not margin-moved");
+    }
+
+    /// [M2] The watcher re-reads the file we just wrote (200 ms debounce).
+    /// A live-only slider change made in that window is not in the file,
+    /// so applying the re-read reverted it and the slider snapped back.
+    /// The echo of our own write is ignored; a real edit — a different
+    /// config, or one arriving long after our write — still applies.
+    #[test]
+    fn the_watchers_echo_of_our_own_write_does_not_revert_a_live_change() {
+        let written = Config { thumb_width: 300, ..Config::default() };
+        let mut app = app(written.clone());
+        app.last_config_write = Some((Instant::now(), written.clone()));
+        let live = Config { thumb_width: 400, ..written.clone() };
+        let _ = app.apply_config(live.clone());
+        let _ = app.update(Msg::ConfigChanged(written.clone()));
+        assert_eq!(app.config.thumb_width, 400, "our own write, echoed back, must not win");
+
+        // The same content long after our write is the user's edit.
+        app.last_config_write = Some((Instant::now() - Duration::from_secs(5), written.clone()));
+        let _ = app.update(Msg::ConfigChanged(written.clone()));
+        assert_eq!(app.config.thumb_width, 300);
+
+        // Different content inside the window is the user's edit too.
+        app.last_config_write = Some((Instant::now(), written.clone()));
+        let _ = app.update(Msg::ConfigChanged(Config { thumb_width: 500, ..written }));
+        assert_eq!(app.config.thumb_width, 500);
     }
 
     /// [M3] Before the backend has handed over its command channel, a
