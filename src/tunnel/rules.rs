@@ -60,17 +60,27 @@ pub fn nft_ruleset(uid: u32, dns: Option<Ipv4Addr>) -> String {
         "    chain postrouting {\n        type nat hook postrouting priority srcnat; policy accept;\n",
     );
     s.push_str(&format!("        oifname \"{IFACE}\" masquerade\n    }}\n"));
+    // The kill-switch hooks POSTROUTING, not OUTPUT. The OUTPUT hook state
+    // captures its `out` device once, when the hook starts, and nothing
+    // refreshes it after the route chain re-routes a freshly marked packet
+    // to `yutani0`: every later chain in the same hook — including this one
+    // — still reports `oifname "enp5s0"`, so an output-hook drop rule fires
+    // on packets that are in fact leaving through the tunnel. POSTROUTING's
+    // hook state is built after routing, so it sees the real interface.
+    //
+    // It keys on `FWMARK` because `socket cgroupv2` is not permitted in a
+    // postrouting hook (nft_socket validates prerouting/input/output only),
+    // and it does not need to: `setmark` sets that mark only on
+    // cgroup-matched packets, so "marked for the tunnel but leaving
+    // elsewhere" is exactly the leak we must stop. `WG_FWMARK` needs no
+    // exemption either — the encrypted outer packets carry `0x5a`, never
+    // `0x59`, so they cannot match the drop.
     s.push_str(
-        "    chain killswitch {\n        type filter hook output priority filter; policy accept;\n",
+        "    chain killswitch {\n        type filter hook postrouting priority filter; policy accept;\n",
     );
-    // Also first: the encrypted outer packets carry the game's socket, so
-    // the drop rule below would match them — but they are *supposed* to
-    // leave by the LAN route, to the peer's endpoint. `WG_FWMARK` is how we
-    // tell them apart from the cleartext traffic that must never escape.
-    s.push_str(&format!("        meta mark {WG_FWMARK:#x} accept\n"));
-    s.push_str(&format!("        {m} oifname \"lo\" accept\n"));
+    s.push_str("        oifname \"lo\" accept\n");
     s.push_str(&format!(
-        "        {m} oifname != \"{IFACE}\" counter drop\n    }}\n"
+        "        meta mark {FWMARK:#x} oifname != \"{IFACE}\" counter drop\n    }}\n"
     ));
     s.push_str("}\n");
     s
@@ -186,10 +196,9 @@ mod tests {
              \x20       oifname \"yutani0\" masquerade\n\
              \x20   }\n\
              \x20   chain killswitch {\n\
-             \x20       type filter hook output priority filter; policy accept;\n\
-             \x20       meta mark 0x5a accept\n\
-             \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" oifname \"lo\" accept\n\
-             \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" oifname != \"yutani0\" counter drop\n\
+             \x20       type filter hook postrouting priority filter; policy accept;\n\
+             \x20       oifname \"lo\" accept\n\
+             \x20       meta mark 0x59 oifname != \"yutani0\" counter drop\n\
              \x20   }\n\
              }\n"
         );
@@ -211,34 +220,73 @@ mod tests {
              \x20       oifname \"yutani0\" masquerade\n\
              \x20   }\n\
              \x20   chain killswitch {\n\
-             \x20       type filter hook output priority filter; policy accept;\n\
-             \x20       meta mark 0x5a accept\n\
-             \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" oifname \"lo\" accept\n\
-             \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" oifname != \"yutani0\" counter drop\n\
+             \x20       type filter hook postrouting priority filter; policy accept;\n\
+             \x20       oifname \"lo\" accept\n\
+             \x20       meta mark 0x59 oifname != \"yutani0\" counter drop\n\
              \x20   }\n\
              }\n"
         );
+    }
+
+    /// Lines of `chain`, trimmed, without its `type …` header or braces.
+    fn chain_rules(ruleset: &str, chain: &str) -> Vec<String> {
+        let lines: Vec<&str> = ruleset.lines().map(|l| l.trim()).collect();
+        let i = lines.iter().position(|l| *l == format!("chain {chain} {{")).unwrap();
+        lines[i + 2..]
+            .iter()
+            .take_while(|l| **l != "}")
+            .map(|l| l.to_string())
+            .collect()
     }
 
     /// The encrypted outer packet re-uses the inner packet's `sk_buff`, so
     /// it still carries the game's socket and matches our cgroup rules.
     /// WireGuard stamps `WG_FWMARK` on it; `setmark` must `return` before it
     /// can be re-marked (which would route it back into `yutani0` — an
-    /// encrypt loop) and `killswitch` must accept it (it leaves via the LAN
-    /// interface, which the drop rule would otherwise catch).
+    /// encrypt loop).
     #[test]
     fn the_wireguard_fwmark_is_exempt_before_any_cgroup_rule() {
         for r in [
             nft_ruleset(1000, Some("10.2.0.1".parse().unwrap())),
             nft_ruleset(1000, None),
         ] {
-            let lines: Vec<&str> = r.lines().map(|l| l.trim()).collect();
-            let first_after = |chain: &str| -> String {
-                let i = lines.iter().position(|l| *l == format!("chain {chain} {{")).unwrap();
-                lines[i + 2].to_string()
-            };
-            assert_eq!(first_after("setmark"), "meta mark 0x5a return");
-            assert_eq!(first_after("killswitch"), "meta mark 0x5a accept");
+            assert_eq!(chain_rules(&r, "setmark")[0], "meta mark 0x5a return");
+        }
+    }
+
+    /// The kill-switch hooks POSTROUTING, not OUTPUT: the OUTPUT hook state
+    /// captures `out` once, before the route chain re-routes the marked
+    /// packet, so every later OUTPUT chain still sees the LAN interface and
+    /// the drop rule would fire on a packet that is in fact going out of
+    /// `yutani0`. Only POSTROUTING knows the real outgoing interface.
+    ///
+    /// Keying on `FWMARK` (not on `socket cgroupv2`, which nft rejects in a
+    /// postrouting hook) is equivalent: `setmark` sets that mark only on
+    /// cgroup-matched packets, so "marked for the tunnel but leaving
+    /// elsewhere" is exactly the kill-switch condition. `WG_FWMARK` needs no
+    /// exemption here — the outer packets carry `0x5a`, never `0x59`.
+    #[test]
+    fn the_kill_switch_hooks_postrouting_and_keys_on_the_mark() {
+        for r in [
+            nft_ruleset(1000, Some("10.2.0.1".parse().unwrap())),
+            nft_ruleset(1000, None),
+        ] {
+            assert!(
+                r.contains(
+                    "    chain killswitch {\n        type filter hook postrouting priority filter; policy accept;\n"
+                ),
+                "the kill-switch must hook postrouting:\n{r}"
+            );
+            assert_eq!(
+                chain_rules(&r, "killswitch"),
+                vec![
+                    "oifname \"lo\" accept".to_string(),
+                    "meta mark 0x59 oifname != \"yutani0\" counter drop".to_string(),
+                ]
+            );
+            // `socket` is not permitted in a postrouting hook, and the
+            // mark already implies the cgroup.
+            assert!(!chain_rules(&r, "killswitch").iter().any(|l| l.contains("socket")));
         }
     }
 

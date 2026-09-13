@@ -136,10 +136,9 @@ table inet yutani {
         oifname "yutani0" masquerade
     }
     chain killswitch {
-        type filter hook output priority filter; policy accept;
-        meta mark 0x5a accept
-        socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" oifname "lo" accept
-        socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" oifname != "yutani0" counter drop
+        type filter hook postrouting priority filter; policy accept;
+        oifname "lo" accept
+        meta mark 0x59 oifname != "yutani0" counter drop
     }
 }
 ```
@@ -151,14 +150,14 @@ table inet yutani {
    carries `meta nfproto ipv4` because this is an `inet` table — the chain
    also sees v6 packets and `dnat ip to` is an IPv4-only statement.)
 
-   **Why the interface fwmark exists.** The two `meta mark 0x5a` rules come
-   first in their chains, ahead of every cgroup match. It is tempting to
+   **Why the interface fwmark exists.** The `meta mark 0x5a return` rule
+   comes first in `setmark`, ahead of every cgroup match. It is tempting to
    assume the encrypted UDP to the endpoint is emitted by the kernel's wg
    device with no socket attached and so is unaffected by rules that match
    `socket cgroupv2` — that is wrong, and believing it cost a day. The
    kernel re-uses the *inner* packet's `sk_buff` for the encrypted outer
    datagram, so the outer datagram still carries `skb->sk`: the game's
-   socket, whose cgroup is `yutani-eve.slice`. Without the exemptions,
+   socket, whose cgroup is `yutani-eve.slice`. Without the exemption,
    `setmark` therefore also marks the encrypted packet `0x59`, `ip rule
    fwmark 0x59 lookup 51820` routes it back into `yutani0`, WireGuard
    encrypts it again, and the loop fills the per-peer staged queue. The
@@ -170,11 +169,34 @@ table inet yutani {
    the London exit), because those packets carry a socket in a different
    cgroup and never match. `wg set yutani0 fwmark 0x5a` makes WireGuard
    write `0x5a` into `skb->mark` on every outer packet, which is exactly
-   what these two rules key on: `setmark` returns without re-marking, and
-   `killswitch` accepts — the outer packet is *meant* to leave by the LAN
-   route to the peer's endpoint, so the `oifname != "yutani0" drop` rule
-   below would otherwise kill the tunnel outright. This is the same reason
-   wg-quick sets a firewall mark on the interfaces it creates.
+   what `setmark`'s first rule keys on: it returns without re-marking, so
+   the outer packet keeps `0x5a` and leaves by the LAN route to the peer's
+   endpoint, as it is meant to. That mark also keeps it clear of the
+   kill-switch, which drops only `0x59`. This is the same reason wg-quick
+   sets a firewall mark on the interfaces it creates.
+
+   **Why the kill-switch is in POSTROUTING.** It hooks postrouting and
+   keys on `meta mark 0x59`, not on the cgroup. An `nft monitor trace` of a
+   TCP SYN from the slice shows why: `setmark` sets `meta mark 0x59` in the
+   route chain, the kernel's route hook then re-routes the packet to
+   `yutani0` — and every later chain in the *same* OUTPUT hook (`ip mangle
+   OUTPUT`, our `dns`, `ip nat OUTPUT`, and a kill-switch hooked there)
+   still reports `oif "enp5s0"`. The hook state's `out` device is captured
+   once when the OUTPUT hook starts and is not refreshed after
+   `ip_route_me_harder`, so an output-hook `oifname != "yutani0" drop`
+   matches on a stale interface and drops exactly the packets it is meant
+   to let through (the drop counter climbs while the tunnel carries
+   nothing). Only POSTROUTING, whose hook state is built after routing,
+   sees the real outgoing interface. `socket cgroupv2` cannot come along:
+   `nft_socket` allows that expression in prerouting/input/output hooks
+   only. It is not needed either — `setmark` sets `0x59` solely on
+   cgroup-matched packets, so "marked for the tunnel but leaving elsewhere"
+   is precisely the kill-switch condition, and the encrypted outer packets
+   (marked `0x5a`) can never match it. `oifname "lo" accept` comes first so
+   loopback traffic inside the slice is untouched. The two postrouting
+   chains sit at different priorities (`filter` 0 for the kill-switch,
+   `srcnat` 100 for the masquerade), so the drop is evaluated before the
+   source rewrite.
 
    The `postrouting` chain is what makes the slice's traffic usable at all.
    An application chooses its source address when the socket connects —
@@ -379,11 +401,11 @@ the already-running client without a second adoption.
 - `install-root` also resolves `--uid` to a user name itself (`id -un`) and
   refuses a `--user` that disagrees: the polkit rule names a user while the
   nft rules key on a uid, and those must be the same person.
-- Kill-switch blind spot: the `killswitch` chain matches
-  `socket cgroupv2`, which needs a socket to attribute the packet to. A few
-  packets the kernel emits without one — a late RST, retransmissions from a
-  TIME_WAIT socket after the process is gone — are therefore not matched and
-  can leave by the normal route. They carry no payload and reveal only that
+- Kill-switch blind spot: the `killswitch` chain drops what `setmark`
+  marked, and `setmark` matches `socket cgroupv2`, which needs a socket to
+  attribute the packet to. A few packets the kernel emits without one — a
+  late RST, retransmissions from a TIME_WAIT socket after the process is
+  gone — are therefore never marked, and can leave by the normal route. They carry no payload and reveal only that
   an already-known connection existed; accepted residual.
 - DNS: see the known gap in §2 — with `resolve` in `nsswitch.conf`, EVE's
   `getaddrinfo` lookups never become IP packets from its cgroup, so neither

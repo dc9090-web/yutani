@@ -19,10 +19,12 @@ pub const FWMARK: u32 = 0x59;
 /// 0x59 lookup 51820` would route it straight back into `yutani0` to be
 /// encrypted again, and the loop would fill WireGuard's per-peer staged
 /// queue (the interface's TX `dropped` counter climbs, `tx_errors` stays 0,
-/// and the kernel logs nothing). The `killswitch` chain would likewise drop
-/// it, since it leaves via the LAN interface and not `yutani0`. Marking the
-/// outer packet distinctly lets both chains recognise and exempt it — this
-/// is the same reason wg-quick sets a firewall mark on its interfaces.
+/// and the kernel logs nothing). The `killswitch` chain would then drop it
+/// too, since a packet carrying `FWMARK` that leaves via the LAN interface
+/// is exactly what it is there to stop. Marking the outer packet distinctly
+/// keeps it out of both: `setmark` returns on `WG_FWMARK` before any cgroup
+/// match, and the kill-switch only ever drops `FWMARK` — this is the same
+/// reason wg-quick sets a firewall mark on its interfaces.
 pub const WG_FWMARK: u32 = 0x5a;
 pub const TABLE: u32 = 51820;
 pub const SLICE: &str = "yutani-eve.slice";
