@@ -331,7 +331,11 @@ pub fn install_root(
     let label = conf.file_stem().and_then(|s| s.to_str()).unwrap_or("tunnel");
     let parsed = WgConf::parse(&text, label).map_err(|e| anyhow!("{}: {e}", conf.display()))?;
     let dns_lines = dns_conf_lines(dns_servers, dns_domains)?;
-    let stored = format!("# yutani: label = {}\n# yutani: uid = {uid}\n{dns_lines}{text}", parsed.label);
+    // Root's own lines first, and nothing derived from a user-chosen string
+    // among them: the worker takes the first `# yutani: uid`/`dns_*` line it
+    // finds, and a file name (which may contain a newline) used to be
+    // written ahead of these as a label nobody read.
+    let stored = format!("# yutani: uid = {uid}\n{dns_lines}{text}");
     // Resolve once, up front: `unit_text` and the trust check must agree on
     // the same path (see `resolved_exe`). When resolution itself fails, fall
     // back to the raw `--exe` string for display purposes only — the check
@@ -518,6 +522,29 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The conf's file name is the user's to choose and a Linux file name
+    /// may contain a newline. The label used to be written first, ahead of
+    /// the `uid`/`dns_servers` lines, and the worker takes the first match
+    /// — so `x\n# yutani: uid = 0\n# yutani: dns_servers = 10.0.0.1.conf`
+    /// installed a worker routing for uid 0. Nothing reads the label line
+    /// (the worker re-derives it from the `[Peer]` comment), so it is gone:
+    /// root's own lines come first, and the first `uid` line is root's.
+    #[test]
+    fn the_confs_file_name_cannot_forge_the_lines_root_writes() {
+        let dir = temp_dir("inst-forge");
+        let conf = dir.join("x\n# yutani: uid = 0\n# yutani: dns_servers = 10.0.0.1.conf");
+        std::fs::write(&conf, "[Interface]\nPrivateKey = U0VDUkVU\nAddress = 10.2.0.2/32\n[Peer]\nPublicKey = p=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n").unwrap();
+        let report = install_root(&conf, 1000, "daniel", "/opt/yutani/yutani", &servers(), &domains(), true).unwrap();
+        assert!(!report.contains("# yutani: label"), "the label line is dead and must not be written: {report}");
+        let first = |key: &str| {
+            let prefix = format!("# yutani: {key} =");
+            report.lines().find_map(|l| l.trim().strip_prefix(prefix.as_str())).map(str::trim).map(str::to_string)
+        };
+        assert_eq!(first("uid").as_deref(), Some("1000"), "the first uid line must be root's: {report}");
+        assert_eq!(first("dns_servers").as_deref(), Some("1.1.1.1 9.9.9.9"), "{report}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn install_root_dry_run_writes_nothing_and_hides_the_key() {
         let existed = Path::new(CONF_PATH).exists();
@@ -526,7 +553,6 @@ mod tests {
         let conf = dir.join("EVE-UK-455.conf");
         std::fs::write(&conf, "[Interface]\nPrivateKey = U0VDUkVU\nAddress = 10.2.0.2/32\nDNS = 10.2.0.1\n[Peer]\n# UK#455\nPublicKey = p=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n").unwrap();
         let report = install_root(&conf, 1000, "daniel", "/opt/yutani/yutani", &servers(), &domains(), true).unwrap();
-        assert!(report.contains("# yutani: label = UK#455"));
         assert!(report.contains("# yutani: uid = 1000"));
         assert!(report.contains("PrivateKey = <redacted>"));
         assert!(!report.contains("U0VDUkVU"));
