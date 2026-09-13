@@ -59,15 +59,24 @@ impl Paths {
     }
 }
 
-/// The applet binary: the one next to the running `yutani` when there is
-/// one (cargo target dir, or a prefix bin dir), else the bare name so a
-/// `PATH` lookup decides.
-pub fn applet_exe() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("yutani-applet")))
-        .filter(|sibling| sibling.is_file())
-        .unwrap_or_else(|| PathBuf::from("yutani-applet"))
+/// The applet binary: the one next to the running `yutani` (cargo target
+/// dir, or a prefix bin dir). cosmic-panel runs the `Exec=` line with its
+/// own `PATH`, so a bare name would silently produce an applet that never
+/// starts; a missing sibling is an error with the install command instead.
+pub fn applet_exe() -> anyhow::Result<PathBuf> {
+    let exe = std::env::current_exe().context("cannot resolve the running yutani binary")?;
+    let dir = exe.parent().context("the running yutani binary has no parent directory")?;
+    let sibling = dir.join("yutani-applet");
+    if sibling.is_file() {
+        return Ok(sibling);
+    }
+    anyhow::bail!(
+        "yutani-applet is not installed next to {}\n\
+         the panel starts the applet from that directory, so install it there first:\n\
+         \x20 sudo install -o root -g root -m 0755 target/release/yutani-applet {}/",
+        exe.display(),
+        dir.display()
+    )
 }
 
 /// The daemon binary for the launcher's `Exec=`: the running `yutani`,
@@ -184,7 +193,7 @@ fn update_desktop_database(applications: &Path) {
 
 pub fn install() -> anyhow::Result<()> {
     let paths = Paths::user();
-    let applet = applet_exe();
+    let applet = applet_exe()?;
     let yutani = yutani_exe();
     let count = install_to(&paths, &applet.to_string_lossy(), &yutani.to_string_lossy())?;
     update_icon_cache(&paths.icons);
@@ -378,7 +387,12 @@ mod tests {
         assert!(paths.icons.ends_with("icons/hicolor"));
         assert!(paths.applet.ends_with("applications/com.yutani.Applet.desktop"));
         assert!(paths.launcher.ends_with("applications/com.yutani.Yutani.desktop"));
-        assert_eq!(applet_exe().file_name().unwrap(), "yutani-applet");
+        // The test binary has no `yutani-applet` sibling in its deps dir, so
+        // the error names the fix rather than falling back to a bare name.
+        match applet_exe() {
+            Ok(p) => assert_eq!(p.file_name().unwrap(), "yutani-applet"),
+            Err(e) => assert!(e.to_string().contains("sudo install"), "{e}"),
+        }
         // Canonicalised, so absolute — or the bare name when that failed.
         let yutani = yutani_exe();
         assert!(yutani.is_absolute() || yutani == Path::new("yutani"), "{}", yutani.display());
