@@ -40,6 +40,10 @@ pub struct Applet {
     /// At most one `status` request outstanding, with at most one deferred
     /// behind it. See [`Poll`].
     pub poll: Poll,
+    /// A `quit` was acknowledged: every `status` until the daemon is gone
+    /// (or this deadline passes) describes a tunnel on its way down, so it
+    /// is degraded rather than believed. See `Msg::Done(Action::Quit, ..)`.
+    pub quitting: Option<Instant>,
     pub accounts_open: bool,
     /// The last `err …` reply, shown for 3 s — or what a tunnel action is
     /// still doing, shown until the daemon answers it.
@@ -240,6 +244,7 @@ impl cosmic::Application for Applet {
             started: Instant::now(),
             pending: None,
             poll: Poll::default(),
+            quitting: None,
             accounts_open: false,
             note: None,
         };
@@ -269,7 +274,16 @@ impl cosmic::Application for Applet {
                 }
                 if self.poll.tick() { Self::status_task() } else { Task::none() }
             }
-            Msg::Status(Ok(status)) => {
+            Msg::Status(Ok(mut status)) => {
+                // The daemon is still answering while it winds down after
+                // a quit, and says "Connected" until the iface is gone.
+                if let Some(until) = self.quitting {
+                    if still_pending(until, Instant::now(), false) {
+                        degrade(&mut status);
+                    } else {
+                        self.quitting = None;
+                    }
+                }
                 let live = status.tunnel.connected;
                 if live {
                     let now = self.now_ms();
@@ -296,6 +310,7 @@ impl cosmic::Application for Applet {
                 self.sampler.reset();
                 self.rates = Rates::default();
                 self.pending = None;
+                self.quitting = None;
                 after_reply
             }
             Msg::Status(Err(IpcError::Failed(msg))) => {
@@ -345,13 +360,15 @@ impl cosmic::Application for Applet {
             // to ~10 s stopping the tunnel before it goes away, so `status`
             // keeps answering — and keeps saying "Connected" — the whole
             // time. The tunnel is on its way down, so say so now rather
-            // than showing a live link that no longer has an owner; the
-            // polls that follow report whatever is actually true, and end
-            // in the offline state once the socket is gone.
+            // than showing a live link that no longer has an owner, and
+            // keep saying so through the polls that follow (`quitting`)
+            // until the socket is gone — or, should the daemon never go,
+            // for as long as it is given to stop.
             Msg::Done(Action::Quit, Ok(())) => {
                 if let Some(status) = self.status.as_mut() {
                     degrade(status);
                 }
+                self.quitting = Some(Instant::now() + Duration::from_secs(PENDING_S));
                 self.sampler.reset();
                 self.rates = Rates::default();
                 self.poll()
@@ -439,6 +456,7 @@ mod tests {
     use super::*;
     use cosmic::Application as _;
     use yutani::applet::{NOTE_MAX_CHARS, NOTE_MS};
+    use yutani::tunnel::status::Status;
 
     /// How many of this process's children `/proc` currently lists as
     /// zombies (state `Z`) — i.e. exited but not yet `wait`ed on.
@@ -548,6 +566,48 @@ mod tests {
 
     fn applet() -> Applet {
         Applet::init(Core::default(), ()).0
+    }
+
+    fn connected() -> Status {
+        use yutani::tunnel::status::{Status, TunnelStatus};
+        let tunnel = TunnelStatus { installed: true, connected: true, handshake_age_s: Some(4), ..Default::default() };
+        Status { clients: vec![], hidden: false, tunnel }
+    }
+
+    /// M1: `quit` is acknowledged at once but the daemon spends up to 10 s
+    /// stopping the tunnel and answers `status` with "Connected" the whole
+    /// time — so the degrade on Quit must hold across those polls, not be
+    /// undone by the very poll it issues, until the daemon is gone.
+    #[test]
+    fn the_quit_degrade_holds_until_the_daemon_is_gone() {
+        let mut applet = applet();
+        let _ = applet.update(Msg::Status(Ok(connected())));
+        assert!(applet.status.as_ref().unwrap().tunnel.connected);
+
+        let _ = applet.update(Msg::Done(Action::Quit, Ok(())));
+        assert!(!applet.status.as_ref().unwrap().tunnel.connected, "said to be going down at once");
+        let _ = applet.update(Msg::Status(Ok(connected())));
+        assert!(!applet.status.as_ref().unwrap().tunnel.connected, "and still, while the daemon winds down");
+        assert!(applet.status.as_ref().unwrap().tunnel.handshake_age_s.is_none());
+
+        let _ = applet.update(Msg::Status(Err(IpcError::Offline)));
+        assert!(applet.status.is_none());
+        // A daemon started afresh is believed again.
+        let _ = applet.update(Msg::Status(Ok(connected())));
+        assert!(applet.status.as_ref().unwrap().tunnel.connected, "the quit is over once the daemon was gone");
+    }
+
+    /// M1: a daemon that never goes away (a quit it did not act on) is
+    /// believed again after the same 10 s bound the sync icon uses.
+    #[test]
+    fn the_quit_degrade_gives_up_after_the_daemon_stop_timeout() {
+        let mut applet = applet();
+        let _ = applet.update(Msg::Status(Ok(connected())));
+        let _ = applet.update(Msg::Done(Action::Quit, Ok(())));
+        applet.quitting = Some(Instant::now() - Duration::from_secs(1));
+        let _ = applet.update(Msg::Status(Ok(connected())));
+        assert!(applet.status.as_ref().unwrap().tunnel.connected);
+        assert!(applet.quitting.is_none());
     }
 
     /// M2: whatever a poll or an action says, the note under the row is
