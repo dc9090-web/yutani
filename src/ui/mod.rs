@@ -1585,14 +1585,17 @@ impl App {
             Ok(targets) if targets.is_empty() => {
                 format!("nothing to restore: no file in {} is in {}", backup.display(), dir.display())
             }
-            Ok(targets) => match copy::backup_files(&targets, &saved).and_then(|_| copy::restore(&backup, &dir)) {
+            Ok(targets) => match copy::backup_files(&targets, &saved)
+                .map_err(|error| copy::Failure { error, replaced: 0, planned: targets.len() })
+                .and_then(|_| copy::restore(&backup, &dir))
+            {
                 Ok(n) => format!(
                     "restored {n} file{} from {}; the files it replaced are in {}",
                     if n == 1 { "" } else { "s" },
                     backup.display(),
                     saved.display()
                 ),
-                Err(e) => format!("restore failed: {e}"),
+                Err(e) => characters::restore_failure_note(&e, &saved),
             },
         };
         self.settings_note(note);

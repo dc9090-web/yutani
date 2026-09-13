@@ -276,6 +276,28 @@ pub fn copy_failure_note(failure: &Failure, backup: &Path) -> String {
     )
 }
 
+/// The note for a failed restore, shaped like [`copy_failure_note`]:
+/// `saved` is the pre-restore backup holding the live files the restore
+/// replaced before it failed — the newest backup now, so pressing Restore
+/// again puts them back. A failure before any file was replaced (the
+/// pre-restore backup itself, or the first file) has nothing to point at.
+pub fn restore_failure_note(failure: &Failure, saved: &Path) -> String {
+    if failure.replaced == 0 {
+        let mut note = format!("restore not started: {}", failure.error);
+        if failure.error.kind() == std::io::ErrorKind::AlreadyExists {
+            note.push_str(" — wait a second and press again");
+        }
+        return note;
+    }
+    format!(
+        "restore failed after replacing {} of {} files: {}; the files it replaced are in {}",
+        failure.replaced,
+        failure.planned,
+        failure.error,
+        saved.display()
+    )
+}
+
 /// A blocker constant reworded as a note-line fragment. The constants are
 /// captions under a button — capitalised, full sentences — and the note
 /// line is a lowercase phrase, so pushing one through verbatim reads wrong.
@@ -505,6 +527,32 @@ mod tests {
         assert_eq!(
             copy_failure_note(&failure(std::io::ErrorKind::PermissionDenied, "read-only", 3), &backup),
             "copy failed after replacing 3 of 7 files: read-only; the originals are in /b/20260913T024100Z"
+        );
+    }
+
+    /// A restore that failed after replacing some files: the live files
+    /// it replaced are in the pre-restore backup, and the note has to say
+    /// so — pressing Restore again would put that backup back, which is
+    /// the way out. Nothing replaced: nothing to point at.
+    #[test]
+    fn a_failed_restore_says_how_far_it_got_and_where_the_live_files_went() {
+        let saved = PathBuf::from("/b/20260913T024200Z");
+        let failure = |kind, msg: &str, replaced| Failure {
+            error: std::io::Error::new(kind, msg.to_string()),
+            replaced,
+            planned: 7,
+        };
+        assert_eq!(
+            restore_failure_note(&failure(std::io::ErrorKind::PermissionDenied, "read-only", 3), &saved),
+            "restore failed after replacing 3 of 7 files: read-only; the files it replaced are in /b/20260913T024200Z"
+        );
+        assert_eq!(
+            restore_failure_note(&failure(std::io::ErrorKind::PermissionDenied, "read-only", 0), &saved),
+            "restore not started: read-only"
+        );
+        assert_eq!(
+            restore_failure_note(&failure(std::io::ErrorKind::AlreadyExists, "backup directory /b/x already exists", 0), &saved),
+            "restore not started: backup directory /b/x already exists — wait a second and press again"
         );
     }
 

@@ -233,20 +233,18 @@ pub fn restore_plan(backup: &Path, dir: &Path) -> std::io::Result<Vec<PathBuf>> 
 
 /// Copy every settings file in `backup` back over the file of the same
 /// name in `dir`; returns how many. Backup entries with no counterpart in
-/// `dir` are skipped (see [`restore_plan`]).
-pub fn restore(backup: &Path, dir: &Path) -> std::io::Result<usize> {
+/// `dir` are skipped (see [`restore_plan`]). A failure says how far it
+/// got, like [`execute`]: the live files already replaced are only in
+/// the pre-restore backup, and the note has to say so.
+pub fn restore(backup: &Path, dir: &Path) -> Result<usize, Failure> {
+    let targets = restore_plan(backup, dir).map_err(|error| Failure { error, replaced: 0, planned: 0 })?;
+    let planned = targets.len();
     let mut restored = 0;
-    for entry in std::fs::read_dir(backup)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name.to_str().and_then(parse_file_name).is_none() || !entry.path().is_file() {
-            continue;
+    for to in &targets {
+        let name = to.file_name().ok_or_else(|| std::io::Error::other("target has no file name"));
+        if let Err(error) = name.and_then(|name| replace_via_tmp(&backup.join(name), to)) {
+            return Err(Failure { error, replaced: restored, planned });
         }
-        let to = dir.join(&name);
-        if !to.is_file() {
-            continue;
-        }
-        replace_via_tmp(&entry.path(), &to)?;
         restored += 1;
     }
     Ok(restored)
@@ -466,6 +464,28 @@ mod tests {
         assert_eq!(restore(&backup, &dir).unwrap(), 1);
         assert_eq!(std::fs::read(dir.join("core_char_1.dat")).unwrap(), b"old");
         assert!(!dir.join("core_char_2.dat").exists(), "not brought back from the dead");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A restore that dies part-way says how far it got — the note needs
+    /// `replaced` and `planned` like a failed copy, because the live files
+    /// it did replace are only in the pre-restore backup.
+    #[test]
+    fn a_restore_that_fails_part_way_reports_how_many_it_replaced() {
+        let dir = tmpdir("restore-partial");
+        let backup = dir.join("b");
+        std::fs::create_dir_all(&backup).unwrap();
+        for name in ["core_char_1.dat", "core_char_2.dat", "core_char_3.dat"] {
+            std::fs::write(dir.join(name), b"live").unwrap();
+            std::fs::write(backup.join(name), b"old").unwrap();
+        }
+        // The second target's temporary is a directory: the copy into it fails.
+        std::fs::create_dir(dir.join("core_char_2.tmp")).unwrap();
+        let err = restore(&backup, &dir).unwrap_err();
+        assert_eq!((err.replaced, err.planned), (1, 3), "{}", err.error);
+        assert_eq!(std::fs::read(dir.join("core_char_1.dat")).unwrap(), b"old");
+        assert_eq!(std::fs::read(dir.join("core_char_2.dat")).unwrap(), b"live", "not touched");
+        assert_eq!(std::fs::read(dir.join("core_char_3.dat")).unwrap(), b"live", "stopped at the failure");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
