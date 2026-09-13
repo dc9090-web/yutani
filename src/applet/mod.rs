@@ -23,6 +23,21 @@ pub const PENDING_S: u64 = 10;
 /// How long an `err …` note stays under the menu (spec §7).
 pub const NOTE_MS: u64 = 3_000;
 
+/// The most of an `err …` a note shows. `malformed reply {line:?}` quotes
+/// the whole line (up to 64 KiB) and an action error carries systemctl's
+/// stderr; unclipped, either wraps into many lines in the 360 px popup and
+/// pushes Quit toward `popup_container`'s 1000 px clip.
+pub const NOTE_MAX_CHARS: usize = 160;
+
+/// `text` as a note: whole if it fits [`NOTE_MAX_CHARS`], else its first
+/// `NOTE_MAX_CHARS` chars and an ellipsis.
+pub fn clip_note(text: &str) -> String {
+    match text.char_indices().nth(NOTE_MAX_CHARS) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
+    }
+}
+
 /// A menu press. `request()` is `None` for the one action the applet
 /// performs itself instead of asking the daemon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +72,19 @@ impl Action {
     }
 }
 
+/// What the menu says under a Connect/Disconnect row while the daemon is
+/// still working on it — up to [`client::TUNNEL_TIMEOUT`], most of which
+/// would otherwise be a row that looks ignored. `None` for every other
+/// action: they are answered at once.
+pub fn waiting_note(action: Action) -> Option<String> {
+    let verb = match action {
+        Action::Connect => "connecting",
+        Action::Disconnect => "disconnecting",
+        _ => return None,
+    };
+    Some(format!("{verb}… (up to {} s)", client::TUNNEL_TIMEOUT.as_secs()))
+}
+
 /// 1 s with the popup open, 5 s with it closed (spec §2). The applet's
 /// timer subscription is keyed on this duration, so flipping it restarts
 /// the timer — which is exactly the intent.
@@ -73,6 +101,17 @@ pub fn daemon_exe() -> std::path::PathBuf {
         .and_then(|exe| exe.parent().map(|dir| dir.join("yutani")))
         .filter(|sibling| sibling.is_file())
         .unwrap_or_else(|| std::path::PathBuf::from("yutani"))
+}
+
+/// What "Start Yutani" runs: `yutani start`, the same as the launcher
+/// entry — through the systemd user unit when `yutani service install`
+/// has been run (crash restart, journald, stoppable via the unit), else
+/// the daemon in that process. Bare `yutani` would bypass an installed
+/// unit and leave a daemon it cannot see.
+pub fn start_command() -> std::process::Command {
+    let mut cmd = std::process::Command::new(daemon_exe());
+    cmd.arg("start");
+    cmd
 }
 
 /// A pending connect/disconnect has got what it asked for: the tunnel a
@@ -162,6 +201,16 @@ mod tests {
         assert_eq!(Action::StartDaemon.request(), None);
     }
 
+    /// I2: only the two tunnel actions keep the user waiting.
+    #[test]
+    fn only_the_tunnel_actions_have_something_to_say_while_waiting() {
+        assert_eq!(waiting_note(Action::Connect).as_deref(), Some("connecting… (up to 15 s)"));
+        assert_eq!(waiting_note(Action::Disconnect).as_deref(), Some("disconnecting… (up to 15 s)"));
+        for action in [Action::ShowThumbs, Action::HideThumbs, Action::Focus(1), Action::Quit, Action::Preferences, Action::StartDaemon] {
+            assert_eq!(waiting_note(action), None, "{action:?}");
+        }
+    }
+
     #[test]
     fn poll_is_one_second_open_and_five_closed() {
         assert_eq!(poll_interval(true), Duration::from_secs(1));
@@ -174,6 +223,17 @@ mod tests {
         assert_eq!(exe.file_name().unwrap(), "yutani");
         // Either an absolute sibling that exists, or the bare name for PATH.
         assert!(exe.is_absolute() && exe.is_file() || exe == std::path::Path::new("yutani"));
+    }
+
+    /// I1: "Start Yutani" runs `yutani start`, not bare `yutani` — that is
+    /// what routes through the systemd user unit when one is installed
+    /// (crash restart, journald, stoppable via the unit) and is byte-for-
+    /// byte the in-process daemon when none is.
+    #[test]
+    fn start_yutani_goes_through_yutani_start() {
+        let cmd = start_command();
+        assert_eq!(std::path::Path::new(cmd.get_program()).file_name().unwrap(), "yutani");
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["start"]);
     }
 
     #[test]
@@ -245,6 +305,21 @@ mod tests {
         assert!(!poll.replied());
         assert!(!poll.in_flight());
         assert!(poll.request(), "and the guard is still usable");
+    }
+
+    /// M2: a note is one aside under a row, not a paragraph. `malformed
+    /// reply {line:?}` quotes up to 64 KiB and an action error carries
+    /// systemctl's whole stderr; either would wrap into many lines and push
+    /// Quit toward `popup_container`'s clip.
+    #[test]
+    fn a_note_is_clipped_to_one_readable_line() {
+        assert_eq!(clip_note("short"), "short");
+        let exact = "a".repeat(NOTE_MAX_CHARS);
+        assert_eq!(clip_note(&exact), exact, "at the limit is kept whole");
+        // Clipped on a char boundary, with an ellipsis that says so.
+        let clipped = clip_note(&"é".repeat(NOTE_MAX_CHARS + 40));
+        assert_eq!(clipped.chars().count(), NOTE_MAX_CHARS + 1);
+        assert!(clipped.ends_with('…'), "{clipped}");
     }
 
     #[test]

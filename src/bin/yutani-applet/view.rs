@@ -9,7 +9,6 @@ use cosmic::{Element, theme as cosmic_theme};
 use yutani::applet::display::Display;
 use yutani::applet::icon::icon_state;
 use yutani::applet::menu::{MenuRow, RowKind};
-use yutani::applet::note_visible;
 use yutani::applet::theme;
 use yutani::assets;
 
@@ -335,9 +334,11 @@ fn menu_row<'a>(row: MenuRow, held: bool) -> Element<'a, Msg> {
 }
 
 /// The last `err …` reply as a one-line note, in the danger ink at the hint
-/// size so it reads as an aside rather than another row.
+/// size so it reads as an aside rather than another row — or, muted, what
+/// a slow action is still doing.
 fn note_line<'a>(note: &Note) -> Element<'a, Msg> {
-    widget::container(mono(note.text.clone(), theme::MENU_HINT_SIZE, theme::DANGER_TEXT))
+    let ink = if note.progress { theme::TEXT_MUTED } else { theme::DANGER_TEXT };
+    widget::container(mono(note.text.clone(), theme::MENU_HINT_SIZE, ink))
         .width(Length::Fill)
         .padding(theme::NOTE_PAD)
         .into()
@@ -371,7 +372,7 @@ fn accounts_list(rows: Vec<Element<'_, Msg>>) -> Element<'_, Msg> {
 /// into the group — everything else keeps its place around them.
 fn menu(state: &Applet) -> Element<'_, Msg> {
     let rows = yutani::applet::menu::rows(state.status.as_ref(), state.accounts_open);
-    let note = state.note.as_ref().filter(|n| note_visible(n.at_ms, state.now_ms()));
+    let note = state.visible_note();
     let mut group: Vec<Element<'_, Msg>> = Vec::new();
     let mut clients: Vec<Element<'_, Msg>> = Vec::new();
     let mut placed = false;

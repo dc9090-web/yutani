@@ -18,33 +18,13 @@ pub const DESKTOP_ID: &str = "com.yutani.Applet.desktop";
 /// Applications list shows.
 pub const LAUNCHER_ID: &str = "com.yutani.Yutani.desktop";
 
-fn data_dir() -> PathBuf {
-    dirs::data_dir().unwrap_or_else(|| PathBuf::from("."))
-}
-
-/// The user's hicolor icon theme. Entries land in their own subdirectory of
-/// it (`crate::assets::ICONS` says which), because symbolic marks and the
-/// full-colour launcher icon are filed in different places.
-pub fn theme_dir() -> PathBuf {
-    data_dir().join("icons").join("hicolor")
-}
-
-pub fn applications_dir() -> PathBuf {
-    data_dir().join("applications")
-}
-
-pub fn desktop_path() -> PathBuf {
-    applications_dir().join(DESKTOP_ID)
-}
-
-pub fn launcher_path() -> PathBuf {
-    applications_dir().join(LAUNCHER_ID)
-}
-
 /// Every file one install touches. A struct rather than more and more
 /// parameters, so `install_to`/`uninstall_from` stay readable.
 pub struct Paths {
-    /// The hicolor theme root the `ICONS` go under.
+    /// The hicolor theme root the `ICONS` go under. Entries land in their
+    /// own subdirectory of it (`crate::assets::ICONS` says which), because
+    /// symbolic marks and the full-colour launcher icon are filed in
+    /// different places.
     pub icons: PathBuf,
     /// The applet's `NoDisplay` entry, for cosmic-panel.
     pub applet: PathBuf,
@@ -53,10 +33,55 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// The real XDG user paths.
-    pub fn user() -> Self {
-        Self { icons: theme_dir(), applet: desktop_path(), launcher: launcher_path() }
+    /// The real XDG user paths under `~/.local/share` (or `$XDG_DATA_HOME`),
+    /// or the reason there are none. No fallback: with no resolvable home
+    /// (`env -i`, a service user without a passwd entry) an install would
+    /// otherwise land in the current directory, report success, and never
+    /// be found by the panel — a refusal that says why is the useful outcome.
+    pub fn user() -> anyhow::Result<Self> {
+        Self::in_data_dir(dirs::data_dir())
     }
+
+    /// `user()` for a given (or missing) data dir, so the refusal is testable.
+    pub fn in_data_dir(data_dir: Option<PathBuf>) -> anyhow::Result<Self> {
+        let data = data_dir.context("cannot resolve the XDG data dir (is HOME unset?)")?;
+        let applications = data.join("applications");
+        Ok(Self {
+            icons: data.join("icons").join("hicolor"),
+            applet: applications.join(DESKTOP_ID),
+            launcher: applications.join(LAUNCHER_ID),
+        })
+    }
+
+    /// The directory both desktop entries live in.
+    fn applications(&self) -> &Path {
+        self.applet.parent().expect("a desktop entry path always has its applications directory")
+    }
+}
+
+/// `path` as a Desktop Entry `Exec=` argument. The spec splits `Exec` on
+/// whitespace and reads `%x` as a field code, `\`, `"`, `` ` `` and `$` as
+/// quoting syntax, so a path containing any of its reserved characters is
+/// wrapped in double quotes with those four backslash-escaped, and every
+/// `%` is doubled (field codes are expanded after unquoting). A plain path
+/// is returned unchanged, so the common entry stays readable.
+pub fn exec_quote(path: &str) -> String {
+    const RESERVED: &[char] =
+        &[' ', '\t', '\n', '"', '\'', '\\', '>', '<', '~', '|', '&', ';', '$', '*', '?', '#', '(', ')', '`'];
+    let percent_escaped = path.replace('%', "%%");
+    if !path.contains(RESERVED) {
+        return percent_escaped;
+    }
+    let mut quoted = String::with_capacity(percent_escaped.len() + 2);
+    quoted.push('"');
+    for c in percent_escaped.chars() {
+        if matches!(c, '"' | '`' | '$' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// The applet binary: the one next to the running `yutani` (cargo target
@@ -92,6 +117,7 @@ pub fn yutani_exe() -> PathBuf {
 /// The desktop entry, shaped like COSMIC's own applets
 /// (`/usr/share/applications/com.system76.CosmicApplet*.desktop`).
 pub fn desktop_entry(exec: &str) -> String {
+    let exec = exec_quote(exec);
     format!(
         "[Desktop Entry]\n\
          Name=Yutani\n\
@@ -115,6 +141,7 @@ pub fn desktop_entry(exec: &str) -> String {
 /// `hicolor/scalable/apps` — the handoff's app icon, and the one thing in
 /// the theme the shell will not recolour.
 pub fn launcher_entry(exec: &str) -> String {
+    let exec = exec_quote(exec);
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
@@ -193,12 +220,12 @@ fn update_desktop_database(applications: &Path) {
 }
 
 pub fn install() -> anyhow::Result<()> {
-    let paths = Paths::user();
+    let paths = Paths::user()?;
     let applet = applet_exe()?;
     let yutani = yutani_exe();
     let count = install_to(&paths, &applet.to_string_lossy(), &yutani.to_string_lossy())?;
     update_icon_cache(&paths.icons);
-    update_desktop_database(&applications_dir());
+    update_desktop_database(paths.applications());
     println!(
         "installed {count} files ({}, {} and {})",
         paths.icons.display(),
@@ -212,10 +239,10 @@ pub fn install() -> anyhow::Result<()> {
 }
 
 pub fn uninstall() -> anyhow::Result<()> {
-    let paths = Paths::user();
+    let paths = Paths::user()?;
     let count = uninstall_from(&paths)?;
     update_icon_cache(&paths.icons);
-    update_desktop_database(&applications_dir());
+    update_desktop_database(paths.applications());
     println!("removed {count} files");
     println!("remove the applet from the panel in Settings → Desktop → Panel → Applets");
     Ok(())
@@ -382,9 +409,58 @@ mod tests {
         assert_eq!(uninstall_from(&s.paths).unwrap(), 0);
     }
 
+    /// A plain absolute path is written as it is: the common case must
+    /// stay byte-for-byte what the tests above expect.
+    #[test]
+    fn exec_quote_leaves_a_plain_path_alone() {
+        assert_eq!(exec_quote("/usr/local/bin/yutani-applet"), "/usr/local/bin/yutani-applet");
+    }
+
+    /// Desktop Entry `Exec=` splits on whitespace and reads `%x` as a field
+    /// code, so a binary under `~/Projects/EVE Tools` or a `%` in the path
+    /// must be quoted and escaped, or cosmic-panel execs nothing at all.
+    #[test]
+    fn exec_quote_quotes_a_space_and_doubles_a_percent() {
+        assert_eq!(
+            exec_quote("/home/d/Projects/EVE Tools/target/release/yutani-applet"),
+            "\"/home/d/Projects/EVE Tools/target/release/yutani-applet\""
+        );
+        assert_eq!(exec_quote("/opt/100%/yutani"), "/opt/100%%/yutani");
+        assert_eq!(exec_quote("/opt/50% off/yutani"), "\"/opt/50%% off/yutani\"");
+    }
+
+    /// Inside the quotes the spec's four characters are backslash-escaped.
+    #[test]
+    fn exec_quote_escapes_the_reserved_characters_inside_the_quotes() {
+        assert_eq!(exec_quote(r#"/a "b"/c\d/$e`f"#), r#""/a \"b\"/c\\d/\$e\`f""#);
+    }
+
+    /// The entries carry the quoted form, and a quoted path still ends up
+    /// followed by the launcher's ` start`.
+    #[test]
+    fn the_entries_quote_the_exec_path() {
+        let applet = desktop_entry("/home/d/EVE Tools/yutani-applet");
+        assert!(applet.lines().any(|l| l == "Exec=\"/home/d/EVE Tools/yutani-applet\""), "{applet}");
+        let launcher = launcher_entry("/home/d/EVE Tools/yutani");
+        assert!(launcher.lines().any(|l| l == "Exec=\"/home/d/EVE Tools/yutani\" start"), "{launcher}");
+    }
+
+    /// No resolvable XDG data dir (`env -i`, a user with no passwd entry) is
+    /// a refusal that names the cause — not an install into the current
+    /// directory that the panel will never find.
+    #[test]
+    fn no_data_dir_is_an_error_not_the_current_directory() {
+        let err = Paths::in_data_dir(None).map(|_| ()).expect_err("must refuse");
+        assert!(err.to_string().contains("HOME"), "{err}");
+        let paths = Paths::in_data_dir(Some(PathBuf::from("/x/share"))).unwrap();
+        assert_eq!(paths.icons, PathBuf::from("/x/share/icons/hicolor"));
+        assert_eq!(paths.applet, PathBuf::from("/x/share/applications").join(DESKTOP_ID));
+        assert_eq!(paths.launcher, PathBuf::from("/x/share/applications").join(LAUNCHER_ID));
+    }
+
     #[test]
     fn the_real_paths_are_the_xdg_user_ones() {
-        let paths = Paths::user();
+        let paths = Paths::user().unwrap();
         assert!(paths.icons.ends_with("icons/hicolor"));
         assert!(paths.applet.ends_with("applications/com.yutani.Applet.desktop"));
         assert!(paths.launcher.ends_with("applications/com.yutani.Yutani.desktop"));

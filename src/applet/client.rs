@@ -16,6 +16,22 @@ use crate::tunnel::status::Status;
 /// applet's poll task forever.
 pub const IPC_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Budget for `tunnel connect|disconnect`. The daemon answers those only
+/// once its `systemctl start|stop yutani-tunnel` has returned, and the
+/// unit's own `TimeoutStopSec` is 10 s (a wedged worker is SIGKILLed then),
+/// so the `status` budget would give up — and show a timeout under the row
+/// — on an action that is in fact succeeding.
+pub const TUNNEL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The round-trip budget for `request`: [`TUNNEL_TIMEOUT`] for the two
+/// tunnel actions, [`IPC_TIMEOUT`] for everything else.
+pub fn budget(request: &Request) -> Duration {
+    match request {
+        Request::TunnelConnect | Request::TunnelDisconnect => TUNNEL_TIMEOUT,
+        _ => IPC_TIMEOUT,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IpcError {
     /// Nothing is listening on the socket: the daemon is not running.
@@ -89,9 +105,10 @@ async fn send_to_inner(path: &Path, request: &Request) -> Result<Option<String>,
     }
 }
 
-/// `send_to` against `$XDG_RUNTIME_DIR/yutani.sock`.
+/// `send_to` against `$XDG_RUNTIME_DIR/yutani.sock`, with the request's
+/// own [`budget`].
 pub async fn send(request: Request) -> Result<Option<String>, IpcError> {
-    send_to(&socket_path().map_err(|err| IpcError::Failed(err.to_string()))?, &request).await
+    send_to_with(&socket_path().map_err(|err| IpcError::Failed(err.to_string()))?, &request, budget(&request)).await
 }
 
 /// The `status` request, parsed. Takes an owned path so the future is
@@ -375,5 +392,18 @@ mod tests {
         });
         assert_eq!(got.0, "status\n");
         assert!(matches!(got.1.unwrap_err(), IpcError::Failed(m) if m.contains("too long")));
+    }
+
+    /// I2: the daemon answers `tunnel connect|disconnect` only after its
+    /// `systemctl start|stop` has completed, and the unit's own
+    /// `TimeoutStopSec` is 10 s — so the 3 s `status` budget would give up
+    /// on an action that is in fact succeeding. `status` keeps its 3 s.
+    #[test]
+    fn tunnel_requests_get_a_longer_budget_than_status() {
+        assert_eq!(budget(&Request::TunnelConnect), TUNNEL_TIMEOUT);
+        assert_eq!(budget(&Request::TunnelDisconnect), TUNNEL_TIMEOUT);
+        assert_eq!(budget(&Request::Status), IPC_TIMEOUT);
+        assert_eq!(budget(&Request::Quit), IPC_TIMEOUT);
+        assert!(TUNNEL_TIMEOUT >= Duration::from_secs(12), "TimeoutStopSec=10 plus a margin");
     }
 }
