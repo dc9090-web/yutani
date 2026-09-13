@@ -9,9 +9,9 @@ pub const HANDSHAKE_STALE_S: u64 = 180;
 pub enum IconState {
     /// The plain mark: connected and healthy, or deliberately disconnected.
     Plain,
-    /// The blue mark: the tunnel is connected *and* there is an EVE client
-    /// behind it. It is the one state where Yutani is doing its whole job,
-    /// and the only one that keeps a colour of its own on the panel.
+    /// The plain mark with a blue dot: the tunnel is connected *and* there
+    /// is an EVE client behind it. It is the one state where Yutani is
+    /// doing its whole job, and the dot is the only colour on the panel.
     Active,
     /// Ring badge: an action is in flight, or the tunnel has just come up
     /// and is still handshaking.
@@ -30,8 +30,7 @@ impl IconState {
         match self {
             IconState::Sync => "y-sync-symbolic",
             IconState::Attention => "y-attention-symbolic",
-            IconState::Active => "y-color",
-            IconState::Plain | IconState::Dim => "y-symbolic",
+            IconState::Active | IconState::Plain | IconState::Dim => "y-symbolic",
         }
     }
 
@@ -39,27 +38,25 @@ impl IconState {
         if self == IconState::Dim { super::theme::DIM_OPACITY } else { 1.0 }
     }
 
-    /// Whether the panel may recolour this icon to its own ink. Every state
-    /// but [`IconState::Active`] is a single-colour mark that *should*
-    /// follow the panel; `Active` is the full-colour `y-color` mark, and
-    /// drawing it symbolic would tint its blue away — which is the entire
-    /// point of the state.
-    pub fn symbolic(self) -> bool {
-        self != IconState::Active
+    /// Whether the mark carries the blue dot. Every state is a single-colour
+    /// mark the panel tints to its own ink; `Active` adds a dot the applet
+    /// draws over the mark (`view::panel_button`), so the Y itself stays the
+    /// panel's colour on a light theme as well as a dark one.
+    pub fn badge(self) -> bool {
+        self == IconState::Active
     }
 
     pub fn bytes(self) -> &'static [u8] {
         match self {
             IconState::Sync => crate::assets::Y_SYNC_SYMBOLIC,
             IconState::Attention => crate::assets::Y_ATTENTION_SYMBOLIC,
-            IconState::Active => crate::assets::Y_COLOR,
-            IconState::Plain | IconState::Dim => crate::assets::Y_SYMBOLIC,
+            IconState::Active | IconState::Plain | IconState::Dim => crate::assets::Y_SYMBOLIC,
         }
     }
 }
 
 /// `tunnel` is `None` when the daemon did not answer. `clients` is how many
-/// EVE clients the daemon is tracking — it is what separates the blue
+/// EVE clients the daemon is tracking — it is what separates the dotted
 /// [`IconState::Active`] mark from the plain one. `pending` is true for
 /// [`super::PENDING_S`] after a `tunnel connect|disconnect` was sent.
 pub fn icon_state(tunnel: Option<&TunnelStatus>, clients: usize, pending: bool) -> IconState {
@@ -91,8 +88,8 @@ pub fn icon_state(tunnel: Option<&TunnelStatus>, clients: usize, pending: bool) 
             }
         }
         (true, Some(age)) if age >= HANDSHAKE_STALE_S => IconState::Attention,
-        // A healthy tunnel with EVE behind it: the one state worth a
-        // colour. With nothing running the tunnel is merely ready, which is
+        // A healthy tunnel with EVE behind it: the one state worth the
+        // dot. With nothing running the tunnel is merely ready, which is
         // the plain mark — the panel must not claim more than is true.
         (true, Some(_)) if clients > 0 => IconState::Active,
         (true, Some(_)) => IconState::Plain,
@@ -211,17 +208,20 @@ mod tests {
         assert_eq!(icon_state(None, 3, false), IconState::Dim);
     }
 
-    /// `y-color` is the only icon the panel must not recolour: it is
-    /// installed to `scalable/apps` precisely because a symbolic tint would
-    /// throw its blue away.
+    /// Every state is the panel's own ink; only Active adds the dot, and it
+    /// does so over the plain mark rather than with a coloured icon, so the
+    /// Y follows a light panel theme too.
     #[test]
-    fn only_the_blue_mark_refuses_the_panel_tint() {
-        assert!(!IconState::Active.symbolic());
+    fn only_the_active_state_carries_the_dot_and_every_mark_is_tintable() {
+        assert!(IconState::Active.badge());
         for state in [IconState::Plain, IconState::Sync, IconState::Attention, IconState::Dim] {
-            assert!(state.symbolic(), "{state:?}");
+            assert!(!state.badge(), "{state:?}");
         }
-        assert_eq!(IconState::Active.bytes(), crate::assets::Y_COLOR);
+        assert_eq!(IconState::Active.bytes(), crate::assets::Y_SYMBOLIC);
         assert_eq!(IconState::Active.opacity(), 1.0);
+        for state in [IconState::Plain, IconState::Sync, IconState::Attention, IconState::Dim, IconState::Active] {
+            assert!(state.icon_name().ends_with("-symbolic"), "{state:?}");
+        }
     }
 
     #[test]
@@ -230,7 +230,7 @@ mod tests {
         assert_eq!(IconState::Sync.icon_name(), "y-sync-symbolic");
         assert_eq!(IconState::Attention.icon_name(), "y-attention-symbolic");
         assert_eq!(IconState::Dim.icon_name(), "y-symbolic");
-        assert_eq!(IconState::Active.icon_name(), "y-color");
+        assert_eq!(IconState::Active.icon_name(), "y-symbolic");
         // Every name is one of the files `applet install` actually writes.
         for state in [IconState::Plain, IconState::Sync, IconState::Attention, IconState::Dim, IconState::Active] {
             let file = format!("{}.svg", state.icon_name());

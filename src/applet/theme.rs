@@ -85,6 +85,13 @@ pub const TITLE_SIZE: f32 = 14.0;
 pub const STATUS_SIZE: f32 = 11.5;
 pub const STATUS_GAP: u16 = 7;
 pub const DOT_PX: f32 = 7.0;
+/// The blue of the Active badge on the panel: the launcher icon's blue, so
+/// the dot and the Applications entry are visibly the same mark.
+pub const ACTIVE_BADGE: Color = rgb(0x0A, 0x5C, 0xFF);
+/// A hairline of near-black around the badge so it reads against both the
+/// white mark and a light panel.
+pub const ACTIVE_BADGE_RING: Color = rgba(0x00, 0x00, 0x00, 0.55);
+pub const ACTIVE_BADGE_RING_PX: f32 = 1.0;
 pub const DOT_GLOW_BLUR: f32 = 8.0;
 pub const CHIP_SIZE: f32 = 11.0;
 pub const CHIP_RADIUS: f32 = 6.0;
@@ -203,6 +210,25 @@ pub fn hairline<'a, M: 'a>() -> cosmic::Element<'a, M> {
 }
 
 /// A filled, optionally glowing round dot (the header status dot).
+/// The badge's diameter for a panel icon `icon_px` tall: about a third of
+/// the mark, never below 5 px (a smaller dot vanishes) or above 8.
+pub fn badge_px(icon_px: f32) -> f32 {
+    (icon_px * 0.34).round().clamp(5.0, 8.0)
+}
+
+/// The Active badge: a filled blue circle with a dark hairline ring.
+pub fn badge_class(diameter: f32) -> cosmic::theme::Container<'static> {
+    cosmic::theme::Container::custom(move |_| container::Style {
+        background: Some(Background::Color(ACTIVE_BADGE)),
+        border: cosmic::iced::Border {
+            radius: Radius::from(diameter / 2.0),
+            width: ACTIVE_BADGE_RING_PX,
+            color: ACTIVE_BADGE_RING,
+        },
+        ..Default::default()
+    })
+}
+
 pub fn dot_class(color: Color, glow: bool) -> cosmic::theme::Container<'static> {
     cosmic::theme::Container::custom(move |_| container::Style {
         background: Some(Background::Color(color)),

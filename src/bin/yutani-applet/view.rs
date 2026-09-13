@@ -116,23 +116,41 @@ fn divider<'a>(padding: cosmic::iced::Padding) -> Element<'a, Msg> {
 
 /// The Y mark in the panel: the state's icon, tinted by the panel theme
 /// (`symbolic(true)` + `applet::style()`'s `icon_color`), dimmed to 38 %
-/// when there is no daemon or no tunnel — except the Active state, which
-/// keeps its own blue (`IconState::symbolic`).
+/// when there is no daemon or no tunnel. The Active state is the same
+/// tinted mark with a blue dot laid over its bottom-right corner
+/// (`IconState::badge`): the Y stays the panel's ink, the dot is the news.
 pub fn panel_button(state: &Applet) -> Element<'_, Msg> {
     let clients = state.status.as_ref().map_or(0, |s| s.clients.len());
     let icon = icon_state(state.status.as_ref().map(|s| &s.tunnel), clients, state.pending());
     let (w, h) = state.core.applet.suggested_size(true);
-    // `symbolic(false)` for the Active state only: it is the full-colour
-    // `y-color` mark, and the panel's tint would take its blue off.
-    let mark = widget::icon(widget::icon::from_svg_bytes(icon.bytes()).symbolic(icon.symbolic()))
+    let mark = widget::icon(widget::icon::from_svg_bytes(icon.bytes()).symbolic(true))
         .width(Length::Fixed(f32::from(w)))
         .height(Length::Fixed(f32::from(h)))
         .opacity(icon.opacity());
+    let content: Element<'_, Msg> = if icon.badge() {
+        // The stack takes the mark's size; the badge layer fills it and
+        // parks the dot in the corner.
+        let d = theme::badge_px(f32::from(h));
+        let badge = widget::container(widget::space().width(Length::Fixed(d)).height(Length::Fixed(d)))
+            .class(theme::badge_class(d));
+        cosmic::iced::widget::stack([
+            mark.into(),
+            widget::container(badge)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(cosmic::iced::alignment::Horizontal::Right)
+                .align_y(cosmic::iced::alignment::Vertical::Bottom)
+                .into(),
+        ])
+        .into()
+    } else {
+        mark.into()
+    };
     let open = state.popup;
     state
         .core
         .applet
-        .button_from_element(mark, true)
+        .button_from_element(content, true)
         .on_press_with_rectangle(move |offset, bounds| match open {
             Some(id) => close_popup_message(id),
             None => open_popup_message(bounds, offset),

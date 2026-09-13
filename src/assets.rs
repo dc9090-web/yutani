@@ -29,10 +29,9 @@ pub const SCALABLE_DIR: &str = "scalable/apps";
 ///
 /// The blue `y-color.svg` is deliberately *not* among the symbolic ones:
 /// anything under `symbolic/` is fair game for the shell to recolour, which
-/// would throw its blue away. It is the launcher icon — and, since the
-/// `IconState::Active` state (spec §3), the panel mark for a tunnel that is
-/// up with EVE behind it, which the applet draws from these bytes with
-/// `symbolic(false)` rather than by icon-theme name.
+/// would throw its blue away. It is the launcher icon only: the panel's
+/// Active state (spec §3) is the tinted `y-symbolic` mark with a blue dot
+/// the applet draws over it, not this file.
 pub const ICONS: [(&str, &str, &[u8]); 5] = [
     (SYMBOLIC_DIR, "y-symbolic.svg", Y_SYMBOLIC),
     (SYMBOLIC_DIR, "y-symbolic-dark.svg", Y_SYMBOLIC_DARK),
