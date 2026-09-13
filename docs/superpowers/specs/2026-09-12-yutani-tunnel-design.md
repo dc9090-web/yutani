@@ -417,6 +417,11 @@ everything it would write, so the refusal is visible before the prompt.
   yutani-tunnel.service` (no `sudo`; authorised by the polkit rule).
   Exit 0/1 with systemctl's message on failure. Also IPC requests
   `tunnel connect` / `tunnel disconnect` handled by the daemon the same way.
+  `connect` first runs `systemctl --user start yutani-eve.slice`: nft
+  resolves the `socket cgroupv2` path against the live cgroup tree when
+  the worker loads the ruleset, so the slice's cgroup must already exist
+  (after a reboot nothing else has created it — found 2026-09-14, "Could
+  not parse cgroupsv2 path"). Starting an active slice is a no-op.
 - `yutani tunnel status` (CLI) prints the same data the `status` IPC
   request returns.
 - **IPC `status`** (new request; reply `ok <json>` on one line):
@@ -496,7 +501,10 @@ the already-running client without a second adoption.
 - Daemon not running: `yutani tunnel connect` still works (it is just
   `systemctl`); the applet shows the daemon-offline state.
 - Reboot: the unit is not enabled; EVE is direct until `connect` (the
-  applet makes that one click). Enabling at boot is a later option.
+  applet makes that one click). Enabling at boot is a later option (it
+  would need the worker itself to create the slice, e.g. `systemctl
+  --user --machine=<user>@ start yutani-eve.slice`, since `connect`
+  would not run).
 - Other WireGuard tunnels (tailscale is WireGuard-based but uses its own
   table/rules) are unaffected: we use our own interface, table and marks.
 - `install` when the conf changed: overwrites; a running unit must be

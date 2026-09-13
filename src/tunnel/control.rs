@@ -6,7 +6,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::status::{TunnelFile, TunnelStatus, assemble};
-use super::{IFACE, STATUS_PATH, UNIT_NAME, UNIT_PATH};
+use super::{IFACE, SLICE, STATUS_PATH, UNIT_NAME, UNIT_PATH};
 
 pub fn installed() -> bool {
     std::path::Path::new(UNIT_PATH).exists()
@@ -20,15 +20,33 @@ pub fn systemctl_argv(verb: &str) -> Vec<String> {
     ["systemctl", "--no-ask-password", verb, UNIT_NAME].iter().map(|s| s.to_string()).collect()
 }
 
-fn systemctl(verb: &str) -> anyhow::Result<()> {
-    ensure!(installed(), "tunnel is not installed; run `yutani tunnel install <conf>`");
-    let argv = systemctl_argv(verb);
+/// Start `yutani-eve.slice` on the user's manager, which creates its
+/// cgroup. The worker's nft ruleset names that cgroup by path, and nft
+/// resolves the path against the live cgroup tree when the ruleset is
+/// loaded ("Could not parse cgroupsv2 path" otherwise) — so the slice has
+/// to exist before the unit starts. After a reboot nothing has created it
+/// yet: the first `yutani launch` or adoption would, but the tunnel is
+/// normally connected before EVE is launched. Starting a slice that is
+/// already active is a no-op, and an active slice stays active (and its
+/// cgroup stays put) after every scope under it has exited.
+pub fn slice_start_argv() -> Vec<String> {
+    ["systemctl", "--user", "--no-ask-password", "start", SLICE].iter().map(|s| s.to_string()).collect()
+}
+
+fn run(argv: &[String], what: &str) -> anyhow::Result<()> {
     let out = Command::new(&argv[0]).args(&argv[1..]).output().context("systemctl")?;
-    ensure!(out.status.success(), "systemctl {verb} {UNIT_NAME}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    ensure!(out.status.success(), "{what}: {}", String::from_utf8_lossy(&out.stderr).trim());
     Ok(())
 }
 
+fn systemctl(verb: &str) -> anyhow::Result<()> {
+    ensure!(installed(), "tunnel is not installed; run `yutani tunnel install <conf>`");
+    run(&systemctl_argv(verb), &format!("systemctl {verb} {UNIT_NAME}"))
+}
+
 pub fn connect() -> anyhow::Result<()> {
+    ensure!(installed(), "tunnel is not installed; run `yutani tunnel install <conf>`");
+    run(&slice_start_argv(), &format!("systemctl --user start {SLICE} (the tunnel's rules key on that slice's cgroup, so it must exist first)"))?;
     systemctl("start")
 }
 
@@ -109,6 +127,16 @@ pub fn current_tunnel_status(location: &str) -> TunnelStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nft resolves the `socket cgroupv2` path against the live cgroup
+    /// tree when the ruleset is loaded, so the slice's cgroup must exist
+    /// *before* the unit starts. After a reboot nothing has created it yet
+    /// (the first `yutani launch` or adoption would), so connect creates
+    /// it itself, on the user manager, without an authentication agent.
+    #[test]
+    fn connect_starts_the_eve_slice_on_the_user_manager_first() {
+        assert_eq!(slice_start_argv(), vec!["systemctl", "--user", "--no-ask-password", "start", "yutani-eve.slice"]);
+    }
 
     #[test]
     fn systemctl_never_waits_on_an_authentication_agent() {
