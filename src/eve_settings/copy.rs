@@ -115,7 +115,10 @@ pub fn execute(plan: &Plan, backup: &Path) -> std::io::Result<Report> {
     let mut report = Report { characters: 0, accounts: 0, backup: backup.to_path_buf() };
     for target in &plan.targets {
         let name = target.to.file_name().ok_or_else(|| std::io::Error::other("target has no file name"))?;
-        std::fs::copy(&target.to, backup.join(name))?;
+        // The backup itself goes through the temporary too: a copy that
+        // dies part-way must not leave a truncated file under the real
+        // name, or a later restore would write it over a good original.
+        replace_via_tmp(&target.to, &backup.join(name))?;
         replace_via_tmp(&target.from, &target.to)?;
         match target.kind {
             Kind::Character => report.characters += 1,
