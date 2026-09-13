@@ -26,6 +26,10 @@ pub const ONE_CHARACTER: &str = "Only one character has settings here; there is 
 pub const NO_PROFILE: &str = "No EVE profile directory was found.";
 pub const NO_SELECTION: &str = "Pick a character to copy from.";
 pub const NO_ACCOUNT_SELECTION: &str = "Pick an account to copy from.";
+/// EVE leaves a truncated `core_char` after a crash on logout; being the
+/// newest it is the default selection, and copying it would broadcast an
+/// empty file to every character.
+pub const EMPTY_SOURCE: &str = "The selected character's file is empty; pick another one to copy from.";
 /// ESI answered, but not about every id we asked for; the caption has to
 /// explain the bare numbers left in the dropdown.
 pub const SOME_UNNAMED: &str = "some characters could not be named";
@@ -159,8 +163,9 @@ pub fn copy_blocker(state: &State, clients_running: bool) -> Option<&'static str
     // A dropdown index past the end of the listing (libcosmic publishes one
     // on ctrl+scroll, and a refresh can shrink the list under a queued
     // message): without this the copy would be a silent no-op.
-    if state.selected_character().is_none() {
-        return Some(NO_SELECTION);
+    let Some(source) = listing.characters.get(state.source_character) else { return Some(NO_SELECTION) };
+    if source.size == 0 {
+        return Some(EMPTY_SOURCE);
     }
     if clients_running {
         return Some(RUNNING_CLIENT);
@@ -308,6 +313,7 @@ pub fn blocker_note(blocker: &str) -> String {
         NO_PROFILE => "no EVE profile directory found",
         NO_SELECTION => "pick a character to copy from",
         NO_ACCOUNT_SELECTION => "pick an account to copy from",
+        EMPTY_SOURCE => "the selected character's file is empty",
         other => other,
     }
     .to_string()
@@ -465,6 +471,18 @@ mod tests {
         assert_eq!(copy_blocker(&s, false), Some(NO_SELECTION));
     }
 
+    /// EVE leaves a truncated `core_char` behind after a crash on logout,
+    /// and being the newest it is the default selection: copying it would
+    /// broadcast an empty file to every character.
+    #[test]
+    fn an_empty_source_file_blocks_the_copy() {
+        let mut s = state_with(&[1, 2], &[10]);
+        s.listing.as_mut().unwrap().characters[0].size = 0;
+        assert_eq!(copy_blocker(&s, false), Some(EMPTY_SOURCE));
+        s.source_character = 1;
+        assert_eq!(copy_blocker(&s, false), None, "the other character is fine");
+    }
+
     /// Index 0 into an empty listing is still nothing: no panic, no
     /// selection, and the copy is blocked by the character count.
     #[test]
@@ -565,7 +583,8 @@ mod tests {
         assert_eq!(blocker_note(NO_PROFILE), "no EVE profile directory found");
         assert_eq!(blocker_note(NO_SELECTION), "pick a character to copy from");
         assert_eq!(blocker_note(NO_ACCOUNT_SELECTION), "pick an account to copy from");
-        for constant in [RUNNING_CLIENT, ONE_CHARACTER, NO_PROFILE, NO_SELECTION, NO_ACCOUNT_SELECTION] {
+        assert_eq!(blocker_note(EMPTY_SOURCE), "the selected character's file is empty");
+        for constant in [RUNNING_CLIENT, ONE_CHARACTER, NO_PROFILE, NO_SELECTION, NO_ACCOUNT_SELECTION, EMPTY_SOURCE] {
             let note = blocker_note(constant);
             assert!(!note.starts_with(|c: char| c.is_uppercase()), "{note}");
             assert!(!note.ends_with('.'), "{note}");
