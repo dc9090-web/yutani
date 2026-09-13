@@ -5,6 +5,8 @@
 //! names in [`names`]. Everything takes explicit paths so it runs against
 //! a temp directory in tests.
 
+pub mod copy;
+
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
