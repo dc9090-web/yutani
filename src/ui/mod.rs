@@ -1477,7 +1477,12 @@ impl App {
             S::BrowseTunnelConf => return self.browse_tunnel_conf(),
             // Re-checked here and not only on the button: the file behind
             // the enabled state can have been moved since the last redraw.
+            // The redraw's answer is cached per text (`conf_check`), so it
+            // is dropped first or this would be the same look, not a new one.
             S::InstallTunnel => {
+                if let Some(s) = self.settings.as_mut() {
+                    *s.tunnel.conf_check.borrow_mut() = None;
+                }
                 let blocked =
                     self.settings.as_ref().and_then(|s| tunnel_page::install_blocker(&s.tunnel));
                 if let Some(reason) = blocked {
@@ -1700,7 +1705,9 @@ impl App {
         let Some(listing) = state.characters.listing.as_ref() else { return };
         // The toplevel list empties when the window closes; the process
         // outlives it and writes these files while it exits.
-        if let Some(reason) = characters::write_blocker_now(listing, &self.config.tunnel.adopt_processes) {
+        if let Some(reason) =
+            characters::write_blocker_now(listing, &self.config.tunnel.adopt_processes, state.characters.last_write)
+        {
             return self.settings_note(reason);
         }
         let Some(character) = state.characters.selected_character() else {
@@ -1716,14 +1723,25 @@ impl App {
         let source = state.characters.source_label();
         let backups = yutani::eve_settings::copy::backups_dir(&dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")));
         let backup = backups.join(yutani::eve_settings::copy::backup_name(SystemTime::now()));
-        let note = match yutani::eve_settings::copy::plan(listing, character, account) {
-            Err(e) => e,
+        let (note, wrote) = match yutani::eve_settings::copy::plan(listing, character, account) {
+            Err(e) => (e, false),
             Ok(plan) => match yutani::eve_settings::copy::execute(&plan, &backup) {
-                Ok(report) => characters::copy_note(&source, &report),
-                Err(e) => characters::copy_failure_note(&e, &backup),
+                Ok(report) => (characters::copy_note(&source, &report), true),
+                Err(e) => (characters::copy_failure_note(&e, &backup), true),
             },
         };
+        if wrote {
+            self.mark_own_settings_write();
+        }
         self.settings_note(note);
+    }
+
+    /// The profile's files were just replaced by us: their fresh mtimes
+    /// are not a client's (see `characters::write_blocker`).
+    fn mark_own_settings_write(&mut self) {
+        if let Some(state) = self.settings.as_mut() {
+            state.characters.last_write = Some(SystemTime::now());
+        }
     }
 
     /// Characters page: put the newest backup back over the profile —
@@ -1740,33 +1758,41 @@ impl App {
         else {
             return self.settings_note("nothing to restore".to_string());
         };
-        if let Some(reason) = characters::write_blocker_now(listing, &self.config.tunnel.adopt_processes) {
+        if let Some(reason) =
+            characters::write_blocker_now(listing, &self.config.tunnel.adopt_processes, state.characters.last_write)
+        {
             return self.settings_note(reason);
         }
         let dir = listing.dir.clone();
         let backups = copy::backups_dir(&dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")));
         let saved = backups.join(copy::backup_name(SystemTime::now()));
-        let note = match copy::restore_plan(&backup, &dir) {
-            Err(e) => format!("restore failed: {e}"),
+        let (note, wrote) = match copy::restore_plan(&backup, &dir) {
+            Err(e) => (format!("restore failed: {e}"), false),
             // Nothing in the backup matches a file in the profile. Making
             // an empty backup directory here would hide the real newest
             // backup behind it, so do nothing at all.
             Ok(targets) if targets.is_empty() => {
-                format!("nothing to restore: no file in {} is in {}", backup.display(), dir.display())
+                (format!("nothing to restore: no file in {} is in {}", backup.display(), dir.display()), false)
             }
             Ok(targets) => match copy::backup_files(&targets, &saved)
                 .map_err(|error| copy::Failure { error, replaced: 0, planned: targets.len() })
                 .and_then(|_| copy::restore(&backup, &dir))
             {
-                Ok(n) => format!(
-                    "restored {n} file{} from {}; the files it replaced are in {}",
-                    if n == 1 { "" } else { "s" },
-                    backup.display(),
-                    saved.display()
+                Ok(n) => (
+                    format!(
+                        "restored {n} file{} from {}; the files it replaced are in {}",
+                        if n == 1 { "" } else { "s" },
+                        backup.display(),
+                        saved.display()
+                    ),
+                    true,
                 ),
-                Err(e) => characters::restore_failure_note(&e, &saved),
+                Err(e) => (characters::restore_failure_note(&e, &saved), true),
             },
         };
+        if wrote {
+            self.mark_own_settings_write();
+        }
         self.settings_note(note);
     }
 
@@ -2015,7 +2041,17 @@ impl Application for App {
                 if let Some(handle) = self.client_for_surface(id) {
                     tracing::info!("layer surface closed by compositor; recreating");
                     self.forget_surface(&handle);
-                    return self.reconcile_surfaces();
+                    // The keepalive's own Done can be later in the same
+                    // batch (libcosmic has already disconnected its clipboard
+                    // when it is), and the recreate below must not be the
+                    // first surface after that. A fresh keepalive goes up
+                    // ahead of it; the old id is only abandoned, never
+                    // destroyed — the compositor closed it, or it is still
+                    // holding the clipboard — and its later Done matches
+                    // nothing.
+                    self.keepalive = None;
+                    let keepalive = self.ensure_keepalive();
+                    return Task::batch([keepalive, self.reconcile_surfaces()]);
                 }
                 Task::none()
             }
@@ -2343,6 +2379,35 @@ mod tests {
         assert_eq!(surface_of(&app, &a), Some(shown), "and no client was touched");
     }
 
+    /// [M3] On output loss the compositor closes every surface on it and
+    /// libcosmic disconnects its clipboard when the keepalive's `Done` is
+    /// among them — before any of our updates run. A thumbnail's `Done`
+    /// that comes first in that batch would otherwise make the recreated
+    /// thumbnail the first surface after the disconnect (and the clipboard
+    /// bind to it), so a fresh keepalive goes up ahead of the recreate and
+    /// the old one's later `Done` matches nothing.
+    #[test]
+    fn a_thumbnail_closed_by_the_compositor_puts_a_fresh_keepalive_ahead_of_its_recreate() {
+        let fake = Fake::new();
+        let mut app = app(Config { visibility: Visibility::Always, ..Config::default() });
+        add_output(&mut app, &fake, "DP-1");
+        let first = app.keepalive.expect("created with the first output");
+        let a = fake.handle();
+        let _ = app.on_backend(Event::ClientAdded(a.clone(), info(true, Vec::new())));
+        let thumb = surface_of(&app, &a).expect("shown");
+
+        let _ = app.update(Msg::Wayland(WaylandEvent::Layer(LayerEvent::Done, fake.wl_surface(), thumb)));
+        let fresh = app.keepalive.expect("a keepalive is up");
+        assert_ne!(fresh, first, "the keepalive was replaced, not kept");
+        let recreated = surface_of(&app, &a).expect("recreated");
+        assert!(fresh < recreated, "the fresh keepalive was minted before the thumbnail");
+
+        // The stale keepalive's own Done, later in the same batch.
+        let _ = app.update(Msg::Wayland(WaylandEvent::Layer(LayerEvent::Done, fake.wl_surface(), first)));
+        assert_eq!(app.keepalive, Some(fresh), "matches nothing");
+        assert_eq!(surface_of(&app, &a), Some(recreated), "and no client was touched");
+    }
+
     /// [I4] A character logs in on DP-1 (its thumbnail is created there,
     /// on the client's own output) with a saved position on DP-2. When the
     /// name resolves, the saved x/y must not be applied with a margin on
@@ -2448,6 +2513,30 @@ mod tests {
         let characters = &app.settings.as_ref().unwrap().characters;
         assert!(characters.listing.is_none() && characters.error.is_none(), "read synchronously");
         assert!(characters.last_backup.is_none());
+    }
+
+    /// [M1] The Install press re-checks the `.conf` path because the file
+    /// can have been moved since the last redraw — but the redraw's answer
+    /// is cached per text, so the press has to drop it or it looks at
+    /// nothing and raises the polkit prompt for a file root cannot read.
+    #[test]
+    fn the_install_press_re_stats_the_conf_file_instead_of_trusting_the_redraw() {
+        let dir = std::env::temp_dir().join(format!("yutani-install-press-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("wg0.conf");
+        std::fs::write(&conf, "[Interface]\n").unwrap();
+        let mut app = app(Config::default());
+        app.settings = Some(settings::State::new(SurfaceId::unique(), &app.config));
+        app.settings.as_mut().unwrap().tunnel.conf_path = conf.display().to_string();
+        // The redraw: enabled, and the answer cached for that text.
+        assert_eq!(tunnel_page::install_blocker(&app.settings.as_ref().unwrap().tunnel), None);
+        std::fs::remove_file(&conf).unwrap();
+        let _ = app.update(Msg::Settings(settings::Msg::InstallTunnel));
+        let state = app.settings.as_ref().unwrap();
+        assert_eq!(state.note.as_deref(), Some(tunnel_page::NOT_A_FILE), "the press must see the file is gone");
+        assert!(!state.tunnel.busy && app.tunnel_in_flight.is_none(), "no action started");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// [I3] The watcher's answer to a `config.ron` that does not parse:
