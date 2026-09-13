@@ -36,6 +36,7 @@ use anyhow::Context as _;
 use calloop_wayland_source::WaylandSource;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::{hash::Hash, thread};
@@ -353,7 +354,9 @@ fn start(conn: Connection, app_ids: Vec<String>, fps: u32) -> mpsc::Receiver<Eve
         Ok(result) => result,
         Err(err) => {
             tracing::error!("cannot initialize wayland registry: {err}");
-            eprintln!("yutani: cannot initialize wayland registry: {err}");
+            // Not `eprintln!`: stderr may be the applet's pipe with nobody
+            // reading it, and a panic on EPIPE here would replace exit 1.
+            let _ = writeln!(std::io::stderr().lock(), "yutani: cannot initialize wayland registry: {err}");
             std::process::exit(1);
         }
     };
@@ -369,7 +372,11 @@ fn start(conn: Connection, app_ids: Vec<String>, fps: u32) -> mpsc::Receiver<Eve
         let missing: Vec<&str> =
             checks.iter().filter(|c| c.required && c.found.is_none()).map(|c| c.interface).collect();
         tracing::error!("compositor is missing required protocols: {}", missing.join(", "));
-        eprintln!("yutani: compositor is missing required protocols: {} (run `yutani doctor`)", missing.join(", "));
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "yutani: compositor is missing required protocols: {} (run `yutani doctor`)",
+            missing.join(", ")
+        );
         std::process::exit(2);
     }
 

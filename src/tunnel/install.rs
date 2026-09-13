@@ -4,7 +4,7 @@
 use anyhow::{Context as _, anyhow, bail, ensure};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use super::conf::WgConf;
 use super::{CONF_PATH, POLKIT_PATH, UNIT_NAME, UNIT_PATH, write_with_mode};
@@ -154,10 +154,31 @@ pub fn install(conf: &Path, dns_servers: &[std::net::Ipv4Addr], dns_domains: &[S
     if !dns_domains.is_empty() {
         cmd.args(["--dns-domains", &joined(dns_domains)]);
     }
-    let status = cmd.status().context("pkexec")?;
-    ensure!(status.success(), "install cancelled or failed (pkexec exit {status})");
+    privileged(&mut cmd, "install")?;
     println!("{}", success_message(&conf));
     Ok(())
+}
+
+/// Run one `pkexec` command and say how it went. Its stderr is captured,
+/// never inherited: from the settings window this process's stderr is the
+/// applet's pipe, which has no reader once cosmic-panel has restarted the
+/// applet, and a child that inherits it dies of SIGPIPE on its first write
+/// — "not authorised" would come back as `pkexec exit signal: 13`. What
+/// the child wrote is echoed to our own stderr afterwards (a dead pipe
+/// there is ignored) and its last line goes into the error, which is all
+/// the settings window shows. stdin and stdout stay inherited, as before:
+/// stdin is where pkexec's text-mode agent looks for a terminal, and
+/// stdout carries the root side's report to whoever runs this from one.
+fn privileged(cmd: &mut Command, what: &str) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let out = cmd.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::piped()).output().context("pkexec")?;
+    let _ = std::io::stderr().lock().write_all(&out.stderr);
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let why = stderr.lines().rev().map(str::trim).find(|l| !l.is_empty()).map(|l| format!(": {l}")).unwrap_or_default();
+    bail!("{what} cancelled or failed (pkexec exit {}){why}", out.status)
 }
 
 /// What `install` prints once the root side succeeded. A tunnel that is
@@ -174,8 +195,7 @@ Delete {} (it holds the private key and is world-readable).",
 
 pub fn uninstall() -> anyhow::Result<()> {
     let exe = current_exe()?;
-    let status = Command::new("pkexec").args([&exe, "tunnel", "uninstall-root"]).status().context("pkexec")?;
-    ensure!(status.success(), "uninstall cancelled or failed (pkexec exit {status})");
+    privileged(Command::new("pkexec").args([&exe, "tunnel", "uninstall-root"]), "uninstall")?;
     println!("Tunnel uninstalled.");
     Ok(())
 }
@@ -456,7 +476,11 @@ pub fn install_root(
     .contains(&true);
     daemon_reload()?;
     if parsed.dns.is_none() {
-        eprintln!("warning: the conf has no DNS entry; EVE's DNS lookups will not go through the tunnel");
+        // Root's stderr is whatever pkexec was given; a write that fails
+        // (nobody reading it any more) must not turn a finished install
+        // into a panic.
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), "warning: the conf has no DNS entry; EVE's DNS lookups will not go through the tunnel");
     }
     Ok(if changed { report } else { format!("{report}{NOTHING_CHANGED_MARKER}\n") })
 }
@@ -674,6 +698,26 @@ mod tests {
         assert!(e.contains("KiB"), "got {e}");
         assert!(install_root(&real, 1000, "daniel", "/opt/y", &servers(), &domains(), true).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The pkexec step's stderr is captured, not inherited, and its last
+    /// line is what the error carries — the settings window shows nothing
+    /// else. Driven with `sh` in pkexec's place.
+    #[test]
+    fn the_pkexec_step_carries_the_last_stderr_line_in_its_error() {
+        let mut fine = Command::new("sh");
+        fine.args(["-c", "echo just a warning >&2; exit 0"]);
+        assert!(privileged(&mut fine, "install").is_ok());
+        let mut refused = Command::new("sh");
+        refused.args(["-c", "echo first >&2; echo 'Error executing command as another user: Not authorized' >&2; echo >&2; exit 127"]);
+        let e = privileged(&mut refused, "install").unwrap_err().to_string();
+        assert_eq!(e, "install cancelled or failed (pkexec exit exit status: 127): Error executing command as another user: Not authorized");
+        let mut silent = Command::new("false");
+        let e = privileged(&mut silent, "uninstall").unwrap_err().to_string();
+        assert_eq!(e, "uninstall cancelled or failed (pkexec exit exit status: 1)");
+        let mut missing = Command::new("/nonexistent-yutani-pkexec");
+        let e = privileged(&mut missing, "install").unwrap_err().to_string();
+        assert!(e.starts_with("pkexec"), "got {e}");
     }
 
     /// The guard and the read must see the same object: the caller owns

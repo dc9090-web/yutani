@@ -14,6 +14,7 @@ mod ui;
 use yutani::{ipc, model, tunnel};
 
 use clap::{Parser, Subcommand};
+use std::io::{self, Write as _};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -159,7 +160,7 @@ enum TunnelAction {
 /// without a unit).
 fn run_daemon() -> anyhow::Result<ExitCode> {
     if cli::is_running() {
-        eprintln!("yutani is already running");
+        let _ = writeln!(io::stderr().lock(), "yutani is already running");
         return Ok(ExitCode::from(1));
     }
     let config = model::config::Config::load();
@@ -303,7 +304,11 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("yutani: {err:#}");
+            // Not `eprintln!`: the daemon started by the applet has the
+            // applet's pipe as stderr, and once cosmic-panel has restarted
+            // the applet nobody reads it — `eprintln!` would panic on the
+            // EPIPE (exit 101, message lost either way) instead of exiting 1.
+            let _ = writeln!(io::stderr().lock(), "yutani: {err:#}");
             ExitCode::from(1)
         }
     }
