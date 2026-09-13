@@ -18,7 +18,13 @@ use crate::model::config::{Modifier, ShortcutsConfig, resolve_keysym};
 /// (`key: "t"`, never `Some("t")`) while `description` is a plain `Option`
 /// (`Some("…")`); `keysym` below mirrors that so we can read cosmic's own
 /// files and write what cosmic accepts.
+///
+/// `deny_unknown_fields` here too: the file is re-emitted from these
+/// structs, so a field a newer cosmic-settings writes that we do not model
+/// would be read, dropped and written back missing from the user's own
+/// bindings. Refusing to parse such a file leaves it exactly as it was.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Binding {
     pub modifiers: Vec<Modifier>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "keysym")]
@@ -351,6 +357,72 @@ mod tests {
     #[test]
     fn merge_rejects_unparseable_input_instead_of_clobbering() {
         assert!(merge("{ this is not ron", &desired(&cfg(), "yutani")).is_err());
+    }
+
+    #[test]
+    fn merge_and_strip_refuse_a_binding_with_a_field_we_do_not_model() {
+        // A field a newer cosmic-settings writes into a binding is one we
+        // would read, drop and write back missing — for the user's *own*
+        // shortcut. Refuse the file instead, like upstream's
+        // `deny_unknown_fields` does, so it is left exactly as it was.
+        let foreign = r#"{ (modifiers: [Super], key: "t", repeat: true, description: Some("Terminal")): Spawn("cosmic-term") }"#;
+        let err = merge(foreign, &desired(&cfg(), "yutani")).unwrap_err();
+        assert!(err.to_string().contains("cannot parse the existing custom shortcuts file"), "{err:#}");
+        assert!(strip(foreign).is_err());
+    }
+
+    /// `custom` as cosmic-settings 1.8 writes it: `cosmic_config::Config::set`
+    /// runs `ron::ser::to_string_pretty` with the default `PrettyConfig`, so
+    /// every binding is spread over several lines, one modifier per line,
+    /// in `HashMap` order. Every field cosmic-settings-daemon's `Binding`
+    /// has (modifiers, key, keycode, description), and nothing else.
+    const COSMIC_SETTINGS_1_8: &str = r#"{
+    (
+        modifiers: [
+            Super,
+        ],
+        key: "t",
+        description: Some("Terminal"),
+    ): Spawn("cosmic-term"),
+    (
+        modifiers: [
+            Super,
+            Shift,
+        ],
+        keycode: Some(24),
+        description: Some("By keycode"),
+    ): Close,
+    (
+        modifiers: [],
+        key: "XF86AudioPlay",
+    ): System(PlayPause),
+    (
+        modifiers: [
+            Ctrl,
+            Alt,
+        ],
+        key: "Delete",
+        description: Some("Disabled"),
+    ): Disable,
+}"#;
+
+    #[test]
+    fn a_file_cosmic_settings_wrote_round_trips_through_install_and_uninstall() {
+        let original = parse(COSMIC_SETTINGS_1_8).unwrap();
+        assert_eq!(original.len(), 4);
+        // Re-rendered in our one-line shape, the same four bindings and
+        // actions come back.
+        assert_eq!(parse(&render(&original).unwrap()).unwrap(), original);
+        // Install adds ours and touches nothing of theirs; uninstall then
+        // leaves the file with exactly the entries it started with.
+        let (installed, skipped) = merge(COSMIC_SETTINGS_1_8, &desired(&cfg(), "yutani")).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let with_ours = parse(&installed).unwrap();
+        assert_eq!(with_ours.len(), 15);
+        for (binding, action) in &original {
+            assert_eq!(with_ours.get(binding).map(|a| a.get_ron()), Some(action.get_ron()), "{binding:?}");
+        }
+        assert_eq!(parse(&strip(&installed).unwrap()).unwrap(), original);
     }
 
     #[test]
