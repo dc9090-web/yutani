@@ -41,6 +41,25 @@ pub const TABLE: u32 = 51820;
 pub const DEFAULT_DNS_SERVERS: [std::net::Ipv4Addr; 2] =
     [std::net::Ipv4Addr::new(1, 1, 1, 1), std::net::Ipv4Addr::new(9, 9, 9, 9)];
 pub const DEFAULT_DNS_DOMAINS: [&str; 3] = ["eveonline.com", "ccpgames.com", "evetech.net"];
+
+/// Whether `a` may be a `dns_servers` entry: an address the *exit node*
+/// can reach. `rules::nft_ruleset` marks every packet to it on port 53 for
+/// the tunnel, whoever sends it, and the masquerade hands it to the exit —
+/// so a LAN resolver (`192.168.1.1`: the router, a Pi-hole, the obvious
+/// thing to type), loopback, link-local or a placeholder address would no
+/// longer be routed where it lives, and every lookup on the machine to it
+/// would time out for as long as the tunnel is up, with the applet showing
+/// a healthy tunnel. Checked where the values are typed
+/// (`Config::validate`), where root stores them (`install::dns_conf_lines`)
+/// and where root acts on them (`worker`).
+pub fn usable_dns_server(a: &std::net::Ipv4Addr) -> bool {
+    !(a.is_private() || a.is_loopback() || a.is_link_local() || a.is_unspecified() || a.is_broadcast())
+}
+
+/// The reason [`usable_dns_server`] refuses an address, for the messages
+/// the three call sites print.
+pub const UNUSABLE_DNS_SERVER: &str =
+    "is a private, loopback, link-local, unspecified or broadcast address, which the exit node cannot reach: while the tunnel was up every lookup on this machine to it would time out";
 pub const SLICE: &str = "yutani-eve.slice";
 pub const CONF_PATH: &str = "/etc/yutani/tunnel.conf";
 pub const STATUS_PATH: &str = "/run/yutani/tunnel.json";
@@ -132,6 +151,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// A resolver the exit node cannot reach must never become a
+    /// `dns_servers` entry: the mark rule would send every query to it into
+    /// the tunnel and the machine's DNS would silently die while connected.
+    #[test]
+    fn only_addresses_the_exit_node_can_reach_are_usable_dns_servers() {
+        for ok in ["1.1.1.1", "9.9.9.9", "8.8.8.8", "94.140.14.14", "185.228.168.9"] {
+            assert!(usable_dns_server(&ok.parse().unwrap()), "{ok} is a public resolver");
+        }
+        for bad in ["192.168.1.1", "10.0.0.1", "172.16.0.1", "127.0.0.1", "127.0.0.53", "169.254.1.1", "0.0.0.0", "255.255.255.255"] {
+            assert!(!usable_dns_server(&bad.parse().unwrap()), "{bad} cannot be reached from the exit node");
+        }
+        assert!(DEFAULT_DNS_SERVERS.iter().all(usable_dns_server), "the defaults must pass their own check");
     }
 
     #[test]

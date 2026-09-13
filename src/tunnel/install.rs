@@ -301,6 +301,14 @@ fn dns_conf_lines(servers: &[std::net::Ipv4Addr], domains: &[String]) -> anyhow:
             "{d:?} is not a plain DNS host name (letters, digits, `-`, `.`)"
         );
     }
+    // Every packet to these addresses on port 53 is marked for the tunnel,
+    // whoever sends it, so one the exit node cannot reach (the LAN router,
+    // a Pi-hole, loopback) would take the whole machine's DNS down for as
+    // long as the tunnel is up. Refused here, root-side, whatever the user
+    // side let through.
+    for s in servers {
+        ensure!(super::usable_dns_server(s), "dns server {s} {}", super::UNUSABLE_DNS_SERVER);
+    }
     let servers: Vec<String> = if servers.is_empty() {
         super::DEFAULT_DNS_SERVERS.iter().map(|s| s.to_string()).collect()
     } else {
@@ -542,6 +550,26 @@ mod tests {
         };
         assert_eq!(first("uid").as_deref(), Some("1000"), "the first uid line must be root's: {report}");
         assert_eq!(first("dns_servers").as_deref(), Some("1.1.1.1 9.9.9.9"), "{report}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A LAN or loopback resolver in `--dns-servers` would have the mark
+    /// rule send every query on the machine to it into the tunnel, where
+    /// the exit node cannot reach it: machine-wide DNS dies while
+    /// connected, with the applet showing a healthy tunnel. The root side
+    /// refuses it, naming the address, whatever the user side validated.
+    #[test]
+    fn install_root_refuses_dns_servers_the_exit_node_cannot_reach() {
+        let dir = temp_dir("inst-lan-dns");
+        let conf = dir.join("EVE.conf");
+        std::fs::write(&conf, GOOD_CONF).unwrap();
+        for bad in ["192.168.1.1", "10.0.0.1", "127.0.0.53", "169.254.1.1", "0.0.0.0"] {
+            let servers = vec![bad.parse().unwrap(), "8.8.8.8".parse().unwrap()];
+            let e = install_root(&conf, 1000, "daniel", "/opt/y", &servers, &domains(), true).unwrap_err().to_string();
+            assert!(e.contains(bad), "the message must name the address, got {e}");
+            assert!(e.contains("exit node"), "got {e}");
+        }
+        assert!(install_root(&conf, 1000, "daniel", "/opt/y", &["8.8.8.8".parse().unwrap()], &domains(), true).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

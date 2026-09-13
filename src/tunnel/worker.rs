@@ -80,10 +80,23 @@ fn conf_list<'a>(text: &'a str, key: &str) -> Option<Vec<&'a str>> {
 /// `config.ron` (spec §9): `install-root` copies the values into the conf
 /// it owns. A conf written before this feature has no such line, and a line
 /// whose values are all unusable is no better than a missing one — both
-/// give the defaults, so an old install keeps working.
+/// give the defaults, so an old install keeps working. Re-checked here
+/// even though `install-root` refuses such addresses: this text is what
+/// the mark rule is built from, and a conf stored before that check could
+/// still name a resolver the exit node cannot reach.
 fn dns_servers_from_conf(text: &str) -> Vec<std::net::Ipv4Addr> {
-    let parsed: Vec<std::net::Ipv4Addr> =
-        conf_list(text, "dns_servers").unwrap_or_default().iter().filter_map(|s| s.parse().ok()).collect();
+    let parsed: Vec<std::net::Ipv4Addr> = conf_list(text, "dns_servers")
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok())
+        .filter(|a| {
+            let usable = super::usable_dns_server(a);
+            if !usable {
+                tracing::warn!("dns server {a} {}; ignoring it", super::UNUSABLE_DNS_SERVER);
+            }
+            usable
+        })
+        .collect();
     if parsed.is_empty() { super::DEFAULT_DNS_SERVERS.to_vec() } else { parsed }
 }
 
@@ -561,6 +574,18 @@ mod tests {
         assert_eq!(
             dns_domains_from_conf("# yutani: dns_domains = eveonline.com bad~domain\n"),
             vec!["eveonline.com"]
+        );
+
+        // A resolver the exit node cannot reach never reaches the mark rule
+        // either — a conf stored before `install-root` refused such
+        // addresses is treated as if the line held only the usable ones.
+        assert_eq!(
+            dns_servers_from_conf("# yutani: dns_servers = 192.168.1.1 8.8.8.8\n"),
+            vec!["8.8.8.8".parse::<std::net::Ipv4Addr>().unwrap()]
+        );
+        assert_eq!(
+            dns_servers_from_conf("# yutani: dns_servers = 192.168.1.1 127.0.0.53\n"),
+            crate::tunnel::DEFAULT_DNS_SERVERS.to_vec()
         );
     }
 
