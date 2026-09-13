@@ -1313,6 +1313,12 @@ impl App {
                 self.settings_note("copied".to_string());
                 return cosmic::iced::clipboard::write(yutani::STEAM_LAUNCH_ARGS.to_string());
             }
+            // The window's own drop target answered: the Wayland route
+            // into the same handler the X11 window event uses.
+            S::FilesDropped(paths) => {
+                self.on_files_dropped(paths);
+                return Task::none();
+            }
             S::RefreshCharacters => return self.refresh_characters(),
             S::RefreshTunnel => return self.refresh_tunnel(),
             S::BrowseTunnelConf => return self.browse_tunnel_conf(),
@@ -1574,15 +1580,14 @@ impl App {
         self.settings_note(note);
     }
 
-    /// Files dropped anywhere on a window. Only the settings window takes
-    /// any, and only a `.conf`: the Tunnel page's third way of naming the
+    /// Files dropped on the settings window — from its own drag-and-drop
+    /// destination widget (`settings::Msg::FilesDropped`, the Wayland
+    /// route) or from the X11/XWayland `FileDropped` window event. Only a
+    /// `.conf` is taken: the Tunnel page's third way of naming the
     /// WireGuard file. The file itself is never opened here — the page
     /// shows its name, and `install` (as root) is the only thing that reads
     /// what is inside it.
-    fn on_files_dropped(&mut self, id: SurfaceId, paths: &[PathBuf]) {
-        if self.settings.as_ref().map(|s| s.window) != Some(id) {
-            return;
-        }
+    fn on_files_dropped(&mut self, paths: &[PathBuf]) {
         let Some(conf) = tunnel_page::conf_candidate(paths) else { return };
         let name = conf.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let tab = settings::page_index(settings::Page::Tunnel);
@@ -1604,7 +1609,15 @@ impl App {
     fn tunnel_done(&mut self, action: settings::TunnelAction, result: Result<(), String>) -> String {
         let Some(state) = self.settings.as_mut() else { return String::new() };
         state.tunnel.busy = false;
-        let conf = PathBuf::from(state.tunnel.conf_path.trim());
+        // The file the action *started* with, not whatever the field holds
+        // now: the path can have been re-typed or dropped on while pkexec
+        // was asking for a password, and the note would then name a file
+        // that was never installed.
+        let conf = state
+            .tunnel
+            .pending_conf
+            .take()
+            .unwrap_or_else(|| PathBuf::from(state.tunnel.conf_path.trim()));
         match (action, result) {
             (settings::TunnelAction::Install, result) => tunnel_page::install_note(&conf, result),
             (_, Err(e)) => e,
@@ -1650,6 +1663,8 @@ impl App {
         let Some(state) = self.settings.as_mut() else { return Task::none() };
         state.tunnel.busy = true;
         let conf = PathBuf::from(state.tunnel.conf_path.trim());
+        // What the note at the end has to name; cleared by `tunnel_done`.
+        state.tunnel.pending_conf = Some(conf.clone());
         let (servers, domains) = (self.config.tunnel.dns_servers.clone(), self.config.tunnel.dns_domains.clone());
         cosmic::iced::Task::perform(
             async move {
@@ -1677,7 +1692,12 @@ impl App {
                     .title("WireGuard configuration")
                     .filter(FileFilter::new("WireGuard config").glob("*.conf"));
                 match dialog.open_file().await {
-                    Ok(response) => response.url().to_file_path().ok(),
+                    // `FileResponse::url()` panics when nothing was
+                    // selected; the URI list behind it is empty instead.
+                    Ok(response) => response.0.uris().first().and_then(|url| url.to_file_path().ok()),
+                    // Cancelling is an answer, not a fault: only a portal
+                    // that failed is worth a line in the log.
+                    Err(file_chooser::Error::Cancelled) => None,
                     Err(why) => {
                         tracing::warn!("file chooser: {why}");
                         None
@@ -1797,8 +1817,13 @@ impl Application for App {
                 }
                 task
             }
+            // The X11/XWayland route only (see `subscription`); the drop
+            // the settings window itself receives comes through
+            // `settings::Msg::FilesDropped`. Both end in the same handler.
             Msg::FileDropped(id, paths) => {
-                self.on_files_dropped(id, &paths);
+                if self.settings.as_ref().map(|s| s.window) == Some(id) {
+                    self.on_files_dropped(&paths);
+                }
                 Task::none()
             }
             Msg::Settings(msg) => self.on_settings(msg),
@@ -1842,6 +1867,10 @@ impl Application for App {
                 event @ (WaylandEvent::Output(..) | WaylandEvent::Layer(..)),
             )) => Some(Msg::Wayland(event)),
             iced::Event::Mouse(m) => Some(Msg::Pointer(id, m)),
+            // winit emits this on X11, macOS and Windows only — never on
+            // Wayland, where a drop reaches the client through the data
+            // device and so through the settings window's own drag-and-drop
+            // destination widget. Kept for XWayland/X11 sessions.
             iced::Event::Window(iced::window::Event::FileDropped(paths)) => Some(Msg::FileDropped(id, paths)),
             // Every other event (RequestResize, Frame, keyboard, …) must not become
             // a message: update → redraw → same event again is a hot loop.

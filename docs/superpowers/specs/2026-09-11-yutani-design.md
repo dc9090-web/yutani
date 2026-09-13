@@ -326,7 +326,8 @@ libcosmic window, opened from the applet or `yutani settings`. Pages:
   specified in full in `2026-09-13-yutani-character-copy-design.md`.
 - **Tunnel** — install, connect, disconnect and uninstall the EVE-only
   WireGuard tunnel from the Proton VPN `.conf` (browsed through the XDG
-  portal, typed, or dropped on the window), with the tunnel's state and the
+  portal, typed, or dragged from Files onto the window — the compositor's
+  data device hands the window a `text/uri-list`), with the tunnel's state and the
   read-only DNS settings; specified in full in
   `2026-09-13-yutani-tunnel-page-and-ansible-design.md`.
 - **Steam** — the launch options EVE Online needs in its Steam *Properties

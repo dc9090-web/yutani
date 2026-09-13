@@ -10,8 +10,14 @@ A fifth editable page, **Tunnel**, between Characters and Steam. It replaces
 the terminal step `yutani tunnel install <file>` with a window that takes the
 WireGuard configuration file (Proton VPN's wg-quick `.conf` download) three
 ways: a **Browse…** button (the XDG file-chooser portal, filtered to
-`*.conf`), a path typed into a text field, or **dropping the file onto the
-settings window**. One **Install tunnel** button then runs the existing
+`*.conf`), a path typed into a text field, or **dragging the file out of
+Files (or any file manager) and dropping it on the settings window**. The
+drop arrives the only way it can on Wayland: through the compositor's data
+device, as a `text/uri-list` payload handed to the drag-and-drop destination
+libcosmic's `dnd_destination_for_data` wraps the window's page in. (Winit's
+`FileDropped` window event, which iced also reports, is an X11/macOS/Windows
+event only; it is kept for XWayland sessions and fires nowhere else.) One
+**Install tunnel** button then runs the existing
 `tunnel::install::install` on the blocking pool; that path shells out to
 `pkexec`, so the desktop's polkit agent asks for the password once, exactly
 as the CLI does. Replacing an installed tunnel with a new file is the same
@@ -26,11 +32,14 @@ are shown read-only with the note that the tunnel must be re-installed after
 changing them (they are baked into `/etc/yutani/tunnel.conf` at install).
 
 Safety and feedback follow the rest of the window: the note line reports
-what happened (`tunnel installed from EVE-UK-455.conf; press Connect`,
-`install cancelled or failed: …`), the buttons are disabled while an action
-is in flight, and nothing is written when the path does not name a readable
-file. Private keys are never displayed or logged; the page shows only the
-file name and the parsed `location`.
+what happened (`tunnel installed from EVE-UK-455.conf; press Connect — you
+can delete EVE-UK-455.conf now, it holds the private key`, `install
+cancelled or failed: …`), the buttons and the path field are disabled while
+an action is in flight, and nothing is written when the path does not name a
+readable file. Private keys are never displayed or logged; the page shows
+only the file name and the parsed `location`. As the CLI's success message
+does, the page says to delete the download once the install succeeded: it is
+a world-readable copy of the private key.
 
 Every state change on this page is a file operation outside `config.ron`,
 so the page works while `config.ron` is broken (like Layouts, Characters and

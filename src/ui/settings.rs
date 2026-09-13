@@ -260,6 +260,11 @@ pub enum Msg {
     RefreshCharacters,
     /// A names lookup finished: what is known, and the error if any id is still unnamed.
     Names(Names, Option<String>),
+    /// Files dragged onto this window and dropped on it, decoded from the
+    /// drop's `text/uri-list`. The window's whole page is a drag-and-drop
+    /// destination ([`view`]): on Wayland a drop arrives through the
+    /// compositor's data device and nowhere else.
+    FilesDropped(Vec<PathBuf>),
     /// Tunnel page: the `.conf` path field, as typed/browsed/dropped.
     TunnelConfPath(String),
     /// Tunnel page: open the XDG file chooser.
@@ -455,6 +460,19 @@ pub fn view<'a>(
         .padding(16)
         .width(Length::Fill)
         .height(Length::Fill);
+    // The whole page is the drop target for the Tunnel page's `.conf`
+    // (`tunnel_page::DroppedFiles` names the MIME types it takes). This —
+    // libcosmic's drag-and-drop destination widget, fed by the compositor's
+    // data device — is the only route a drop takes on Wayland;
+    // `iced::window::Event::FileDropped` is winit's X11/macOS/Windows
+    // event and never fires here. A drop the widget cannot decode arrives
+    // as `None`, i.e. no files, and changes nothing.
+    let dropzone: Element<'a, Msg> =
+        widget::dnd_destination::dnd_destination_for_data::<super::tunnel_page::DroppedFiles, _>(
+            page,
+            |data, _action| Msg::FilesDropped(data.map(|files| files.0).unwrap_or_default()),
+        )
+        .into();
     let content: Element<'a, Msg> = widget::container(widget::column::with_children(vec![
         widget::header_bar()
             .title("Yutani Settings")
@@ -462,7 +480,7 @@ pub fn view<'a>(
             .on_drag(Msg::Drag)
             .focused(focused)
             .into(),
-        page.into(),
+        dropzone,
     ]))
     .class(cosmic::theme::Container::WindowBackground)
     .width(Length::Fill)
@@ -828,6 +846,7 @@ mod tests {
         // The Tunnel page drives systemd and `/etc/yutani`; not one of its
         // messages is a `config.ron` field either, so none of them may
         // report a config change (or be written back to the file).
+        assert_eq!(apply_config_field(&mut c, &Msg::FilesDropped(vec![PathBuf::from("/tmp/x.conf")])), Ok(false));
         assert_eq!(apply_config_field(&mut c, &Msg::TunnelConfPath("/tmp/x.conf".into())), Ok(false));
         assert_eq!(apply_config_field(&mut c, &Msg::BrowseTunnelConf), Ok(false));
         assert_eq!(apply_config_field(&mut c, &Msg::TunnelConfChosen(None)), Ok(false));
