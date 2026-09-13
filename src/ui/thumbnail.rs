@@ -40,10 +40,6 @@ pub fn zoomed_size(config: &Config, image: Option<&CaptureImage>, zoomed: bool) 
     size_at_width(width, config.border_px, image)
 }
 
-pub fn size_for(config: &Config, src_w: u32, src_h: u32) -> (u32, u32) {
-    size_for_width(config.thumb_width, config.border_px, src_w, src_h)
-}
-
 /// Surface size for a `src_w`×`src_h` source shown `thumb_width` wide
 /// inside a `border_px` border.
 pub fn size_for_width(thumb_width: u32, border_px: u32, src_w: u32, src_h: u32) -> (u32, u32) {
@@ -153,9 +149,8 @@ mod tests {
 
     #[test]
     fn size_follows_captured_aspect() {
-        let config = Config { thumb_width: 320, border_px: 2, ..Config::default() };
-        assert_eq!(size_for(&config, 2560, 1440), (324, 184));
-        assert_eq!(size_for(&config, 1000, 1000), (324, 324));
+        assert_eq!(size_for_width(320, 2, 2560, 1440), (324, 184));
+        assert_eq!(size_for_width(320, 2, 1000, 1000), (324, 324));
     }
 
     #[test]
