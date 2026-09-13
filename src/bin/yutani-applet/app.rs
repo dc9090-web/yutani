@@ -322,7 +322,11 @@ impl cosmic::Application for Applet {
                 }
                 self.sampler.reset();
                 self.rates = Rates::default();
-                self.note(msg, None);
+                // A wait that is still on outranks a poll error: its reply
+                // is what ends it, and it must find its own note to clear.
+                if !self.note.as_ref().is_some_and(|n| n.progress) {
+                    self.note(msg, None);
+                }
                 after_reply
             }
             Msg::Press(Action::StartDaemon) => match spawn_detached(&mut start_command()) {
@@ -678,5 +682,26 @@ mod tests {
         assert!(!note.progress);
         assert_eq!(note.action, Some(Action::Disconnect));
         assert!(note.text.contains("timeout"), "{}", note.text);
+    }
+
+    /// A poll that fails while a connect is in flight (a 3 s status
+    /// timeout, a `socket_path` error) must not replace "connecting…" with
+    /// its own error: the wait is still on, and the daemon's answer would
+    /// then find no progress note to clear and leave the red poll error
+    /// standing. With no wait on, the poll error is shown as before.
+    #[test]
+    fn a_failed_poll_does_not_overwrite_a_progress_note() {
+        let mut applet = applet();
+        let _ = applet.update(Msg::Press(Action::Connect));
+        let _ = applet.update(Msg::Status(Err(IpcError::Failed("timeout after 3000ms".into()))));
+        let note = applet.note.as_ref().expect("still waiting");
+        assert!(note.progress, "the poll error must not replace the wait: {}", note.text);
+        assert_eq!(note.action, Some(Action::Connect));
+        let _ = applet.update(Msg::Done(Action::Connect, Ok(())));
+        assert!(applet.note.is_none(), "the answer ends the wait");
+
+        let _ = applet.update(Msg::Status(Err(IpcError::Failed("timeout after 3000ms".into()))));
+        let note = applet.note.as_ref().expect("a poll error with nothing in flight is shown");
+        assert!(!note.progress && note.action.is_none(), "{}", note.text);
     }
 }
