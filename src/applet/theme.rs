@@ -209,6 +209,24 @@ pub fn hairline<'a, M: 'a>() -> cosmic::Element<'a, M> {
     .into()
 }
 
+/// The panel mark's ink on a dark panel: pure white. The theme's `on_bg`
+/// is a soft grey that reads dull at 16 px (Daniel, 2026-09-13: "make sure
+/// the Y icon is bright white"). A light panel keeps the theme's own ink,
+/// because white on a light panel is invisible.
+pub const MARK_ON_DARK: Color = Color::WHITE;
+
+/// The SVG class for the tinted panel mark: [`MARK_ON_DARK`] on a dark
+/// theme, the theme's `on_bg` colour on a light one. Symbolic icons take
+/// their colour from this class; `Svg::Default` would fall back to the
+/// applet style's `icon_color` (the grey).
+pub fn mark_class() -> cosmic::theme::Svg {
+    cosmic::theme::Svg::custom(|theme| {
+        let cosmic = theme.cosmic();
+        let color = if cosmic.is_dark { MARK_ON_DARK } else { cosmic.on_bg_color().into() };
+        cosmic::iced::widget::svg::Style { color: Some(color) }
+    })
+}
+
 /// The badge's diameter for a panel icon `icon_px` tall: half the mark,
 /// never below 7 px or above 12 (enlarged from a third / 5–8 px on
 /// 2026-09-13: at panel size XS the smaller dot was easy to miss).

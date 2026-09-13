@@ -51,7 +51,10 @@ cosmic-panel ──spawns──▶ yutani-applet (libcosmic applet, own process)
 
 ## 3. Panel button and icon states
 
-Icon name `y-symbolic` (tinted by the panel). `yutani applet install`
+Icon name `y-symbolic`, tinted **pure white** on a dark panel theme and
+with the theme's `on_bg` ink on a light one (`applet::theme::mark_class`;
+the panel's default `icon_color` is a soft grey that read dull — changed
+2026-09-13). `yutani applet install`
 copies the five SVGs into `~/.local/share/icons/hicolor/` (the four
 symbolic marks to `symbolic/apps/`, the full-colour `y-color.svg` to
 `scalable/apps/`), runs `gtk-update-icon-cache` if present, and prints the
