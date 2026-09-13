@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::adopt;
 use crate::backend::{self, CaptureImage, ClientInfo, Cmd, Event, Handle};
 use crate::model::client::Login;
-use crate::model::config::{Config, Mode, Visibility};
+use crate::model::config::{Config, Mode};
 use crate::model::layout::{self, Layout, Rect, ThumbPos};
 
 pub mod characters;
@@ -285,20 +285,25 @@ impl App {
     }
 
     /// After a client update: remember an activation, and when focus has
-    /// just left EVE, arrange a second look once the grace is over (the
-    /// surfaces are kept until then). Nothing is scheduled while focus is
-    /// still on EVE or while the grace could not matter.
-    fn note_activation(&mut self) -> Task<cosmic::Action<Msg>> {
-        if self.any_client_activated() {
+    /// just left EVE (`was_focused`: a client was activated before the
+    /// update), start the grace *now* and arrange a second look once it is
+    /// over (the surfaces are kept until then). See
+    /// [`rules::grace_after_update`] for why the stamp has to be taken on
+    /// the transition and not left at the last event seen while focused.
+    fn note_activation(&mut self, was_focused: bool) -> Task<cosmic::Action<Msg>> {
+        let (stamp, timer) = rules::grace_after_update(self.any_client_activated(), was_focused, self.eve_focused());
+        if stamp {
             self.last_eve_focus = Some(Instant::now());
+        }
+        if !timer {
             return Task::none();
         }
-        if self.config.visibility != Visibility::EveFocusedOnly || !self.eve_focused() {
-            return Task::none();
-        }
+        // The sleep is created inside the future: `tokio::time::sleep`
+        // wants a runtime at construction, and this runs on the update
+        // thread (and in tests, where there is none).
         cosmic::iced::Task::perform(
-            tokio::time::sleep(rules::FOCUS_GRACE + Duration::from_millis(20)),
-            |_| cosmic::Action::App(Msg::FocusGraceOver),
+            async { tokio::time::sleep(rules::FOCUS_GRACE + Duration::from_millis(20)).await },
+            |()| cosmic::Action::App(Msg::FocusGraceOver),
         )
     }
 
@@ -1032,6 +1037,9 @@ impl App {
                 Task::none()
             }
             Event::ClientAdded(handle, info) | Event::ClientUpdated(handle, info) => {
+                // Taken before the update lands: whether focus *leaves*
+                // EVE with it is what starts the grace.
+                let was_focused = self.any_client_activated();
                 let entry = self.clients.entry(handle.clone()).or_insert_with(|| Client {
                     info: info.clone(),
                     image: None,
@@ -1049,7 +1057,7 @@ impl App {
                 let was_named = matches!(entry.info.login, Login::LoggedIn(_));
                 entry.info = info;
                 let became_named = !was_named && matches!(entry.info.login, Login::LoggedIn(_));
-                let grace = self.note_activation();
+                let grace = self.note_activation(was_focused);
                 // An activation change on one client can hide/show others, so
                 // reconcile every client's surface, not just this one's.
                 let reconciled = Task::batch([grace, self.reconcile_surfaces()]);
@@ -1066,10 +1074,11 @@ impl App {
                 }
             }
             Event::ClientRemoved(handle) => {
+                let was_focused = self.any_client_activated();
                 let task = self.destroy_surface(&handle);
                 self.clients.remove(&handle);
                 // The activated client may be the one that closed.
-                let grace = self.note_activation();
+                let grace = self.note_activation(was_focused);
                 // The layout order changed; the saved position stays, so the
                 // character comes back to the same spot next launch.
                 self.save_current_layout();
@@ -1984,5 +1993,137 @@ impl Application for App {
         } else {
             thumbnail::view(client, &self.config)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic::cctk::wayland_client::protocol::wl_registry::WlRegistry;
+    use cosmic::cctk::wayland_client::{EventQueue, QueueHandle, backend::Backend, delegate_noop};
+    use std::os::unix::net::UnixStream;
+
+    use crate::model::config::Visibility;
+
+    /// A Wayland connection with nobody on the other end: enough to mint
+    /// proxies (outputs, toplevel handles) for an `App` without a
+    /// compositor. Requests go into the socket's buffer and nothing ever
+    /// answers them, which is fine — the tests only look at the app's
+    /// state, never at what the (absent) compositor would do.
+    struct Fake {
+        qh: QueueHandle<Nop>,
+        registry: WlRegistry,
+        _queue: EventQueue<Nop>,
+        _peer: UnixStream,
+    }
+
+    struct Nop;
+    delegate_noop!(Nop: ignore WlRegistry);
+    delegate_noop!(Nop: ignore WlOutput);
+    delegate_noop!(Nop: ignore Handle);
+
+    impl Fake {
+        fn new() -> Fake {
+            let (ours, peer) = UnixStream::pair().unwrap();
+            let conn = Connection::from_backend(Backend::connect(ours).unwrap());
+            let queue = conn.new_event_queue::<Nop>();
+            let qh = queue.handle();
+            let registry = conn.display().get_registry(&qh, ());
+            Fake { qh, registry, _queue: queue, _peer: peer }
+        }
+
+        fn output(&self) -> WlOutput {
+            self.registry.bind::<WlOutput, _, _>(1, 4, &self.qh, ())
+        }
+
+        /// A toplevel handle. The compositor would normally create these;
+        /// binding one as a global is nonsense on the wire but yields a
+        /// perfectly good proxy to key `clients` by.
+        fn handle(&self) -> Handle {
+            self.registry.bind::<Handle, _, _>(1, 1, &self.qh, ())
+        }
+    }
+
+    fn app(config: Config) -> App {
+        App {
+            core: cosmic::app::Core::default(),
+            config,
+            conn: None,
+            cmd: None,
+            clients: HashMap::new(),
+            outputs: Vec::new(),
+            layout: Layout::default(),
+            layout_poisoned: false,
+            layout_poison_warned: false,
+            drag: None,
+            hidden: false,
+            last_eve_focus: None,
+            settings: None,
+            tunnel_in_flight: None,
+        }
+    }
+
+    /// Announce an output to the app the way libcosmic does, and hand back
+    /// its handle so clients can be placed on it. sctk's `OutputInfo` is
+    /// `#[non_exhaustive]`, so the event carries no info and the record
+    /// `on_output` would have built from it is registered by hand — then
+    /// the same reconcile the event handler runs.
+    fn add_output(app: &mut App, fake: &Fake, name: &str) -> WlOutput {
+        let output = fake.output();
+        let _ = app.update(Msg::Wayland(WaylandEvent::Output(OutputEvent::Created(None), output.clone())));
+        app.outputs.push(Output { handle: output.clone(), name: name.to_string(), logical_size: (2560, 1440), scale: 1 });
+        let _ = app.reconcile_surfaces();
+        output
+    }
+
+    fn info(activated: bool, outputs: Vec<WlOutput>) -> ClientInfo {
+        ClientInfo { login: Login::LoggingIn, activated, minimized: false, outputs }
+    }
+
+    fn surface_of(app: &App, h: &Handle) -> Option<SurfaceId> {
+        app.clients[h].surface
+    }
+
+    /// [I1] Play in client A for a minute (no toplevel events), then click
+    /// client B. cosmic-comp refreshes toplevel state in list order, so A's
+    /// deactivation lands first and B's activation a few milliseconds
+    /// later. The grace has to start the moment focus *leaves* — not date
+    /// from the last event that happened to arrive while EVE was focused —
+    /// or every surface is destroyed and recreated across that gap.
+    #[test]
+    fn a_click_from_one_eve_window_to_another_keeps_every_surface() {
+        let fake = Fake::new();
+        let mut app = app(Config { visibility: Visibility::EveFocusedOnly, ..Config::default() });
+        add_output(&mut app, &fake, "DP-1");
+        let (a, b) = (fake.handle(), fake.handle());
+        let _ = app.on_backend(Event::ClientAdded(a.clone(), info(true, Vec::new())));
+        let _ = app.on_backend(Event::ClientAdded(b.clone(), info(false, Vec::new())));
+        let before = (surface_of(&app, &a), surface_of(&app, &b));
+        assert!(before.0.is_some() && before.1.is_some(), "shown while EVE is focused");
+        // A quiet minute in A: nothing stamped `last_eve_focus` since.
+        app.last_eve_focus = Some(Instant::now().checked_sub(Duration::from_secs(60)).unwrap());
+
+        let _ = app.on_backend(Event::ClientUpdated(a.clone(), info(false, Vec::new())));
+        std::thread::sleep(Duration::from_millis(5));
+        let _ = app.on_backend(Event::ClientUpdated(b.clone(), info(true, Vec::new())));
+
+        let after = (surface_of(&app, &a), surface_of(&app, &b));
+        assert_eq!(after, before, "no surface was destroyed and recreated across the click");
+    }
+
+    /// The other half of the grace: once it has passed with nobody
+    /// activated, `FocusGraceOver` does take the surfaces down.
+    #[test]
+    fn the_surfaces_go_once_the_grace_passes_with_eve_unfocused() {
+        let fake = Fake::new();
+        let mut app = app(Config { visibility: Visibility::EveFocusedOnly, ..Config::default() });
+        add_output(&mut app, &fake, "DP-1");
+        let a = fake.handle();
+        let _ = app.on_backend(Event::ClientAdded(a.clone(), info(true, Vec::new())));
+        let _ = app.on_backend(Event::ClientUpdated(a.clone(), info(false, Vec::new())));
+        assert!(surface_of(&app, &a).is_some(), "kept for the grace");
+        app.last_eve_focus = Some(Instant::now().checked_sub(rules::FOCUS_GRACE + Duration::from_millis(100)).unwrap());
+        let _ = app.update(Msg::FocusGraceOver);
+        assert_eq!(surface_of(&app, &a), None);
     }
 }

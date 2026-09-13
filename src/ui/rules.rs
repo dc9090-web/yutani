@@ -21,6 +21,27 @@ pub fn eve_focused(any_activated: bool, since_last_activation: Option<Duration>,
     any_activated || since_last_activation.is_some_and(|since| since < grace)
 }
 
+/// What the focus grace needs after a client update, given whether any
+/// client is activated now, whether one was before the update, and
+/// whether EVE still counts as focused (`eve_focused`): (stamp the last
+/// focus now?, schedule a grace timer?). Focus *leaving* EVE is the moment
+/// the grace starts — the last stamp dates from the last event that
+/// arrived while EVE was focused, which after a quiet stretch of play is
+/// minutes old — so that transition stamps and schedules; while focus is
+/// still away inside the grace only the timer is (re)scheduled, so the
+/// grace can never extend itself. Visibility is deliberately not an input:
+/// one timer per focus loss costs nothing, and a switch to
+/// `EveFocusedOnly` inside the grace needs that second look too.
+pub fn grace_after_update(any_activated: bool, was_activated: bool, within_grace: bool) -> (bool, bool) {
+    if any_activated {
+        return (true, false);
+    }
+    if was_activated {
+        return (true, true);
+    }
+    (false, within_grace)
+}
+
 /// Whether a client's thumbnail should be on screen right now.
 pub fn should_show(
     visibility: Visibility,
@@ -125,6 +146,25 @@ mod tests {
         assert!(eve_focused(false, Some(Duration::from_millis(100)), g), "inside the grace");
         assert!(!eve_focused(false, Some(g), g), "the grace is exclusive");
         assert!(!eve_focused(false, Some(Duration::from_secs(5)), g));
+    }
+
+    /// [I1]/[M1] Focus leaving EVE is what starts the grace: the stamp is
+    /// refreshed on that transition (the last one may be minutes old) and
+    /// the timer scheduled — whatever the visibility setting, so a switch
+    /// to `EveFocusedOnly` inside the grace still gets its second look.
+    #[test]
+    fn the_grace_starts_when_focus_leaves_eve() {
+        // Focused now: stamp, no timer.
+        assert_eq!(grace_after_update(true, true, true), (true, false));
+        assert_eq!(grace_after_update(true, false, false), (true, false));
+        // Focus just left: stamp now and arrange the second look.
+        assert_eq!(grace_after_update(false, true, false), (true, true), "stale stamp must not matter");
+        assert_eq!(grace_after_update(false, true, true), (true, true));
+        // Still away inside the grace: another look, but no fresh stamp
+        // (the grace must not extend itself).
+        assert_eq!(grace_after_update(false, false, true), (false, true));
+        // Long gone.
+        assert_eq!(grace_after_update(false, false, false), (false, false));
     }
 
     #[test]
