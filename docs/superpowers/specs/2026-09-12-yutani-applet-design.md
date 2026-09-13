@@ -108,8 +108,23 @@ Vertical order and copy exactly as the handoff; data sources:
    < 180 s, else `Disconnected` (`#8A8F98`); `·` ; pin glyph ;
    `tunnel.location`. Right chip: `tunnel.iface` (`yutani0`).
 2. **Accounts band** — count = `clients.len()`; label "Account connected" /
-   "Accounts connected"; right column: `tunnel.address` or `—`; `hs 21s ago`
-   from `handshake_age_s`, `hs —` when null/disconnected.
+   "Accounts connected"; right column: the **tunnel IP**, meaning the
+   *public* address EVE is seen at — `tunnel.exit_address` when the worker
+   has one, else the internal `tunnel.address` (10.2.0.2, all the applet
+   has before the first lookup or against an older daemon), else `—`;
+   `hs 21s ago` from `handshake_age_s`, `hs —` when null/disconnected.
+
+   `exit_address` is `Option<String>` on both `TunnelFile` and
+   `TunnelStatus` (`#[serde(default)]`, like `up_for_s`/`failed`), and
+   `None` whenever the link is down. The root worker fills it with
+   `curl -4 -sS -m 6 --interface <tunnel address> https://api.ipify.org`
+   through `proc::output_with_timeout` (8 s cap): `--interface 10.2.0.2`
+   gives the request the source address the policy rule `from 10.2.0.2`
+   matches, so the query goes down `yutani0` and the exit node answers it.
+   It runs when the link comes up, when the peer's first handshake lands,
+   and every 300 s after; only a bare IPv4 answer is accepted, and any
+   failure keeps the previous value (debug-logged) rather than blanking the
+   band.
 3. **Traffic tiles** — Upload (`tx_bytes`, accent `#2FD6B0`) and Download
    (`rx_bytes`, `#5B9BFF`): total + rate; formatting per the handoff
    (≥1e9 `X.XX GB`, ≥1e6 `X.X MB`, else `N KB`; rates `X.X MB/s` / `N KB/s`,

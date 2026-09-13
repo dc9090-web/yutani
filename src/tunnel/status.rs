@@ -17,6 +17,13 @@ pub struct TunnelFile {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     pub since_unix: u64,
+    /// The public address the exit node answers on, as seen from inside the
+    /// tunnel — the address EVE's traffic actually arrives from, which is
+    /// what spec §4.2's "tunnel IP" means. `None` until the first successful
+    /// lookup. `serde(default)`: a file written by an older worker (or one
+    /// that has not looked yet) must still parse.
+    #[serde(default)]
+    pub exit_address: Option<String>,
 }
 
 /// Peer line of `wg show <iface> dump`: endpoint, latest handshake (unix
@@ -68,6 +75,13 @@ pub struct TunnelStatus {
     /// icon (spec §3). `serde(default)` for the same reason as `up_for_s`.
     #[serde(default)]
     pub failed: bool,
+    /// The tunnel's *public* exit address (`TunnelFile::exit_address`),
+    /// `None` while disconnected or before the worker's first successful
+    /// lookup. The popup prefers it over the internal `address`: spec §4.2's
+    /// "tunnel IP" is the address the world sees, not 10.2.0.2.
+    /// `serde(default)` for the same reason as `up_for_s`.
+    #[serde(default)]
+    pub exit_address: Option<String>,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
 }
@@ -132,6 +146,9 @@ pub fn assemble(
         handshake_age_s,
         up_for_s,
         failed,
+        // Nothing is connected, so there is no exit to report — a stale
+        // address from the last session would read as a live one.
+        exit_address: if connected { file.and_then(|f| f.exit_address.clone()) } else { None },
         rx_bytes: rx,
         tx_bytes: tx,
     }
@@ -183,6 +200,7 @@ mod tests {
             rx_bytes: 5,
             tx_bytes: 7,
             since_unix: 900,
+            exit_address: Some("198.51.100.10".into()),
         }
     }
 
@@ -232,12 +250,41 @@ mod tests {
         assert_eq!(s.up_for_s, None);
     }
 
+    /// Spec §4.2's "tunnel IP" is the *public* exit address, so the worker's
+    /// value has to reach the applet — and must not survive the link it
+    /// belongs to.
+    #[test]
+    fn assemble_passes_the_exit_address_through_only_while_connected() {
+        let s = assemble(Some(&file()), true, None, true, false, "London", 1021);
+        assert_eq!(s.exit_address.as_deref(), Some("198.51.100.10"));
+        // The link is gone: last session's exit address would read as live.
+        let s = assemble(Some(&file()), false, None, true, false, "London", 1021);
+        assert_eq!(s.exit_address, None);
+        // Up, but the worker has not managed a lookup yet.
+        let mut f = file();
+        f.exit_address = None;
+        let s = assemble(Some(&f), true, None, true, false, "London", 1021);
+        assert_eq!(s.exit_address, None);
+        assert_eq!(assemble(None, false, None, false, false, "London", 1).exit_address, None);
+    }
+
     #[test]
     fn assemble_passes_the_units_failed_state_through() {
         let s = assemble(Some(&file()), true, None, true, false, "London", 1021);
         assert!(!s.failed);
         let s = assemble(None, false, None, true, true, "London", 1021);
         assert!(s.failed);
+    }
+
+    /// The same across the worker/daemon boundary: a `tunnel.json` written
+    /// before the exit address existed must still load, or a tunnel that
+    /// survived the upgrade would read as down.
+    #[test]
+    fn a_tunnel_file_without_the_exit_address_still_parses() {
+        let json = r#"{"up":true,"iface":"yutani0","address":"10.2.0.2","endpoint":"198.51.100.10:51820",
+            "latest_handshake_unix":1000,"rx_bytes":5,"tx_bytes":7,"since_unix":900}"#;
+        let back: TunnelFile = serde_json::from_str(json).expect("an older worker's file must parse");
+        assert_eq!(back.exit_address, None);
     }
 
     /// The applet and the daemon are separate binaries and can be different
@@ -253,6 +300,7 @@ mod tests {
         assert_eq!(back.tunnel.handshake_age_s, Some(21));
         assert_eq!(back.tunnel.up_for_s, None);
         assert!(!back.tunnel.failed);
+        assert_eq!(back.tunnel.exit_address, None);
     }
 
     #[test]

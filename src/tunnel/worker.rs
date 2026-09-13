@@ -181,9 +181,103 @@ fn ensure_route() {
     }
 }
 
-fn write_status(conf: &WgConf, since: u64) -> anyhow::Result<()> {
+/// How long the worker keeps a known exit address before looking again.
+/// The answer only changes when the peer does, so this is a refresh, not a
+/// poll: five minutes costs one `curl` per five minutes of uptime.
+pub const EXIT_IP_REFRESH_S: u64 = 300;
+
+/// How long the exit-IP `curl` may take before it is killed. Comfortably
+/// above curl's own `-m 6` so the process timeout is only ever the backstop
+/// for a curl that ignores it (a stuck DNS resolve, an unkillable TLS
+/// handshake), not the normal way out.
+const EXIT_IP_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Ask what the public internet sees this machine as, *through the tunnel*.
+///
+/// `--interface <tunnel address>` is the whole trick: it binds the request
+/// to 10.2.0.2, which is exactly what the policy rule `from 10.2.0.2`
+/// matches, so the query is routed down `yutani0` and answered by the exit
+/// node rather than by the LAN's own uplink. `-4` because the tunnel is
+/// v4-only and a v6 answer would be some other path entirely.
+pub fn exit_ip_command(addr: std::net::Ipv4Addr) -> Vec<String> {
+    ["curl", "-4", "-sS", "-m", "6", "--interface", &addr.to_string(), "https://api.ipify.org"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+/// The body of that request, if it is an IPv4 address and nothing else.
+///
+/// Anything else — an error page, a captive portal's redirect, a v6
+/// address, two addresses — is not an answer, and the applet must never be
+/// handed a string that only *looks* like an address.
+pub fn parse_exit_ip(body: &str) -> Option<std::net::Ipv4Addr> {
+    body.trim().parse().ok()
+}
+
+/// When the exit address is worth asking for again: the first look after
+/// the link came up (`last_refresh` 0), the moment the peer first
+/// handshakes (the route is only then carrying traffic, so the answer can
+/// differ from the one before it), and every [`EXIT_IP_REFRESH_S`]
+/// thereafter. `saturating_sub` keeps a backwards clock step from becoming
+/// a refresh on every tick.
+pub fn should_refresh_exit_ip(last_refresh: u64, now: u64, handshake_changed: bool) -> bool {
+    last_refresh == 0 || handshake_changed || now.saturating_sub(last_refresh) >= EXIT_IP_REFRESH_S
+}
+
+/// What the worker remembers between ticks about the exit address.
+struct ExitIp {
+    /// The last address that parsed. Kept across failures: a tunnel that is
+    /// still up has not changed its exit node just because one `curl` could
+    /// not reach api.ipify.org, and blanking the field would flap the
+    /// applet's band between an address and the internal one.
+    address: Option<String>,
+    /// Unix seconds of the last *attempt* (not the last success): a failing
+    /// query must back off exactly as a succeeding one does, or a broken
+    /// network would mean one `curl` per second.
+    last_refresh: u64,
+    /// The handshake timestamp seen on the previous tick, to spot the 0 →
+    /// non-zero transition.
+    last_handshake: u64,
+}
+
+impl ExitIp {
+    fn new() -> Self {
+        ExitIp { address: None, last_refresh: 0, last_handshake: 0 }
+    }
+
+    /// Refresh `address` if this tick is one of the moments
+    /// [`should_refresh_exit_ip`] names. Every failure keeps the previous
+    /// value and is logged at debug: the exit address is a nicety on the
+    /// applet's band, never a reason to disturb a working tunnel.
+    fn refresh(&mut self, addr: std::net::Ipv4Addr, handshake: u64, now: u64) {
+        let handshake_changed = self.last_handshake == 0 && handshake > 0;
+        self.last_handshake = handshake;
+        if !should_refresh_exit_ip(self.last_refresh, now, handshake_changed) {
+            return;
+        }
+        self.last_refresh = now;
+        let argv = exit_ip_command(addr);
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        match crate::proc::output_with_timeout(&mut cmd, EXIT_IP_TIMEOUT) {
+            Ok(Some(out)) if out.status.success() => {
+                match parse_exit_ip(&String::from_utf8_lossy(&out.stdout)) {
+                    Some(ip) => self.address = Some(ip.to_string()),
+                    None => tracing::debug!("exit ip: answer is not an IPv4 address"),
+                }
+            }
+            Ok(Some(out)) => tracing::debug!("exit ip: curl failed ({})", out.status),
+            Ok(None) => tracing::debug!("exit ip: curl outlived {EXIT_IP_TIMEOUT:?}"),
+            Err(e) => tracing::debug!("exit ip: {e}"),
+        }
+    }
+}
+
+fn write_status(conf: &WgConf, since: u64, exit: &mut ExitIp) -> anyhow::Result<()> {
     let dump = exec(&["wg".to_string(), "show".to_string(), IFACE.to_string(), "dump".to_string()])?;
     let (endpoint, handshake, rx, tx) = parse_wg_dump(&dump).unwrap_or((conf.endpoint.clone(), 0, 0, 0));
+    exit.refresh(conf.address, handshake, now_unix());
     let file = TunnelFile {
         up: true,
         iface: IFACE.into(),
@@ -193,6 +287,7 @@ fn write_status(conf: &WgConf, since: u64) -> anyhow::Result<()> {
         rx_bytes: rx,
         tx_bytes: tx,
         since_unix: since,
+        exit_address: exit.address.clone(),
     };
     // `write_with_mode` creates the temporary with 0644 from the start and
     // renames it into place, so the file is never briefly unreadable and a
@@ -220,11 +315,17 @@ pub fn run() -> anyhow::Result<()> {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
         let mut tick = tokio::time::interval(Duration::from_secs(1));
+        // The exit-IP refresh can block a tick for as long as
+        // `EXIT_IP_TIMEOUT`; without this an interval that fell behind
+        // would then fire every missed tick back to back (tokio's default
+        // `Burst`) instead of simply carrying on once a second.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut exit = ExitIp::new();
         loop {
             tokio::select! {
                 _ = tick.tick() => {
                     ensure_route();
-                    if let Err(e) = write_status(&conf, since) {
+                    if let Err(e) = write_status(&conf, since, &mut exit) {
                         tracing::warn!("status: {e:#}");
                     }
                 }
@@ -352,6 +453,58 @@ mod tests {
             dns_domains_from_conf("# yutani: dns_domains = eveonline.com bad~domain\n"),
             vec!["eveonline.com"]
         );
+    }
+
+    /// The exit IP is fetched *through* the tunnel: the policy rule
+    /// `from 10.2.0.2` is what routes it into `yutani0`, and `--interface`
+    /// is what gives curl that source address.
+    #[test]
+    fn the_exit_ip_is_asked_for_through_the_tunnel_address() {
+        let addr: std::net::Ipv4Addr = "10.2.0.2".parse().unwrap();
+        assert_eq!(exit_ip_command(addr), vec![
+            "curl",
+            "-4",
+            "-sS",
+            "-m",
+            "6",
+            "--interface",
+            "10.2.0.2",
+            "https://api.ipify.org"
+        ]);
+    }
+
+    /// api.ipify.org answers with a bare address and no newline, but a
+    /// proxy, a captive portal or an error page can answer with anything —
+    /// and anything that is not an IPv4 address must never reach the applet.
+    #[test]
+    fn only_a_bare_ipv4_address_is_accepted_as_the_exit_ip() {
+        assert_eq!(parse_exit_ip("198.51.100.10"), Some("198.51.100.10".parse().unwrap()));
+        assert_eq!(parse_exit_ip("  198.51.100.10\n"), Some("198.51.100.10".parse().unwrap()));
+        assert_eq!(parse_exit_ip(""), None);
+        assert_eq!(parse_exit_ip("   "), None);
+        assert_eq!(parse_exit_ip("<html>error</html>"), None);
+        assert_eq!(parse_exit_ip("2a00:1450::1"), None);
+        assert_eq!(parse_exit_ip("198.51.100.10 198.51.100.11"), None);
+    }
+
+    /// Rarely, and on the two events that can change the answer: the first
+    /// look after the link came up (`last_refresh` 0) and the first
+    /// handshake after none. Otherwise every five minutes — a `curl` in the
+    /// one-second status loop is not something to run on every tick.
+    #[test]
+    fn the_exit_ip_is_refreshed_on_the_events_that_can_change_it_and_rarely_otherwise() {
+        // Never looked yet.
+        assert!(should_refresh_exit_ip(0, 1_789_180_000, false));
+        // Just looked.
+        assert!(!should_refresh_exit_ip(1_789_180_000, 1_789_180_001, false));
+        // The peer handshaked for the first time: the route is only now
+        // carrying traffic, so the answer may differ from the one before it.
+        assert!(should_refresh_exit_ip(1_789_180_000, 1_789_180_001, true));
+        // The five-minute floor.
+        assert!(!should_refresh_exit_ip(1_789_180_000, 1_789_180_000 + EXIT_IP_REFRESH_S - 1, false));
+        assert!(should_refresh_exit_ip(1_789_180_000, 1_789_180_000 + EXIT_IP_REFRESH_S, false));
+        // A clock that stepped backwards must not turn into a refresh storm.
+        assert!(!should_refresh_exit_ip(1_789_180_000, 1_000, false));
     }
 
     #[test]

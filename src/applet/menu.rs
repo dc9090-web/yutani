@@ -120,6 +120,7 @@ mod tests {
                 handshake_age_s: None,
                 up_for_s: None,
                 failed: false,
+                exit_address: None,
                 rx_bytes: 0,
                 tx_bytes: 0,
             },

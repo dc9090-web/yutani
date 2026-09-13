@@ -80,7 +80,12 @@ pub fn display(status: Option<&Status>, rates: Rates) -> Display {
         iface: t.iface.clone(),
         accounts: s.clients.len(),
         accounts_label: format::accounts_label(s.clients.len()),
-        address: match (t.connected, t.address.as_deref()) {
+        // Spec §4.2's "tunnel IP" is the address the world sees EVE at, so
+        // the public exit address wins whenever the worker has one. The
+        // internal 10.2.0.2 is the fallback — it is at least *an* answer
+        // while the first lookup is in flight, or against a daemon too old
+        // to send the exit address at all.
+        address: match (t.connected, t.exit_address.as_deref().or(t.address.as_deref())) {
             (true, Some(addr)) => addr.to_string(),
             _ => DASH.to_string(),
         },
@@ -116,6 +121,7 @@ mod tests {
                 handshake_age_s,
                 up_for_s: None,
                 failed: false,
+                exit_address: None,
                 rx_bytes: 413_100_000,
                 tx_bytes: 2_790_000_000,
             },
@@ -136,6 +142,30 @@ mod tests {
         assert_eq!((d.up_total.as_str(), d.up_rate.as_str()), ("2.79 GB", "41 KB/s"));
         assert_eq!((d.down_total.as_str(), d.down_rate.as_str()), ("413.1 MB", "222 KB/s"));
         assert!(!d.hidden);
+    }
+
+    /// The band's right column is the *public* exit address when there is
+    /// one: 10.2.0.2 is an implementation detail of the tunnel, not the IP
+    /// the user is asking about.
+    #[test]
+    fn the_band_prefers_the_public_exit_address_over_the_internal_one() {
+        let mut s = status(true, Some(21), 1);
+        s.tunnel.exit_address = Some("198.51.100.10".into());
+        assert_eq!(display(Some(&s), Rates::default()).address, "198.51.100.10");
+
+        // No lookup yet (or an older daemon): the internal address is still
+        // better than a dash.
+        s.tunnel.exit_address = None;
+        assert_eq!(display(Some(&s), Rates::default()).address, "10.2.0.2");
+
+        // Neither: a dash, not an empty gap.
+        s.tunnel.address = None;
+        assert_eq!(display(Some(&s), Rates::default()).address, DASH);
+
+        // Nothing is up, so neither address is shown.
+        let mut down = status(false, None, 1);
+        down.tunnel.exit_address = Some("198.51.100.10".into());
+        assert_eq!(display(Some(&down), Rates::default()).address, DASH);
     }
 
     #[test]

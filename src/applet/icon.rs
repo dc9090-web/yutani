@@ -95,6 +95,7 @@ mod tests {
             // Freshly up unless a test says otherwise.
             up_for_s: connected.then_some(1),
             failed: false,
+            exit_address: None,
             rx_bytes: 0,
             tx_bytes: 0,
         }
