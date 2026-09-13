@@ -5,7 +5,7 @@
 use std::net::Ipv4Addr;
 
 use super::conf::WgConf;
-use super::{FWMARK, IFACE, SLICE, TABLE};
+use super::{FWMARK, IFACE, SLICE, TABLE, WG_FWMARK};
 
 /// systemd nests `yutani-eve.slice` under `yutani.slice` because of the
 /// dash in the name (a dash-separated slice name is automatically a child
@@ -30,6 +30,12 @@ pub fn nft_ruleset(uid: u32, dns: Option<Ipv4Addr>) -> String {
     s.push_str(
         "    chain setmark {\n        type route hook output priority mangle; policy accept;\n",
     );
+    // First, before any cgroup match: WireGuard's encrypted outer packets
+    // re-use the inner packet's `sk_buff` and so still carry the game's
+    // socket. Re-marking one would route it back into `yutani0` to be
+    // encrypted again — a loop that overflows the staged queue. WireGuard
+    // stamps `WG_FWMARK` on them; `return` leaves that mark alone.
+    s.push_str(&format!("        meta mark {WG_FWMARK:#x} return\n"));
     s.push_str(&format!("        {m} meta mark set {FWMARK:#x}\n    }}\n"));
     if let Some(dns) = dns {
         s.push_str(
@@ -57,6 +63,11 @@ pub fn nft_ruleset(uid: u32, dns: Option<Ipv4Addr>) -> String {
     s.push_str(
         "    chain killswitch {\n        type filter hook output priority filter; policy accept;\n",
     );
+    // Also first: the encrypted outer packets carry the game's socket, so
+    // the drop rule below would match them — but they are *supposed* to
+    // leave by the LAN route, to the peer's endpoint. `WG_FWMARK` is how we
+    // tell them apart from the cleartext traffic that must never escape.
+    s.push_str(&format!("        meta mark {WG_FWMARK:#x} accept\n"));
     s.push_str(&format!("        {m} oifname \"lo\" accept\n"));
     s.push_str(&format!(
         "        {m} oifname != \"{IFACE}\" counter drop\n    }}\n"
@@ -92,9 +103,13 @@ pub fn up_commands(conf: &WgConf, wg_conf_path: &str) -> Vec<Vec<String>> {
     let from = conf.address.to_string();
     let table = TABLE.to_string();
     let mark = format!("{FWMARK:#x}");
+    let wg_mark = format!("{WG_FWMARK:#x}");
     vec![
         argv(&["ip", "link", "add", IFACE, "type", "wireguard"]),
         argv(&["wg", "setconf", IFACE, wg_conf_path]),
+        // After `setconf`, which rewrites the whole device configuration and
+        // would clear a mark set before it. See `WG_FWMARK`.
+        argv(&["wg", "set", IFACE, "fwmark", &wg_mark]),
         argv(&["ip", "address", "add", &addr, "dev", IFACE]),
         argv(&["ip", "link", "set", IFACE, "mtu", &mtu, "up"]),
         argv(&[
@@ -159,6 +174,7 @@ mod tests {
             "table inet yutani {\n\
              \x20   chain setmark {\n\
              \x20       type route hook output priority mangle; policy accept;\n\
+             \x20       meta mark 0x5a return\n\
              \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" meta mark set 0x59\n\
              \x20   }\n\
              \x20   chain dns {\n\
@@ -171,6 +187,7 @@ mod tests {
              \x20   }\n\
              \x20   chain killswitch {\n\
              \x20       type filter hook output priority filter; policy accept;\n\
+             \x20       meta mark 0x5a accept\n\
              \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" oifname \"lo\" accept\n\
              \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" oifname != \"yutani0\" counter drop\n\
              \x20   }\n\
@@ -186,6 +203,7 @@ mod tests {
             "table inet yutani {\n\
              \x20   chain setmark {\n\
              \x20       type route hook output priority mangle; policy accept;\n\
+             \x20       meta mark 0x5a return\n\
              \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" meta mark set 0x59\n\
              \x20   }\n\
              \x20   chain postrouting {\n\
@@ -194,11 +212,34 @@ mod tests {
              \x20   }\n\
              \x20   chain killswitch {\n\
              \x20       type filter hook output priority filter; policy accept;\n\
+             \x20       meta mark 0x5a accept\n\
              \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" oifname \"lo\" accept\n\
              \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" oifname != \"yutani0\" counter drop\n\
              \x20   }\n\
              }\n"
         );
+    }
+
+    /// The encrypted outer packet re-uses the inner packet's `sk_buff`, so
+    /// it still carries the game's socket and matches our cgroup rules.
+    /// WireGuard stamps `WG_FWMARK` on it; `setmark` must `return` before it
+    /// can be re-marked (which would route it back into `yutani0` — an
+    /// encrypt loop) and `killswitch` must accept it (it leaves via the LAN
+    /// interface, which the drop rule would otherwise catch).
+    #[test]
+    fn the_wireguard_fwmark_is_exempt_before_any_cgroup_rule() {
+        for r in [
+            nft_ruleset(1000, Some("10.2.0.1".parse().unwrap())),
+            nft_ruleset(1000, None),
+        ] {
+            let lines: Vec<&str> = r.lines().map(|l| l.trim()).collect();
+            let first_after = |chain: &str| -> String {
+                let i = lines.iter().position(|l| *l == format!("chain {chain} {{")).unwrap();
+                lines[i + 2].to_string()
+            };
+            assert_eq!(first_after("setmark"), "meta mark 0x5a return");
+            assert_eq!(first_after("killswitch"), "meta mark 0x5a accept");
+        }
     }
 
     /// Syntax smoke test: pipe the generated ruleset through `nft -c -f -`.
@@ -250,6 +291,7 @@ mod tests {
             vec![
                 "ip link add yutani0 type wireguard",
                 "wg setconf yutani0 /run/yutani/wg.conf",
+                "wg set yutani0 fwmark 0x5a",
                 "ip address add 10.2.0.2/32 dev yutani0",
                 "ip link set yutani0 mtu 1420 up",
                 "sysctl -q -w net.ipv4.conf.yutani0.rp_filter=2",

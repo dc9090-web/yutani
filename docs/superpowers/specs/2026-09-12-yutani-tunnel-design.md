@@ -79,7 +79,10 @@ Three pieces, all in the `yutani` binary:
 3. **`yutani launch`** and **auto-adopt** — put EVE's processes into the
    `yutani-eve.slice` cgroup that the firewall rules key on.
 
-Constants: interface `yutani0`; fwmark `0x59`; routing table `51820`;
+Constants: interface `yutani0`; fwmark `0x59` (on the cleartext packets
+that must be routed into the tunnel) and `0x5a` (WireGuard's own mark, on
+the encrypted packets that must be let out — see "Why the interface fwmark
+exists" in §4); routing table `51820`;
 slice `yutani-eve.slice` (cgroup path
 `user.slice/user-<uid>.slice/user@<uid>.service/yutani.slice/yutani-eve.slice`,
 nft `level 5`; systemd nests `yutani-eve.slice` under `yutani.slice` because
@@ -102,14 +105,18 @@ running the teardown for whatever was already created.
    PresharedKey?, AllowedIPs, Endpoint, PersistentKeepalive`); the tmpfile is
    0600 under `/run/yutani/` and deleted right after. `Address`/`DNS`/`MTU`
    are consumed by us.
-3. `ip address add 10.2.0.2/32 dev yutani0`; `ip link set yutani0 mtu 1420
+3. `wg set yutani0 fwmark 0x5a` — WireGuard then stamps `0x5a` on every
+   *encrypted* packet it sends. This must come after `setconf`, which
+   rewrites the whole device configuration and would clear a mark set
+   before it. See "Why the interface fwmark exists" below.
+4. `ip address add 10.2.0.2/32 dev yutani0`; `ip link set yutani0 mtu 1420
    up` (MTU from the conf if given).
-4. `sysctl -w net.ipv4.conf.yutani0.rp_filter=2`.
-5. `ip route add default dev yutani0 table 51820`;
+5. `sysctl -w net.ipv4.conf.yutani0.rp_filter=2`.
+6. `ip route add default dev yutani0 table 51820`;
    `ip rule add fwmark 0x59 lookup 51820 priority 1000`;
    `ip rule add from 10.2.0.2 lookup 51820 priority 1001` (makes strict
    `rp_filter` accept tunnel replies).
-6. `nft -f -` with:
+7. `nft -f -` with:
 
 (`mark` is a reserved nft keyword, hence `setmark`.)
 
@@ -117,6 +124,7 @@ running the teardown for whatever was already created.
 table inet yutani {
     chain setmark {
         type route hook output priority mangle; policy accept;
+        meta mark 0x5a return
         socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" meta mark set 0x59
     }
     chain dns {
@@ -129,6 +137,7 @@ table inet yutani {
     }
     chain killswitch {
         type filter hook output priority filter; policy accept;
+        meta mark 0x5a accept
         socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" oifname "lo" accept
         socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" oifname != "yutani0" counter drop
     }
@@ -140,9 +149,32 @@ table inet yutani {
    dash, hence five components. `meta nfproto ipv6` from the cgroup falls
    under the last rule since v6 never routes via `yutani0`. The DNS rule
    carries `meta nfproto ipv4` because this is an `inet` table — the chain
-   also sees v6 packets and `dnat ip to` is an IPv4-only statement.) The encrypted
-   UDP to the endpoint is emitted
-   by the kernel's wg device, not from a cgroup socket, so it is unaffected.
+   also sees v6 packets and `dnat ip to` is an IPv4-only statement.)
+
+   **Why the interface fwmark exists.** The two `meta mark 0x5a` rules come
+   first in their chains, ahead of every cgroup match. It is tempting to
+   assume the encrypted UDP to the endpoint is emitted by the kernel's wg
+   device with no socket attached and so is unaffected by rules that match
+   `socket cgroupv2` — that is wrong, and believing it cost a day. The
+   kernel re-uses the *inner* packet's `sk_buff` for the encrypted outer
+   datagram, so the outer datagram still carries `skb->sk`: the game's
+   socket, whose cgroup is `yutani-eve.slice`. Without the exemptions,
+   `setmark` therefore also marks the encrypted packet `0x59`, `ip rule
+   fwmark 0x59 lookup 51820` routes it back into `yutani0`, WireGuard
+   encrypts it again, and the loop fills the per-peer staged queue. The
+   symptom is total loss of every packet (TCP and ICMP alike) sent from
+   inside the slice, with `yutani0`'s TX `dropped` counter climbing,
+   `tx_errors` at 0 and nothing in the kernel log — WireGuard only bumps
+   `tx_dropped` when that staged queue overflows. From *outside* the slice
+   the tunnel looks perfectly healthy (`curl --interface 10.2.0.2` returns
+   the London exit), because those packets carry a socket in a different
+   cgroup and never match. `wg set yutani0 fwmark 0x5a` makes WireGuard
+   write `0x5a` into `skb->mark` on every outer packet, which is exactly
+   what these two rules key on: `setmark` returns without re-marking, and
+   `killswitch` accepts — the outer packet is *meant* to leave by the LAN
+   route to the peer's endpoint, so the `oifname != "yutani0" drop` rule
+   below would otherwise kill the tunnel outright. This is the same reason
+   wg-quick sets a firewall mark on the interfaces it creates.
 
    The `postrouting` chain is what makes the slice's traffic usable at all.
    An application chooses its source address when the socket connects —
@@ -379,7 +411,12 @@ observe what resolved actually sent upstream with `sudo resolvectl monitor`
 (or `journalctl -u systemd-resolved -f`) in another terminal: if the query
 leaves from the host's normal route, the §2 gap is what you are looking at,
 not a regression. Also inspect the live ruleset and policy routing with
-`sudo nft list table inet yutani` and `ip rule show`. Then
+`sudo nft list table inet yutani` and `ip rule show`, and confirm the
+interface fwmark is in place with `sudo wg show yutani0 fwmark` (`0x5a`).
+If the slice has no connectivity at all while the tunnel is healthy from
+outside it, check `cat /sys/class/net/yutani0/statistics/tx_dropped`: a
+counter climbing with `tx_errors` at 0 is the encrypt loop described in
+§4, i.e. the fwmark or one of its two nft rules has gone missing. Then
 `yutani tunnel disconnect`
 → the slice `curl` prints the home IP again; with the unit up and the
 endpoint blocked (e.g. wrong endpoint in a scratch conf) the slice `curl`

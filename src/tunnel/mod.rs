@@ -10,6 +10,20 @@ pub mod worker;
 
 pub const IFACE: &str = "yutani0";
 pub const FWMARK: u32 = 0x59;
+/// WireGuard's own firewall mark, stamped by the kernel on every *encrypted*
+/// outer packet (`wg set yutani0 fwmark 0x5a`). It exists because the kernel
+/// re-uses the inner packet's `sk_buff` for the outer UDP datagram, so that
+/// datagram still carries `skb->sk` — the game's socket, whose cgroup is
+/// `yutani-eve.slice`. Our cgroup-matching rules would therefore also match
+/// the encrypted packet: `setmark` would set `FWMARK` on it, `ip rule fwmark
+/// 0x59 lookup 51820` would route it straight back into `yutani0` to be
+/// encrypted again, and the loop would fill WireGuard's per-peer staged
+/// queue (the interface's TX `dropped` counter climbs, `tx_errors` stays 0,
+/// and the kernel logs nothing). The `killswitch` chain would likewise drop
+/// it, since it leaves via the LAN interface and not `yutani0`. Marking the
+/// outer packet distinctly lets both chains recognise and exempt it — this
+/// is the same reason wg-quick sets a firewall mark on its interfaces.
+pub const WG_FWMARK: u32 = 0x5a;
 pub const TABLE: u32 = 51820;
 pub const SLICE: &str = "yutani-eve.slice";
 pub const CONF_PATH: &str = "/etc/yutani/tunnel.conf";
