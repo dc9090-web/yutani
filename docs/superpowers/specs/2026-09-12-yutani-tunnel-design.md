@@ -46,6 +46,22 @@ Programs that speak DNS directly (`dig`, `nslookup`, Wine's own resolver if
 it bypasses NSS) do go through the DNAT and are unaffected by this gap —
 which is exactly why the acceptance check in §10 must not use `dig`.
 
+DNS sent to the local stub resolver (`127.0.0.53`, `/etc/resolv.conf`'s
+target under systemd-resolved) is deliberately *not* redirected by the
+`dns` chain: it reaches `systemd-resolved` over loopback and is answered
+outside the tunnel, exactly like the NSS path above, because a
+loopback-destined query is built with a loopback source address
+(`127.0.0.1`), and a loopback-sourced packet cannot be re-routed out of a
+non-loopback interface such as `yutani0` — the kernel's route lookup
+refuses it (`__mkroute_output` returns `EINVAL`), so DNAT-ing its
+destination would only get it dropped. Only DNS aimed at a real resolver
+address is redirected to `10.2.0.1`. This matters because the Steam
+runtime container the EVE launcher runs in (`pressure-vessel`) ships a
+glibc whose NSS stack lacks the `resolve` module, so unlike a normal
+CachyOS process it does not take the unix-socket path above — it sends raw
+DNS packets straight to the stub resolver, `127.0.0.53`, which is the path
+this exclusion is about.
+
 Planned remedy (follow-up task, not in plan A): either run each launched
 command in a mount namespace with an `nsswitch.conf` that has no `resolve`
 entry (so glibc falls back to `dns` and sends real packets the DNAT can
@@ -129,7 +145,7 @@ table inet yutani {
     }
     chain dns {
         type nat hook output priority dstnat; policy accept;
-        socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" meta nfproto ipv4 meta l4proto { tcp, udp } th dport 53 dnat ip to 10.2.0.1
+        socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" ip daddr != 127.0.0.0/8 meta l4proto { tcp, udp } th dport 53 dnat ip to 10.2.0.1
     }
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
@@ -147,8 +163,12 @@ table inet yutani {
    Systemd nests `yutani-eve.slice` under `yutani.slice` because of the
    dash, hence five components. `meta nfproto ipv6` from the cgroup falls
    under the last rule since v6 never routes via `yutani0`. The DNS rule
-   carries `meta nfproto ipv4` because this is an `inet` table — the chain
-   also sees v6 packets and `dnat ip to` is an IPv4-only statement.)
+   carries `ip daddr != 127.0.0.0/8` for two reasons: it guards against v6
+   packets, since this is an `inet` table — the chain also sees them and
+   `dnat ip to` is an IPv4-only statement — the same job `meta nfproto ipv4`
+   used to do alone; and, being narrower than that, it also excludes
+   loopback destinations, i.e. the local stub resolver `127.0.0.53` — see
+   the DNS paragraph in §2's "Known gap".)
 
    **Why the interface fwmark exists.** The `meta mark 0x5a return` rule
    comes first in `setmark`, ahead of every cgroup match. It is tempting to

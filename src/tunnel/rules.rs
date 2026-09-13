@@ -41,12 +41,22 @@ pub fn nft_ruleset(uid: u32, dns: Option<Ipv4Addr>) -> String {
         s.push_str(
             "    chain dns {\n        type nat hook output priority dstnat; policy accept;\n",
         );
-        // `meta nfproto ipv4` first: this is an `inet` table, so the chain
-        // also sees IPv6 packets, and `dnat ip to` is an IPv4-only statement.
-        // Without the guard nft is being asked to rewrite a v6 packet to a v4
-        // address — the rule is at best skipped and at worst an error.
+        // `ip daddr != 127.0.0.0/8` first: this both guards against v6
+        // packets (this is an `inet` table, so the chain also sees them, and
+        // `dnat ip to` is an IPv4-only statement that `meta nfproto ipv4`
+        // used to spell out) and excludes the loopback stub resolver
+        // (127.0.0.53, `/etc/resolv.conf`'s target under systemd-resolved).
+        // A packet aimed at 127.0.0.53 is built with a loopback source
+        // (127.0.0.1); DNAT-ing its destination to `dns` would still leave
+        // that source, and the kernel's route lookup for a loopback-sourced
+        // packet refuses to send it out any non-loopback interface
+        // (`__mkroute_output` returns EINVAL), so it would be silently
+        // dropped instead of reaching the tunnel. Excluding it here lets
+        // that query fall through unmodified to systemd-resolved over
+        // loopback, answered outside the tunnel — see the design doc's
+        // "Known gap".
         s.push_str(&format!(
-            "        {m} meta nfproto ipv4 meta l4proto {{ tcp, udp }} th dport 53 dnat ip to {dns}\n    }}\n"
+            "        {m} ip daddr != 127.0.0.0/8 meta l4proto {{ tcp, udp }} th dport 53 dnat ip to {dns}\n    }}\n"
         ));
     }
     // The application picks its source address when it connects, *before*
@@ -189,7 +199,7 @@ mod tests {
              \x20   }\n\
              \x20   chain dns {\n\
              \x20       type nat hook output priority dstnat; policy accept;\n\
-             \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" meta nfproto ipv4 meta l4proto { tcp, udp } th dport 53 dnat ip to 10.2.0.1\n\
+             \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" ip daddr != 127.0.0.0/8 meta l4proto { tcp, udp } th dport 53 dnat ip to 10.2.0.1\n\
              \x20   }\n\
              \x20   chain postrouting {\n\
              \x20       type nat hook postrouting priority srcnat; policy accept;\n\
