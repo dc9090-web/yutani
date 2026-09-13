@@ -4,7 +4,7 @@
 use anyhow::{Context as _, anyhow, bail, ensure};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use super::conf::WgConf;
 use super::{CONF_PATH, POLKIT_PATH, UNIT_NAME, UNIT_PATH, write_with_mode};
@@ -154,10 +154,31 @@ pub fn install(conf: &Path, dns_servers: &[std::net::Ipv4Addr], dns_domains: &[S
     if !dns_domains.is_empty() {
         cmd.args(["--dns-domains", &joined(dns_domains)]);
     }
-    let status = cmd.status().context("pkexec")?;
-    ensure!(status.success(), "install cancelled or failed (pkexec exit {status})");
+    privileged(&mut cmd, "install")?;
     println!("{}", success_message(&conf));
     Ok(())
+}
+
+/// Run one `pkexec` command and say how it went. Its stderr is captured,
+/// never inherited: from the settings window this process's stderr is the
+/// applet's pipe, which has no reader once cosmic-panel has restarted the
+/// applet, and a child that inherits it dies of SIGPIPE on its first write
+/// — "not authorised" would come back as `pkexec exit signal: 13`. What
+/// the child wrote is echoed to our own stderr afterwards (a dead pipe
+/// there is ignored) and its last line goes into the error, which is all
+/// the settings window shows. stdin and stdout stay inherited, as before:
+/// stdin is where pkexec's text-mode agent looks for a terminal, and
+/// stdout carries the root side's report to whoever runs this from one.
+fn privileged(cmd: &mut Command, what: &str) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let out = cmd.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::piped()).output().context("pkexec")?;
+    let _ = std::io::stderr().lock().write_all(&out.stderr);
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let why = stderr.lines().rev().map(str::trim).find(|l| !l.is_empty()).map(|l| format!(": {l}")).unwrap_or_default();
+    bail!("{what} cancelled or failed (pkexec exit {}){why}", out.status)
 }
 
 /// What `install` prints once the root side succeeded. A tunnel that is
@@ -174,8 +195,7 @@ Delete {} (it holds the private key and is world-readable).",
 
 pub fn uninstall() -> anyhow::Result<()> {
     let exe = current_exe()?;
-    let status = Command::new("pkexec").args([&exe, "tunnel", "uninstall-root"]).status().context("pkexec")?;
-    ensure!(status.success(), "uninstall cancelled or failed (pkexec exit {status})");
+    privileged(Command::new("pkexec").args([&exe, "tunnel", "uninstall-root"]), "uninstall")?;
     println!("Tunnel uninstalled.");
     Ok(())
 }
@@ -337,10 +357,38 @@ const CONF_MAX_LEN: u64 = 64 * 1024;
 /// case changes nothing outside the test-suite, where `uid` is a fixture.
 /// Spec §9 calls the conf the one deliberate crossing of the root/user
 /// boundary; this is its guard.
-fn conf_guard(conf: &Path, uid: u32) -> anyhow::Result<()> {
+///
+/// Yields the open handle, and the caller reads from *that*: the user owns
+/// the directory and could swap the file for something else between a
+/// check by path and a read by path, so the facts are taken from the
+/// handle that is read. `O_NOFOLLOW` refuses a symlink put there after the
+/// `stat` above; `O_NONBLOCK` makes `open(2)` return at once on a FIFO
+/// (with no writer it would otherwise block for ever) and means nothing
+/// for the regular file that is the only thing ever read.
+fn conf_guard(conf: &Path, uid: u32) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     let md = std::fs::symlink_metadata(conf).with_context(|| format!("stat {}", conf.display()))?;
     ensure!(!md.file_type().is_symlink(), "{} is a symlink; pass the file it points to", conf.display());
-    conf_readable(md.is_file(), md.uid(), md.len(), uid, crate::ipc::uid()).map_err(|why| anyhow!("{}: {why}", conf.display()))
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(conf)
+        .with_context(|| format!("open {}", conf.display()))?;
+    let md = file.metadata().with_context(|| format!("stat {}", conf.display()))?;
+    conf_readable(md.is_file(), md.uid(), md.len(), uid, crate::ipc::uid()).map_err(|why| anyhow!("{}: {why}", conf.display()))?;
+    Ok(file)
+}
+
+/// The conf's text, from the handle [`conf_guard`] checked. Its size was
+/// checked on that handle, but the owner can still append to it while it
+/// is read, and a root process reads nothing unbounded: the read stops at
+/// [`CONF_MAX_LEN`] and anything beyond it is refused.
+fn read_conf(file: std::fs::File, conf: &Path) -> anyhow::Result<String> {
+    use std::io::Read as _;
+    let mut text = String::new();
+    file.take(CONF_MAX_LEN + 1).read_to_string(&mut text).with_context(|| format!("read {}", conf.display()))?;
+    ensure!(text.len() as u64 <= CONF_MAX_LEN, "{}: grew past {} KiB while being read", conf.display(), CONF_MAX_LEN / 1024);
+    Ok(text)
 }
 
 /// The verdict behind [`conf_guard`], on the facts alone.
@@ -370,8 +418,7 @@ pub fn install_root(
     ensure!(conf.is_absolute() && Path::new(exe).is_absolute(), "paths must be absolute");
     ensure!(valid_username(username), "{username:?} is not a POSIX portable user name ([a-z_][a-z0-9_-]*$)");
     check_pkexec_uid(std::env::var("PKEXEC_UID").ok().as_deref(), uid)?;
-    conf_guard(conf, uid)?;
-    let text = std::fs::read_to_string(conf).with_context(|| format!("read {}", conf.display()))?;
+    let text = read_conf(conf_guard(conf, uid)?, conf)?;
     let label = conf.file_stem().and_then(|s| s.to_str()).unwrap_or("tunnel");
     let parsed = WgConf::parse(&text, label).map_err(|e| anyhow!("{}: {e}", conf.display()))?;
     let dns_lines = dns_conf_lines(dns_servers, dns_domains)?;
@@ -429,7 +476,11 @@ pub fn install_root(
     .contains(&true);
     daemon_reload()?;
     if parsed.dns.is_none() {
-        eprintln!("warning: the conf has no DNS entry; EVE's DNS lookups will not go through the tunnel");
+        // Root's stderr is whatever pkexec was given; a write that fails
+        // (nobody reading it any more) must not turn a finished install
+        // into a panic.
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), "warning: the conf has no DNS entry; EVE's DNS lookups will not go through the tunnel");
     }
     Ok(if changed { report } else { format!("{report}{NOTHING_CHANGED_MARKER}\n") })
 }
@@ -646,6 +697,54 @@ mod tests {
         let e = install_root(&big, 1000, "daniel", "/opt/y", &servers(), &domains(), true).unwrap_err().to_string();
         assert!(e.contains("KiB"), "got {e}");
         assert!(install_root(&real, 1000, "daniel", "/opt/y", &servers(), &domains(), true).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The pkexec step's stderr is captured, not inherited, and its last
+    /// line is what the error carries — the settings window shows nothing
+    /// else. Driven with `sh` in pkexec's place.
+    #[test]
+    fn the_pkexec_step_carries_the_last_stderr_line_in_its_error() {
+        let mut fine = Command::new("sh");
+        fine.args(["-c", "echo just a warning >&2; exit 0"]);
+        assert!(privileged(&mut fine, "install").is_ok());
+        let mut refused = Command::new("sh");
+        refused.args(["-c", "echo first >&2; echo 'Error executing command as another user: Not authorized' >&2; echo >&2; exit 127"]);
+        let e = privileged(&mut refused, "install").unwrap_err().to_string();
+        assert_eq!(e, "install cancelled or failed (pkexec exit exit status: 127): Error executing command as another user: Not authorized");
+        let mut silent = Command::new("false");
+        let e = privileged(&mut silent, "uninstall").unwrap_err().to_string();
+        assert_eq!(e, "uninstall cancelled or failed (pkexec exit exit status: 1)");
+        let mut missing = Command::new("/nonexistent-yutani-pkexec");
+        let e = privileged(&mut missing, "install").unwrap_err().to_string();
+        assert!(e.starts_with("pkexec"), "got {e}");
+    }
+
+    /// The guard and the read must see the same object: the caller owns
+    /// the directory and can swap the file between a check by path and a
+    /// read by path. So the guard opens the file once, checks the handle,
+    /// and hands that handle back for the read — and the open itself must
+    /// not block on a FIFO put there after the `stat` (a FIFO with no
+    /// writer blocks a plain `open(2)` for ever, in a root process).
+    #[test]
+    fn the_conf_guard_reads_from_the_handle_it_checked_and_does_not_block_on_a_fifo() {
+        use std::io::Read as _;
+        let dir = temp_dir("inst-handle");
+        let real = dir.join("EVE.conf");
+        std::fs::write(&real, GOOD_CONF).unwrap();
+        let mut text = String::new();
+        conf_guard(&real, 1000).unwrap().read_to_string(&mut text).unwrap();
+        assert_eq!(text, GOOD_CONF, "the handle the guard checked is the one that is read");
+
+        let fifo = dir.join("fifo.conf");
+        assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(conf_guard(&fifo, 1000).map(|_| ()).map_err(|e| e.to_string()));
+        });
+        let verdict = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the guard must not block on a FIFO");
+        let e = verdict.unwrap_err();
+        assert!(e.contains("regular file"), "got {e}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

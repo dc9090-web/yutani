@@ -111,6 +111,15 @@ fn exec(argv: &[String]) -> io::Error {
 /// the exec failed, as the shell's "command not found" code (127) after
 /// saying why on stderr.
 fn run_directly(command: &[String]) -> u8 {
+    run_directly_with(command, exec)
+}
+
+/// [`run_directly`] with the exec step handed in. The tests use a stub:
+/// a real `CommandExt::exec` that fails has already run std's pre-exec
+/// reset (SIGPIPE back to `SIG_DFL`, the signal mask cleared), which is
+/// process-global and would stay with the test binary for every test
+/// after it.
+fn run_directly_with(command: &[String], exec: impl FnOnce(&[String]) -> io::Error) -> u8 {
     let err = exec(command);
     eprintln!("yutani launch: cannot run {}: {err}", command[0]);
     127
@@ -199,16 +208,20 @@ mod tests {
         assert!(should_wrap(Some(&output(0, b"BusAddress=unix:path=/run/user/1000/bus\n"))));
     }
 
-    #[test]
-    fn a_failed_exec_comes_back_as_an_error_instead_of_replacing_the_process() {
-        // `exec` never returns on success (this test would be replaced by
-        // the target), so the only thing to assert is the failure path.
-        let err = exec(&["/nonexistent-yutani-binary".to_string()]);
-        assert_eq!(err.kind(), io::ErrorKind::NotFound, "got {err}");
-    }
-
+    /// The direct path hands the whole command, untouched, to one exec and
+    /// answers a failure with the shell's 127. Checked with a stub exec:
+    /// `exec` itself never returns on success (the test would be replaced
+    /// by the target) and a *failed* real exec leaves std's pre-exec reset
+    /// behind for the rest of the test process.
     #[test]
     fn running_a_missing_command_directly_reports_127() {
-        assert_eq!(run_directly(&["/nonexistent-yutani-binary".to_string()]), 127);
+        let command = vec!["/nonexistent-yutani-binary".to_string(), "--flag".to_string()];
+        let mut seen: Option<Vec<String>> = None;
+        let code = run_directly_with(&command, |argv| {
+            seen = Some(argv.to_vec());
+            io::Error::new(io::ErrorKind::NotFound, "No such file or directory")
+        });
+        assert_eq!(code, 127);
+        assert_eq!(seen.as_deref(), Some(&command[..]), "the command must be exec'd exactly as given");
     }
 }

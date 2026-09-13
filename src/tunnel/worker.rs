@@ -262,14 +262,44 @@ fn link_is_up() -> bool {
     std::fs::read_to_string(format!("/sys/class/net/{IFACE}/flags")).is_ok_and(|f| link_flags_say_up(&f))
 }
 
-/// Whether this tick has to re-assert the route: the link is up and either
-/// nothing has asserted it since the loop began or the link was down on the
-/// previous tick. Every other tick leaves the routing table alone — an
-/// unconditional `ip route replace` still emits an `RTM_NEWROUTE`
-/// notification for an unchanged route, and NetworkManager, networkd,
-/// resolved and avahi would each wake up on it once a second for nothing.
-fn route_needs_readd(link_was_up: bool, link_is_up: bool) -> bool {
-    link_is_up && !link_was_up
+/// Whether a `ip route show default …` listing holds the route: its one
+/// line starts with `default` (the `dev` filter elides the dev word, so
+/// that is all that can be relied on). Anything else in the table is not
+/// ours.
+fn route_listed(listing: &str) -> bool {
+    listing.lines().any(|l| l.split_whitespace().next() == Some("default"))
+}
+
+/// Whether `default dev yutani0 table 51820` is in the table right now,
+/// from a read-only dump. A listing that fails (the table itself is gone,
+/// `ip` missing) counts as "not there": `ip route replace` is idempotent,
+/// and that route is the only way out of the kill-switch, so the safe
+/// answer is to re-assert it.
+fn route_present(x: &dyn Exec) -> bool {
+    match x.run(&rules::route_show_command(), None) {
+        Ok(listing) => route_listed(&listing),
+        Err(e) => {
+            tracing::debug!("route: {e:#}");
+            false
+        }
+    }
+}
+
+/// One tick's share of keeping the route: when the link is up, look for
+/// the route and re-add it only if it is missing. Looking is a dump that
+/// wakes nobody; an unconditional `ip route replace` would emit an
+/// `RTM_NEWROUTE` notification for an unchanged route, and NetworkManager,
+/// networkd, resolved and avahi would each wake up on it once a second for
+/// nothing. The route, not the link state, is what is checked: a link that
+/// went down and came back between two samples looks like "up, up" to an
+/// edge detector on `IFF_UP`, and the route it lost would never come back.
+/// (WireGuard never raises carrier, so `carrier_up_count` cannot tell
+/// either.) While the link is down the route cannot be added at all, so
+/// the table is left alone until it is back.
+fn keep_route(x: &dyn Exec, link_up: bool) {
+    if link_up && !route_present(x) {
+        ensure_route(x);
+    }
 }
 
 /// Re-assert `default dev yutani0 table 51820`. The kernel deletes that
@@ -418,15 +448,10 @@ async fn serve(
     // `Burst`) instead of simply carrying on once a second.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut exit = ExitIp::new();
-    let mut link_was_up = false;
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                let up_now = link_is_up();
-                if route_needs_readd(link_was_up, up_now) {
-                    ensure_route(x);
-                }
-                link_was_up = up_now;
+                keep_route(x, link_is_up());
                 if let Err(e) = write_status(x, &loaded.conf, since, &mut exit) {
                     tracing::warn!("status: {e:#}");
                 }
@@ -645,16 +670,22 @@ mod tests {
 
     /// Records every argv (and the bound it was given) instead of running
     /// it. `fail` says which commands answer with an error, the way the
-    /// real ones do on an object that is not there.
+    /// real ones do on an object that is not there; `answer` is the stdout
+    /// of the ones that succeed (empty unless the test says otherwise).
     struct Recorder {
         calls: RefCell<Vec<(Vec<String>, Option<Duration>)>>,
         stdin: RefCell<Vec<String>>,
         fail: fn(&[String]) -> bool,
+        answer: fn(&[String]) -> String,
     }
 
     impl Recorder {
         fn new(fail: fn(&[String]) -> bool) -> Self {
-            Recorder { calls: RefCell::new(Vec::new()), stdin: RefCell::new(Vec::new()), fail }
+            Self::answering(fail, |_| String::new())
+        }
+
+        fn answering(fail: fn(&[String]) -> bool, answer: fn(&[String]) -> String) -> Self {
+            Recorder { calls: RefCell::new(Vec::new()), stdin: RefCell::new(Vec::new()), fail, answer }
         }
 
         fn joined(&self) -> Vec<String> {
@@ -665,7 +696,7 @@ mod tests {
     impl Exec for Recorder {
         fn run(&self, argv: &[String], timeout: Option<Duration>) -> anyhow::Result<String> {
             self.calls.borrow_mut().push((argv.to_vec(), timeout));
-            if (self.fail)(argv) { Err(anyhow!("`{}` failed (stub)", argv.join(" "))) } else { Ok(String::new()) }
+            if (self.fail)(argv) { Err(anyhow!("`{}` failed (stub)", argv.join(" "))) } else { Ok((self.answer)(argv)) }
         }
 
         fn run_with_stdin(&self, argv: &[String], stdin: &str) -> anyhow::Result<()> {
@@ -825,17 +856,50 @@ mod tests {
     }
 
     /// `ip link set yutani0 down` makes the kernel drop the table-51820
-    /// route and bringing the link back up does not restore it. Only that
-    /// transition needs the route re-added: doing it every second would be
-    /// an `RTM_NEWROUTE` notification per second for NetworkManager,
-    /// resolved and friends to wake up on.
+    /// route and bringing the link back up does not restore it — and a
+    /// down-and-up between two ticks looks like "up, up" to anything that
+    /// samples the link once a second, so what a tick checks is the route
+    /// itself: a read-only `ip route show` (a dump nobody is woken up by),
+    /// and `ip route replace` — an `RTM_NEWROUTE` per call for
+    /// NetworkManager, resolved and avahi to wake on — only when the route
+    /// is missing.
     #[test]
-    fn the_route_is_re_added_on_the_first_tick_and_when_the_link_comes_back_up() {
-        assert!(route_needs_readd(false, true), "first tick: the link is up and nothing has asserted the route yet");
-        assert!(!route_needs_readd(true, true), "steady state: nothing to do");
-        assert!(!route_needs_readd(true, false), "the link went down: the route is gone and cannot be added yet");
-        assert!(!route_needs_readd(false, false));
-        assert!(route_needs_readd(false, true), "the link came back: this is the case the tick exists for");
+    fn the_route_is_re_added_exactly_when_it_is_missing_from_the_table() {
+        fn never(_: &[String]) -> bool {
+            false
+        }
+        fn show_fails(argv: &[String]) -> bool {
+            argv[..3] == ["ip", "route", "show"]
+        }
+        // What `ip route show default dev yutani0 table 51820` prints when
+        // the route is there (the `dev` filter elides the dev word).
+        fn listed(argv: &[String]) -> String {
+            if show_fails(argv) { "default scope link \n".to_string() } else { String::new() }
+        }
+        let show = rules::route_show_command().join(" ");
+        let replace = rules::ensure_route_command().join(" ");
+        // Steady state: the route is there — look, and leave the table alone.
+        let rec = Recorder::answering(never, listed);
+        keep_route(&rec, true);
+        assert_eq!(rec.joined(), vec![show.clone()]);
+        // Missing (the link bounced between two ticks): look, then put it back.
+        let rec = Recorder::new(never);
+        keep_route(&rec, true);
+        assert_eq!(rec.joined(), vec![show.clone(), replace.clone()]);
+        // The link is down: the route cannot be added yet, so not even a look.
+        let rec = Recorder::new(never);
+        keep_route(&rec, false);
+        assert!(rec.joined().is_empty(), "got {:?}", rec.joined());
+        // A listing that fails (the table itself is gone: `ip` exits 2)
+        // counts as missing — `replace` is idempotent, and the route is the
+        // only way out of the kill-switch.
+        let rec = Recorder::new(show_fails);
+        keep_route(&rec, true);
+        assert_eq!(rec.joined(), vec![show, replace]);
+        assert!(route_listed("default scope link \n"));
+        assert!(route_listed("default dev yutani0 scope link\n"), "with or without the dev word");
+        assert!(!route_listed(""));
+        assert!(!route_listed("10.2.0.0/24 scope link\n"), "some other route in the table is not ours");
         // `/sys/class/net/<iface>/flags` is hex with IFF_UP as bit 0.
         assert!(link_flags_say_up("0x1003\n"));
         assert!(link_flags_say_up("0x1"));

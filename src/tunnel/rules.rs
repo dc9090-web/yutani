@@ -147,12 +147,21 @@ pub fn resolved_down_command() -> Vec<String> {
     argv(&["resolvectl", "revert", IFACE])
 }
 
+/// List the tunnel's default route, if it is there: one `default …` line,
+/// or nothing. A read-only dump — no daemon is woken up by it — which is
+/// what lets the worker look every tick and write only when it has to.
+/// Fails (exit 2) when the table itself does not exist.
+pub fn route_show_command() -> Vec<String> {
+    argv(&["ip", "route", "show", "default", "dev", IFACE, "table", &TABLE.to_string()])
+}
+
 /// Re-assert the tunnel's default route. `ip link set yutani0 down` makes
 /// the kernel delete `default dev yutani0 table 51820`, and bringing the
 /// link back up does *not* restore it — without this the table stays empty,
 /// marked packets fall through to the LAN route and the kill-switch drops
-/// them forever. `replace` is idempotent, so the worker can run it on every
-/// status tick; it simply fails while the link is down.
+/// them forever. `replace` is idempotent, so the worker can run it whenever
+/// [`route_show_command`] finds nothing; it simply fails while the link is
+/// down.
 pub fn ensure_route_command() -> Vec<String> {
     argv(&[
         "ip",
@@ -509,10 +518,15 @@ mod tests {
 
     /// `ip link set yutani0 down` makes the kernel drop
     /// `default dev yutani0 table 51820`, and bringing the link back up does
-    /// not restore it — so the worker re-adds it every tick. `replace` is
-    /// idempotent: it is a no-op when the route is already there.
+    /// not restore it — so the worker looks for it every tick (a read-only
+    /// dump) and re-adds it when it is missing. `replace` is idempotent: it
+    /// is a no-op when the route is already there.
     #[test]
     fn ensure_route_command_replaces_the_default_route_in_our_table() {
+        assert_eq!(
+            route_show_command().join(" "),
+            "ip route show default dev yutani0 table 51820"
+        );
         assert_eq!(
             ensure_route_command().join(" "),
             "ip route replace default dev yutani0 table 51820"

@@ -6652,6 +6652,7 @@ dependencies = [
  "gbm",
  "glow",
  "khronos-egl",
+ "libc",
  "libcosmic",
  "notify",
  "ron 0.10.1",
