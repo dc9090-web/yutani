@@ -120,6 +120,12 @@ impl State {
     pub fn names_arrived(&mut self, names: Names, error: Option<String>) {
         self.names.extend(names);
         self.fetching = false;
+        // A failed lookup (offline, ESI down) is worth asking again: the
+        // next Refresh retries those ids. Only a reply that succeeded and
+        // still left an id nameless is final.
+        if error.is_some() {
+            self.asked.retain(|id| self.names.contains_key(id));
+        }
         let unanswered = self.listing.as_ref().is_some_and(|l| {
             l.characters.iter().any(|e| self.asked.contains(&e.id) && !self.names.contains_key(&e.id))
         });
@@ -398,5 +404,18 @@ mod tests {
         assert!(!s.fetching);
         s.names_arrived(Names::from([(1, "One".to_string())]), None);
         assert_eq!(s.names_error, None, "every asked id has a name now");
+    }
+
+    /// Offline at first open must not mean numbers forever: a reply that
+    /// carries an error releases the nameless ids so Refresh asks again.
+    #[test]
+    fn a_failed_lookup_is_retried_on_the_next_refresh() {
+        let mut s = state_with(&[1, 2], &[]);
+        s.asking(&[1, 2]);
+        assert_eq!(s.unnamed(), Vec::<u64>::new());
+        s.names_arrived(Names::from([(2, "Two".to_string())]), Some("curl failed".to_string()));
+        assert_eq!(s.names_error.as_deref(), Some("curl failed"));
+        assert_eq!(s.unnamed(), vec![1], "1 is asked again, 2 is named");
+        assert!(!s.fetching);
     }
 }
