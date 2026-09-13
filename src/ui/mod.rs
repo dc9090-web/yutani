@@ -37,6 +37,7 @@ pub mod pointer;
 pub mod rules;
 pub mod settings;
 pub mod thumbnail;
+pub mod tunnel_page;
 
 /// The daemon's flags. `Config` itself lives in the library now, and the
 /// orphan rule forbids implementing libcosmic's `CosmicFlags` for a foreign
@@ -156,6 +157,11 @@ pub enum Msg {
     /// thumbnails if it has not come back.
     FocusGraceOver,
     Adopt(adopt::AdoptEvent),
+    /// Files were dropped on one of our windows. Only the settings window
+    /// cares (the Tunnel page takes a `.conf` this way); `FileHovered` is
+    /// deliberately *not* a message — it repeats for every pointer motion
+    /// while the drag is over the window.
+    FileDropped(SurfaceId, Vec<PathBuf>),
     Settings(settings::Msg),
 }
 
@@ -1185,11 +1191,15 @@ impl App {
                 // …and EVE's files with it: the Characters page is as stale
                 // as the rest after the window has been sitting open.
                 let characters = self.refresh_characters();
+                // …and so is the tunnel: it can have been installed,
+                // connected or torn down from the CLI meanwhile.
+                let tunnel = self.refresh_tunnel();
                 // Un-minimize first, then activate: a window the compositor
                 // minimised stays minimised if it is only activated. The
                 // same chain libcosmic's own `Action::Activate` does.
                 return Task::batch([
                     characters,
+                    tunnel,
                     cosmic::iced::window::minimize(window, false)
                         .chain(activation::activate(window, token.clone())),
                 ]);
@@ -1206,8 +1216,9 @@ impl App {
                     }
                     state.refresh();
                     // EVE's files are outside `State::refresh` (they are not
-                    // ours, and the names lookup is a task).
-                    return self.refresh_characters();
+                    // ours, and the names lookup is a task) — and so is the
+                    // tunnel, which is systemd's state, not a file of ours.
+                    return Task::batch([self.refresh_characters(), self.refresh_tunnel()]);
                 }
                 S::ActiveBorder(text) => state.active_border_field = text.clone(),
                 S::InactiveBorder(text) => state.inactive_border_field = text.clone(),
@@ -1215,6 +1226,24 @@ impl App {
                 S::PrevKey(text) => state.prev_field = text.clone(),
                 S::Name(text) => {
                     state.name_field = text.clone();
+                    return Task::none();
+                }
+                S::TunnelConfPath(text) => {
+                    state.tunnel.conf_path = text.clone();
+                    return Task::none();
+                }
+                S::TunnelStatus(status) => {
+                    state.tunnel.status = Some((**status).clone());
+                    return Task::none();
+                }
+                // The chooser answers with a path or with nothing
+                // (cancelled); either way the note is the only feedback.
+                S::TunnelConfChosen(path) => {
+                    if let Some(path) = path {
+                        state.tunnel.conf_path = path.display().to_string();
+                        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        state.note = Some(format!("chose {name}"));
+                    }
                     return Task::none();
                 }
                 // Clamped to the listing the window is showing: libcosmic
@@ -1285,6 +1314,29 @@ impl App {
                 return cosmic::iced::clipboard::write(yutani::STEAM_LAUNCH_ARGS.to_string());
             }
             S::RefreshCharacters => return self.refresh_characters(),
+            S::RefreshTunnel => return self.refresh_tunnel(),
+            S::BrowseTunnelConf => return self.browse_tunnel_conf(),
+            // Re-checked here and not only on the button: the file behind
+            // the enabled state can have been moved since the last redraw.
+            S::InstallTunnel => {
+                let blocked =
+                    self.settings.as_ref().and_then(|s| tunnel_page::install_blocker(&s.tunnel));
+                if let Some(reason) = blocked {
+                    self.settings_note(reason.to_string());
+                    return Task::none();
+                }
+                return self.run_tunnel_action(settings::TunnelAction::Install);
+            }
+            S::UninstallTunnel => return self.run_tunnel_action(settings::TunnelAction::Uninstall),
+            S::TunnelConnect => return self.run_tunnel_action(settings::TunnelAction::Connect),
+            S::TunnelDisconnect => return self.run_tunnel_action(settings::TunnelAction::Disconnect),
+            // Whatever happened, the action is over: the buttons come back
+            // and the state on screen is re-read from systemd.
+            S::TunnelDone(action, result) => {
+                let note = self.tunnel_done(*action, result.clone());
+                self.settings_note(note);
+                return self.refresh_tunnel();
+            }
             // Both set the note themselves, then the listing (and the
             // newest backup) are re-read: the files on disk just changed.
             S::CopyCharacters => {
@@ -1522,6 +1574,120 @@ impl App {
         self.settings_note(note);
     }
 
+    /// Files dropped anywhere on a window. Only the settings window takes
+    /// any, and only a `.conf`: the Tunnel page's third way of naming the
+    /// WireGuard file. The file itself is never opened here — the page
+    /// shows its name, and `install` (as root) is the only thing that reads
+    /// what is inside it.
+    fn on_files_dropped(&mut self, id: SurfaceId, paths: &[PathBuf]) {
+        if self.settings.as_ref().map(|s| s.window) != Some(id) {
+            return;
+        }
+        let Some(conf) = tunnel_page::conf_candidate(paths) else { return };
+        let name = conf.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let tab = settings::page_index(settings::Page::Tunnel);
+        if let Some(state) = self.settings.as_mut() {
+            state.tunnel.conf_path = conf.display().to_string();
+            // The file landed on a page that does not mention it otherwise;
+            // show the one that does.
+            if let Some(tab) = tab {
+                state.pages.activate_position(tab as u16);
+            }
+            state.note = Some(format!("dropped {name}; press Install tunnel"));
+        }
+    }
+
+    /// One finished tunnel action: the buttons come back — whatever
+    /// happened, and on every path through here — and the note says what
+    /// happened. It never names anything from inside the `.conf`, only its
+    /// file name.
+    fn tunnel_done(&mut self, action: settings::TunnelAction, result: Result<(), String>) -> String {
+        let Some(state) = self.settings.as_mut() else { return String::new() };
+        state.tunnel.busy = false;
+        let conf = PathBuf::from(state.tunnel.conf_path.trim());
+        match (action, result) {
+            (settings::TunnelAction::Install, result) => tunnel_page::install_note(&conf, result),
+            (_, Err(e)) => e,
+            (settings::TunnelAction::Uninstall, Ok(())) => "tunnel uninstalled".to_string(),
+            // `systemctl start` returns once the unit is up, but the
+            // handshake behind it is not: the status line says when it is.
+            (settings::TunnelAction::Connect, Ok(())) => "tunnel connecting…".to_string(),
+            (settings::TunnelAction::Disconnect, Ok(())) => "tunnel disconnected".to_string(),
+        }
+    }
+
+    /// Read the tunnel state off the UI thread (`is-failed` may spawn
+    /// systemctl). Runs when the window opens or is raised, when Re-check is
+    /// pressed, and after every action.
+    fn refresh_tunnel(&self) -> Task<cosmic::Action<Msg>> {
+        if self.settings.is_none() {
+            return Task::none();
+        }
+        let location = self.config.tunnel.location.clone();
+        cosmic::iced::Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || crate::tunnel::control::current_tunnel_status(&location))
+                    .await
+                    .ok()
+            },
+            |status| match status {
+                Some(t) => cosmic::Action::App(Msg::Settings(settings::Msg::TunnelStatus(Box::new(t)))),
+                None => cosmic::Action::None,
+            },
+        )
+    }
+
+    /// One tunnel action on the blocking pool; the page is `busy` until the
+    /// `TunnelDone` it resolves to. `install` shells out to `pkexec` (the
+    /// polkit agent's password prompt) and connect/disconnect to
+    /// `systemctl`, either of which can take seconds — none of it may
+    /// happen on the thread that draws the thumbnails.
+    ///
+    /// The IPC `tunnel connect|disconnect` requests run the same functions
+    /// and are not covered by this flag: systemd serialises the two, and
+    /// the status refresh at the end reports whatever actually happened.
+    fn run_tunnel_action(&mut self, action: settings::TunnelAction) -> Task<cosmic::Action<Msg>> {
+        let Some(state) = self.settings.as_mut() else { return Task::none() };
+        state.tunnel.busy = true;
+        let conf = PathBuf::from(state.tunnel.conf_path.trim());
+        let (servers, domains) = (self.config.tunnel.dns_servers.clone(), self.config.tunnel.dns_domains.clone());
+        cosmic::iced::Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || match action {
+                    settings::TunnelAction::Install => crate::tunnel::install::install(&conf, &servers, &domains),
+                    settings::TunnelAction::Uninstall => crate::tunnel::install::uninstall(),
+                    settings::TunnelAction::Connect => crate::tunnel::control::connect(),
+                    settings::TunnelAction::Disconnect => crate::tunnel::control::disconnect(),
+                })
+                .await
+                .map_err(|e| format!("tunnel task failed: {e}"))
+                .and_then(|r| r.map_err(|e| format!("{e:#}")))
+            },
+            move |result| cosmic::Action::App(Msg::Settings(settings::Msg::TunnelDone(action, result))),
+        )
+    }
+
+    /// The XDG file-chooser portal, filtered to `*.conf`. A cancelled or
+    /// unavailable dialog answers `None` and changes nothing.
+    fn browse_tunnel_conf(&self) -> Task<cosmic::Action<Msg>> {
+        use cosmic::dialog::file_chooser::{self, FileFilter};
+        cosmic::iced::Task::perform(
+            async {
+                let dialog = file_chooser::open::Dialog::new()
+                    .title("WireGuard configuration")
+                    .filter(FileFilter::new("WireGuard config").glob("*.conf"));
+                match dialog.open_file().await {
+                    Ok(response) => response.url().to_file_path().ok(),
+                    Err(why) => {
+                        tracing::warn!("file chooser: {why}");
+                        None
+                    }
+                }
+            },
+            |path| cosmic::Action::App(Msg::Settings(settings::Msg::TunnelConfChosen(path))),
+        )
+    }
+
     fn settings_note(&mut self, note: String) {
         if let Some(state) = self.settings.as_mut() {
             state.note = Some(note);
@@ -1631,6 +1797,10 @@ impl Application for App {
                 }
                 task
             }
+            Msg::FileDropped(id, paths) => {
+                self.on_files_dropped(id, &paths);
+                Task::none()
+            }
             Msg::Settings(msg) => self.on_settings(msg),
             Msg::Ipc(ev) => {
                 let (reply, task) = self.handle_request(&ev.request, &ev.reply);
@@ -1672,6 +1842,7 @@ impl Application for App {
                 event @ (WaylandEvent::Output(..) | WaylandEvent::Layer(..)),
             )) => Some(Msg::Wayland(event)),
             iced::Event::Mouse(m) => Some(Msg::Pointer(id, m)),
+            iced::Event::Window(iced::window::Event::FileDropped(paths)) => Some(Msg::FileDropped(id, paths)),
             // Every other event (RequestResize, Frame, keyboard, …) must not become
             // a message: update → redraw → same event again is a hot loop.
             _ => None,

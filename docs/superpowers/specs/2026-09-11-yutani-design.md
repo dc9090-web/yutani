@@ -324,6 +324,11 @@ libcosmic window, opened from the applet or `yutani settings`. Pages:
   window positions, chat, UI layout) over every other character in the
   profile, with a backup first and a *Restore last backup* button;
   specified in full in `2026-09-13-yutani-character-copy-design.md`.
+- **Tunnel** — install, connect, disconnect and uninstall the EVE-only
+  WireGuard tunnel from the Proton VPN `.conf` (browsed through the XDG
+  portal, typed, or dropped on the window), with the tunnel's state and the
+  read-only DNS settings; specified in full in
+  `2026-09-13-yutani-tunnel-page-and-ansible-design.md`.
 - **Steam** — the launch options EVE Online needs in its Steam *Properties
   → Launch Options*, as a read-only monospace line with a *Copy* button
   (`yutani::STEAM_LAUNCH_ARGS`), plus the absolute-path variant for a Steam
@@ -331,10 +336,11 @@ libcosmic window, opened from the applet or `yutani settings`. Pages:
   nothing is written, so — like Layouts — it still works while `config.ron`
   does not parse.
 
-Five pages in that order. Display and Behavior apply live and write
+Six pages in that order. Display and Behavior apply live and write
 `config.ron`; Layouts writes its own files under `~/.config/yutani/layouts`,
-Characters writes EVE's files (never `config.ron`), and Steam writes
-nothing at all.
+Characters writes EVE's files (never `config.ron`), Tunnel writes systemd
+units and `/etc/yutani` through `pkexec` (never `config.ron`), and Steam
+writes nothing at all.
 
 ### Panel applet
 

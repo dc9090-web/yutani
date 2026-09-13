@@ -7,7 +7,7 @@
 //! shows what is wrong and writes nothing at all (spec §9: "never overwrite
 //! the user's file").
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use cosmic::Element;
 use cosmic::iced::Length;
@@ -16,6 +16,7 @@ use cosmic::widget;
 use cosmic::widget::segmented_button;
 
 use yutani::eve_settings::names::Names;
+use yutani::tunnel::status::TunnelStatus;
 
 use crate::model::config::{Config, Edge, Mode, Modifier, Visibility, config_path, parse_color, resolve_keysym};
 use crate::model::layout;
@@ -28,18 +29,28 @@ pub enum Page {
     Behavior,
     Layouts,
     Characters,
+    Tunnel,
     Steam,
 }
 
 /// The tab strip, in order. `State::new` builds the segmented control from
 /// this, so the list *is* the window: a page missing here has no tab.
-pub const PAGES: [(&str, Page); 5] = [
+pub const PAGES: [(&str, Page); 6] = [
     ("Display", Page::Display),
     ("Behavior", Page::Behavior),
     ("Layouts", Page::Layouts),
     ("Characters", Page::Characters),
+    ("Tunnel", Page::Tunnel),
     ("Steam", Page::Steam),
 ];
+
+/// Where a page sits in [`PAGES`], for the code that has to *select* a tab
+/// rather than render one (dropping a `.conf` on the window jumps to the
+/// Tunnel page). `None` for a page with no tab, which the page-order test
+/// forbids.
+pub fn page_index(page: Page) -> Option<usize> {
+    index_of(&PAGES, &page)
+}
 
 pub const MODES: [(&str, Mode); 2] = [("Floating", Mode::Floating), ("Dock", Mode::Dock)];
 pub const EDGES: [(&str, Edge); 4] =
@@ -137,6 +148,10 @@ pub struct State {
     /// The Characters page's own state (`super::characters`): EVE's files,
     /// not ours, so it is refreshed by `App::refresh_characters`.
     pub characters: super::characters::State,
+    /// The Tunnel page's own state (`super::tunnel_page`): the systemd unit
+    /// and `/etc/yutani`, not `config.ron`, so it is refreshed by
+    /// `App::refresh_tunnel`.
+    pub tunnel: super::tunnel_page::State,
 }
 
 impl State {
@@ -159,6 +174,10 @@ impl State {
             note: None,
             layout_error: None,
             characters: Default::default(),
+            tunnel: super::tunnel_page::State {
+                can_browse: super::tunnel_page::CAN_BROWSE,
+                ..Default::default()
+            },
         };
         state.refresh();
         state
@@ -241,12 +260,44 @@ pub enum Msg {
     RefreshCharacters,
     /// A names lookup finished: what is known, and the error if any id is still unnamed.
     Names(Names, Option<String>),
+    /// Tunnel page: the `.conf` path field, as typed/browsed/dropped.
+    TunnelConfPath(String),
+    /// Tunnel page: open the XDG file chooser.
+    BrowseTunnelConf,
+    /// The file chooser answered (`None`: cancelled or unavailable).
+    TunnelConfChosen(Option<PathBuf>),
+    /// Tunnel page: install (or replace) the tunnel from the chosen file.
+    InstallTunnel,
+    /// Tunnel page: remove the unit, the rules and `/etc/yutani`.
+    UninstallTunnel,
+    /// Tunnel page: `systemctl start`.
+    TunnelConnect,
+    /// Tunnel page: `systemctl stop`.
+    TunnelDisconnect,
+    /// Tunnel page: re-read the state now.
+    RefreshTunnel,
+    /// The tunnel's current state, re-read after every action and on open.
+    /// Boxed: `TunnelStatus` is much the largest thing a `Msg` could carry,
+    /// and every other variant would pay for it.
+    TunnelStatus(Box<TunnelStatus>),
+    /// An action finished: which one, and how it went.
+    TunnelDone(TunnelAction, Result<(), String>),
     /// The Save-as / Rename name field.
     Name(String),
     SaveAs,
     Apply(String),
     Rename(String),
     Delete(String),
+}
+
+/// The four things the Tunnel page can ask the daemon to do. Each runs the
+/// same function the CLI and the IPC requests run, on the blocking pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TunnelAction {
+    Install,
+    Uninstall,
+    Connect,
+    Disconnect,
 }
 
 /// The settings window: an ordinary xdg-toplevel. Undecorated because
@@ -364,6 +415,11 @@ pub fn view<'a>(
         // Nor is EVE's profile directory `config.ron`: this page copies
         // CCP's files and is just as usable while ours does not parse.
         (Page::Characters, _) => super::characters::view(&state.characters, clients_running),
+        // Nor is the tunnel `config.ron`: the page drives systemd units and
+        // `/etc/yutani`. It only *reads* `config.tunnel` for the DNS lines,
+        // and that is the in-memory (validated) config, so it works while
+        // the file on disk does not parse.
+        (Page::Tunnel, _) => super::tunnel_page::view(&state.tunnel, config),
         (_, Some(error)) => broken_config(error),
         (Page::Display, None) => display_page(state, config),
         (Page::Behavior, None) => behavior_page(state, config),
@@ -391,7 +447,7 @@ pub fn view<'a>(
         .into(),
     });
     let note: Element<'a, Msg> = widget::column::with_children(notes).spacing(4).into();
-    // Five pages now, the longest of which does not fit 700 px.
+    // Six pages now, the longest of which does not fit 700 px.
     let scrolled: Element<'a, Msg> = widget::scrollable(body).height(Length::Fill).into();
     let tabs: Element<'a, Msg> =
         widget::segmented_control::horizontal(&state.pages).on_activate(Msg::Page).into();
@@ -643,6 +699,7 @@ mod tests {
             note: None,
             layout_error: None,
             characters: Default::default(),
+            tunnel: Default::default(),
         }
     }
 
@@ -741,12 +798,15 @@ mod tests {
     /// rendered.
     #[test]
     fn every_page_has_a_tab_in_the_documented_order() {
-        assert_eq!(labels(&PAGES), vec!["Display", "Behavior", "Layouts", "Characters", "Steam"]);
-        for page in [Page::Display, Page::Behavior, Page::Layouts, Page::Characters, Page::Steam] {
-            assert!(index_of(&PAGES, &page).is_some(), "{page:?}");
+        assert_eq!(labels(&PAGES), vec!["Display", "Behavior", "Layouts", "Characters", "Tunnel", "Steam"]);
+        for page in [Page::Display, Page::Behavior, Page::Layouts, Page::Characters, Page::Tunnel, Page::Steam] {
+            assert!(page_index(page).is_some(), "{page:?}");
         }
-        assert_eq!(index_of(&PAGES, &Page::Characters), Some(index_of(&PAGES, &Page::Layouts).unwrap() + 1));
-        assert_eq!(index_of(&PAGES, &Page::Steam), Some(PAGES.len() - 1), "Steam stays last");
+        assert_eq!(page_index(Page::Characters), Some(page_index(Page::Layouts).unwrap() + 1));
+        // A `.conf` dropped on the window selects this tab by index, so the
+        // index has to be the one the tab strip actually has.
+        assert_eq!(page_index(Page::Tunnel), Some(page_index(Page::Characters).unwrap() + 1));
+        assert_eq!(page_index(Page::Steam), Some(PAGES.len() - 1), "Steam stays last");
     }
 
     /// Copying writes the clipboard and leaves "copied" behind; it is not a
@@ -765,6 +825,26 @@ mod tests {
         assert_eq!(apply_config_field(&mut c, &Msg::RestoreBackup), Ok(false));
         assert_eq!(apply_config_field(&mut c, &Msg::RefreshCharacters), Ok(false));
         assert_eq!(apply_config_field(&mut c, &Msg::Names(Names::new(), None)), Ok(false));
+        // The Tunnel page drives systemd and `/etc/yutani`; not one of its
+        // messages is a `config.ron` field either, so none of them may
+        // report a config change (or be written back to the file).
+        assert_eq!(apply_config_field(&mut c, &Msg::TunnelConfPath("/tmp/x.conf".into())), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::BrowseTunnelConf), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::TunnelConfChosen(None)), Ok(false));
+        assert_eq!(
+            apply_config_field(&mut c, &Msg::TunnelConfChosen(Some(PathBuf::from("/tmp/x.conf")))),
+            Ok(false)
+        );
+        assert_eq!(apply_config_field(&mut c, &Msg::InstallTunnel), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::UninstallTunnel), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::TunnelConnect), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::TunnelDisconnect), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::RefreshTunnel), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::TunnelStatus(Box::default())), Ok(false));
+        for action in [TunnelAction::Install, TunnelAction::Uninstall, TunnelAction::Connect, TunnelAction::Disconnect] {
+            assert_eq!(apply_config_field(&mut c, &Msg::TunnelDone(action, Ok(()))), Ok(false));
+            assert_eq!(apply_config_field(&mut c, &Msg::TunnelDone(action, Err("no".into()))), Ok(false));
+        }
         assert_eq!(c, Config::default());
         assert!(!clears_note(&Msg::CopySteamArgs));
         assert!(!is_live_only(&Msg::CopySteamArgs));

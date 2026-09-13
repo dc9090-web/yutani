@@ -446,6 +446,20 @@ everything it would write, so the refusal is visible before the prompt.
   `/etc/yutani/tunnel.conf`, so editing them in `config.ron` requires
   re-running `yutani tunnel install` to have any effect.
 
+### Settings page
+
+The settings window's **Tunnel** page is the same thing without the
+terminal: it takes the WireGuard `.conf` (Browse… through the XDG
+file-chooser portal, a typed path, or the file dropped on the window) and
+calls exactly the functions above — `tunnel::install::install` /
+`uninstall` and `tunnel::control::connect` / `disconnect` — on the blocking
+pool, so the thumbnails keep drawing while they run. `install` still goes
+through `pkexec` from there, so the desktop's polkit agent asks for the
+password once, as it does for the CLI; nothing about §5's privilege split
+changes. The page shows the file *name* and the parsed `location` only —
+never the key material. Specified in full in
+`2026-09-13-yutani-tunnel-page-and-ansible-design.md` §1.
+
 ## 7. Tagging EVE processes
 
 **Launch wrapper.** Steam launch options:

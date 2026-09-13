@@ -15,6 +15,9 @@ libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "a401af8b1c54a8
     "wgpu",
     "single-instance",
     "applet",
+    # The XDG file-chooser portal, for the Tunnel page's Browse… button
+    # (`ui::App::browse_tunnel_conf`).
+    "xdg-portal",
 ] }
 calloop = { version = "0.14.4", features = ["executor"] }
 calloop-wayland-source = "0.4.1"

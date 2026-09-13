@@ -51,7 +51,10 @@ pub fn parse_wg_dump(dump: &str) -> Option<(String, u64, u64, u64)> {
     ))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// `Default` is "nothing installed, nothing connected": the state the
+/// settings window shows before its first refresh, and the base the page's
+/// summary test builds on.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TunnelStatus {
     pub installed: bool,
     pub connected: bool,
