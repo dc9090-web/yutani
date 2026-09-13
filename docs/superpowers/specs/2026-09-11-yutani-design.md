@@ -316,6 +316,12 @@ libcosmic window, opened from the applet or `yutani settings`. Pages:
   *Uninstall shortcuts* buttons.
 - **Layouts** — list of saved layouts; *Save current as…*, *Apply*, *Rename*,
   *Delete*.
+- **Steam** — the launch options EVE Online needs in its Steam *Properties
+  → Launch Options*, as a read-only monospace line with a *Copy* button
+  (`yutani::STEAM_LAUNCH_ARGS`), plus the absolute-path variant for a Steam
+  that cannot find `yutani` on `PATH`. Nothing on this page is editable and
+  nothing is written, so — like Layouts — it still works while `config.ron`
+  does not parse.
 
 All changes apply live and write `config.ron`.
 

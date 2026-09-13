@@ -1198,6 +1198,13 @@ impl App {
                 self.settings_shortcuts(false);
                 return Task::none();
             }
+            // The note *is* the feedback for this press — there is nothing
+            // else on screen to change — so it is set before the clipboard
+            // task is handed back.
+            S::CopySteamArgs => {
+                self.settings_note("copied".to_string());
+                return cosmic::iced::clipboard::write(yutani::STEAM_LAUNCH_ARGS.to_string());
+            }
             _ => {}
         }
 

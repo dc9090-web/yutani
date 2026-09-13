@@ -18,13 +18,24 @@ use cosmic::widget::segmented_button;
 use crate::model::config::{Config, Edge, Mode, Modifier, Visibility, config_path, parse_color, resolve_keysym};
 use crate::model::layout;
 
-/// The three pages of spec §6.
+/// The pages of spec §6, plus the Steam one: the launch options EVE needs,
+/// which are not a setting at all — they are a string to copy into Steam.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Display,
     Behavior,
     Layouts,
+    Steam,
 }
+
+/// The tab strip, in order. `State::new` builds the segmented control from
+/// this, so the list *is* the window: a page missing here has no tab.
+pub const PAGES: [(&str, Page); 4] = [
+    ("Display", Page::Display),
+    ("Behavior", Page::Behavior),
+    ("Layouts", Page::Layouts),
+    ("Steam", Page::Steam),
+];
 
 pub const MODES: [(&str, Mode); 2] = [("Floating", Mode::Floating), ("Dock", Mode::Dock)];
 pub const EDGES: [(&str, Edge); 4] =
@@ -96,7 +107,7 @@ pub fn install_enabled(next_field: &str, prev_field: &str) -> bool {
 /// Everything the settings window owns. `None` on `App` while it is closed.
 pub struct State {
     pub window: SurfaceId,
-    /// The three-page tab strip; its active entity carries a `Page`.
+    /// The tab strip ([`PAGES`]); its active entity carries a `Page`.
     pub pages: segmented_button::SingleSelectModel,
     /// Set when `config.ron` exists but does not parse: the Display and
     /// Behavior pages are replaced by the reason and nothing is written.
@@ -124,9 +135,10 @@ pub struct State {
 impl State {
     pub fn new(window: SurfaceId, config: &Config) -> Self {
         let mut pages = segmented_button::SingleSelectModel::default();
-        pages.insert().text("Display").data(Page::Display).activate();
-        pages.insert().text("Behavior").data(Page::Behavior);
-        pages.insert().text("Layouts").data(Page::Layouts);
+        for (label, page) in PAGES {
+            pages.insert().text(label).data(page);
+        }
+        pages.activate_position(0);
         let mut state = Self {
             window,
             pages,
@@ -205,6 +217,8 @@ pub enum Msg {
     PrevKey(String),
     InstallShortcuts,
     UninstallShortcuts,
+    /// Put [`yutani::STEAM_LAUNCH_ARGS`] on the clipboard.
+    CopySteamArgs,
     /// The Save-as / Rename name field.
     Name(String),
     SaveAs,
@@ -316,6 +330,10 @@ pub fn view<'a>(state: &'a State, config: &'a Config, focused: bool) -> Element<
     let body: Element<'a, Msg> = match (page, &state.config_error) {
         // Layout files are not `config.ron`; this page works either way.
         (Page::Layouts, _) => layouts_page(state),
+        // Nor does the Steam page read or write anything: it is a fixed
+        // string and a Copy button, and it is exactly the page someone
+        // whose config is broken may still need.
+        (Page::Steam, _) => steam_page(),
         (_, Some(error)) => broken_config(error),
         (Page::Display, None) => display_page(state, config),
         (Page::Behavior, None) => behavior_page(state, config),
@@ -494,6 +512,31 @@ fn behavior_page<'a>(state: &'a State, config: &'a Config) -> Element<'a, Msg> {
     .into()
 }
 
+/// The launch options EVE needs in Steam. Nothing here is editable and
+/// nothing is stored: the page exists so the line can be read and copied
+/// without hunting through the README.
+fn steam_page<'a>() -> Element<'a, Msg> {
+    let line = widget::settings::item_row(vec![
+        widget::text::monotext(yutani::STEAM_LAUNCH_ARGS).width(Length::Fill).into(),
+        widget::button::standard("Copy").on_press(Msg::CopySteamArgs).into(),
+    ]);
+    widget::settings::view_column(vec![
+        widget::settings::section()
+            .title("EVE Online launch options")
+            .add(widget::text::caption(
+                "Launch arguments for EVE Online in Steam (Properties → Launch Options):",
+            ))
+            .add(line)
+            .add(widget::text::caption(
+                "This assumes Steam can find `yutani` on its PATH. If it cannot (a Flatpak Steam, or a \
+                 session that did not inherit your shell's PATH), use the full path instead:",
+            ))
+            .add(widget::text::monotext(yutani::STEAM_LAUNCH_ARGS_ABSOLUTE))
+            .into(),
+    ])
+    .into()
+}
+
 fn layouts_page(state: &State) -> Element<'_, Msg> {
     let named = !state.name_field.trim().is_empty();
     // Not fatal to this page — a named layout is a different file — but the
@@ -639,6 +682,51 @@ mod tests {
         assert!(!clears_note(&Msg::SaveAs));
         assert!(!clears_note(&Msg::InstallShortcuts));
         assert!(!clears_note(&Msg::Commit));
+    }
+
+    /// The one string this page exists to hand over. Pinned exactly: a typo
+    /// in Steam's launch options is a game that starts outside Yutani (or
+    /// not at all), and the user cannot see which word is wrong.
+    #[test]
+    fn the_steam_launch_arguments_are_exactly_what_eve_needs() {
+        assert_eq!(
+            yutani::STEAM_LAUNCH_ARGS,
+            "PROTON_ENABLE_WAYLAND=1 WINE_NO_WM_DECORATION=1 yutani launch -- %command%"
+        );
+        // The alternative for a Steam that cannot find `yutani` on PATH is
+        // the same line with the documented install path spelled out.
+        assert_eq!(
+            yutani::STEAM_LAUNCH_ARGS_ABSOLUTE,
+            "PROTON_ENABLE_WAYLAND=1 WINE_NO_WM_DECORATION=1 /usr/local/bin/yutani launch -- %command%"
+        );
+        assert_eq!(
+            yutani::STEAM_LAUNCH_ARGS_ABSOLUTE,
+            yutani::STEAM_LAUNCH_ARGS.replace(" yutani launch", " /usr/local/bin/yutani launch")
+        );
+    }
+
+    /// The tab strip is built from `PAGES`, so the list is the window: a
+    /// page missing from it has no tab, and a tab with no page cannot be
+    /// rendered.
+    #[test]
+    fn every_page_has_a_tab_and_steam_comes_after_layouts() {
+        assert_eq!(labels(&PAGES), vec!["Display", "Behavior", "Layouts", "Steam"]);
+        for page in [Page::Display, Page::Behavior, Page::Layouts, Page::Steam] {
+            assert!(index_of(&PAGES, &page).is_some(), "{page:?}");
+        }
+        assert_eq!(index_of(&PAGES, &Page::Steam), Some(index_of(&PAGES, &Page::Layouts).unwrap() + 1));
+    }
+
+    /// Copying writes the clipboard and leaves "copied" behind; it is not a
+    /// config field, not a slider, and must not be swallowed by the
+    /// note-clearing rule — the note is the only feedback the press gives.
+    #[test]
+    fn copying_the_steam_arguments_is_not_a_config_field_and_keeps_its_note() {
+        let mut c = Config::default();
+        assert_eq!(apply_config_field(&mut c, &Msg::CopySteamArgs), Ok(false));
+        assert_eq!(c, Config::default());
+        assert!(!clears_note(&Msg::CopySteamArgs));
+        assert!(!is_live_only(&Msg::CopySteamArgs));
     }
 
     #[test]
