@@ -73,6 +73,12 @@ pub struct ScreencopySession {
     /// session; a second one before the first resolves is a fatal
     /// `duplicate_frame` protocol error.
     in_flight: bool,
+    /// A `ready` has spawned the task that waits for the compositor to
+    /// release the previous front buffer before the next `submit`. While it
+    /// is pending, nothing else may submit: the back buffer is the one the
+    /// compositor may still be displaying, and capturing into it early
+    /// ships a torn frame.
+    resubmit_pending: bool,
 }
 
 impl ScreencopySession {
@@ -89,6 +95,7 @@ impl ScreencopySession {
                 last_submit: Instant::now(),
                 consecutive_failures: 0,
                 in_flight: false,
+                resubmit_pending: false,
             }),
             Err(err) => {
                 tracing::error!("cannot create capture session: {err:?}");
@@ -160,15 +167,19 @@ impl AppData {
 
     /// Pause (or resume) capture for a client whose thumbnail the UI has
     /// hidden (or shown again). Resuming re-submits immediately if nothing
-    /// is already in flight; `submit`'s own `in_flight` guard makes this
-    /// safe to call unconditionally.
+    /// is already in flight and no release wait is pending (that task
+    /// submits itself once the compositor has let go of the buffer);
+    /// `submit`'s own `in_flight` guard makes this safe to call
+    /// unconditionally.
     pub fn set_paused(&mut self, handle: &Handle, paused: bool, conn: &Connection) {
         let Some(capture) = self.captures.get(handle).cloned() else { return };
         capture.paused.store(paused, Ordering::Relaxed);
         if !paused {
             let mut guard = capture.session.lock().unwrap();
             if let Some(state) = guard.as_mut() {
-                state.submit(&capture, conn, &self.qh);
+                if !state.resubmit_pending {
+                    state.submit(&capture, conn, &self.qh);
+                }
             }
         }
     }
@@ -308,6 +319,7 @@ impl ScreencopyHandler for AppData {
         };
         let last_submit = state.last_submit;
         let session_id = state.session.clone();
+        state.resubmit_pending = true;
 
         // Next capture: after the previous front buffer is released by the
         // compositor and at least one frame interval since the last submit.
@@ -337,6 +349,7 @@ impl ScreencopyHandler for AppData {
                 if state.session != session_id {
                     return;
                 }
+                state.resubmit_pending = false;
                 state.submit(&capture_for_task, &conn, &qh);
             }
         });
@@ -381,6 +394,9 @@ impl ScreencopyHandler for AppData {
             WEnum::Value(FailureReason::Stopped) => {
                 tracing::info!("capture stopped by compositor");
                 capture.stop();
+                // Grey the thumbnail rather than leave the last frame looking
+                // live; the next `update_toplevel` restarts the session.
+                self.send_event(Event::CaptureUnavailable(capture.handle.clone()));
             }
             other => {
                 let mut guard = capture.session.lock().unwrap();
@@ -422,6 +438,9 @@ impl ScreencopyHandler for AppData {
     fn stopped(&mut self, _: &Connection, _: &QueueHandle<Self>, session: &CaptureSession) {
         if let Some(capture) = Capture::for_session(session) {
             capture.stop();
+            // As for `FailureReason::Stopped`: nothing else restarts this
+            // session, so the UI must not keep showing its last frame as live.
+            self.send_event(Event::CaptureUnavailable(capture.handle.clone()));
         }
     }
 }

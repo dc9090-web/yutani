@@ -11,13 +11,13 @@ const TIMEOUT: Duration = Duration::from_secs(3);
 
 /// True when an app instance is listening on the socket.
 pub fn is_running() -> bool {
-    UnixStream::connect(socket_path()).is_ok()
+    socket_path().and_then(|path| UnixStream::connect(path)).is_ok()
 }
 
 /// Send one request and return the reply. `Err` is a message already
 /// formatted for stderr.
 fn exchange(request: &Request) -> Result<Response, String> {
-    let path = socket_path();
+    let path = socket_path().map_err(|err| format!("yutani: {err}"))?;
     let stream = match UnixStream::connect(&path) {
         Ok(s) => s,
         Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {

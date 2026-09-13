@@ -91,7 +91,7 @@ async fn send_to_inner(path: &Path, request: &Request) -> Result<Option<String>,
 
 /// `send_to` against `$XDG_RUNTIME_DIR/yutani.sock`.
 pub async fn send(request: Request) -> Result<Option<String>, IpcError> {
-    send_to(&socket_path(), &request).await
+    send_to(&socket_path().map_err(|err| IpcError::Failed(err.to_string()))?, &request).await
 }
 
 /// The `status` request, parsed. Takes an owned path so the future is
@@ -104,7 +104,7 @@ pub async fn status_from(path: PathBuf) -> Result<Status, IpcError> {
 }
 
 pub async fn status() -> Result<Status, IpcError> {
-    status_from(socket_path()).await
+    status_from(socket_path().map_err(|err| IpcError::Failed(err.to_string()))?).await
 }
 
 #[cfg(test)]

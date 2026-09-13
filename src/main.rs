@@ -188,7 +188,13 @@ fn main() -> ExitCode {
         Some(Command::Show) => Ok(cli::send(&ipc::Request::Show)),
         Some(Command::Hide) => Ok(cli::send(&ipc::Request::Hide)),
         Some(Command::Toggle) => Ok(cli::send(&ipc::Request::Toggle)),
-        Some(Command::Layout { name }) => Ok(cli::send(&ipc::Request::Layout(name))),
+        Some(Command::Layout { name }) => Ok(match ipc::Request::layout(name) {
+            Ok(request) => cli::send(&request),
+            Err(msg) => {
+                eprintln!("yutani: {msg}");
+                ExitCode::from(1)
+            }
+        }),
         Some(Command::Layouts) => Ok(cli::layouts()),
         Some(Command::Settings) => Ok(cli::send(&ipc::Request::Settings)),
         Some(Command::Quit) => Ok(cli::send(&ipc::Request::Quit)),

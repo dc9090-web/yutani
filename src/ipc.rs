@@ -1,7 +1,8 @@
 //! IPC wire protocol between `yutani` (the app, server) and `yutani <cmd>`
 //! (the CLI, client). Newline-delimited text, one request per connection.
 
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 /// Longest request line the server will read (bytes, including `\n`).
 pub const MAX_LINE: usize = 1024;
@@ -12,13 +13,49 @@ pub const MAX_LINE: usize = 1024;
 /// which bounds only the request line the server reads.
 pub const MAX_REPLY: usize = 64 * 1024;
 
-/// `$XDG_RUNTIME_DIR/yutani.sock`, or `/tmp/yutani-<uid>.sock` without the
-/// variable (a bare TTY session).
-pub fn socket_path() -> PathBuf {
+/// `$XDG_RUNTIME_DIR/yutani.sock`, or `/tmp/yutani-<uid>/yutani.sock`
+/// without the variable (a bare TTY session). `/tmp` is world-writable, so
+/// the fallback directory is only used once [`private_dir`] has created it
+/// 0700 or verified that what is already there is ours and private; `Err`
+/// means it is not, and the socket must not be used.
+pub fn socket_path() -> io::Result<PathBuf> {
     match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("yutani.sock"),
-        _ => PathBuf::from(format!("/tmp/yutani-{}.sock", uid())),
+        Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir).join("yutani.sock")),
+        _ => {
+            let uid = uid();
+            let dir = PathBuf::from(format!("/tmp/yutani-{uid}"));
+            private_dir(&dir, uid)?;
+            Ok(dir.join("yutani.sock"))
+        }
     }
+}
+
+/// Create `dir` as a private directory (mode 0700), or accept an existing
+/// one only if it is a real directory (not a symlink) owned by `uid` with
+/// exactly that mode. In a world-writable parent another local user could
+/// have put something at that path first: a directory they own would let
+/// them pre-create the socket (the server's `bind` fails) or, while nothing
+/// is listening, answer the CLI and applet themselves with forged replies.
+pub fn private_dir(dir: &Path, uid: u32) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        // `mode` is subject to the umask; make sure of it.
+        Ok(()) => std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(err),
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    let shown = dir.display();
+    if !meta.is_dir() {
+        return Err(io::Error::other(format!("{shown} exists but is not a directory")));
+    }
+    if meta.uid() != uid {
+        return Err(io::Error::other(format!("{shown} is owned by uid {}, not {uid}", meta.uid())));
+    }
+    if meta.mode() & 0o777 != 0o700 {
+        return Err(io::Error::other(format!("{shown} is not private (mode {:o})", meta.mode() & 0o777)));
+    }
+    Ok(())
 }
 
 pub fn uid() -> u32 {
@@ -49,6 +86,16 @@ pub enum Request {
 }
 
 impl Request {
+    /// `Request::Layout`, refusing a name that could not survive the wire:
+    /// the server reads one line, so a name with a line break in it would
+    /// silently become a request for whatever precedes the break.
+    pub fn layout(name: String) -> Result<Request, String> {
+        if name.contains(['\n', '\r']) {
+            return Err("layout names cannot contain a line break".into());
+        }
+        Ok(Request::Layout(name))
+    }
+
     /// Parse one request line (trailing newline optional). Errors are the
     /// text the server sends back after `err `.
     pub fn parse(line: &str) -> Result<Request, String> {
@@ -214,8 +261,79 @@ mod tests {
     fn socket_path_follows_runtime_dir() {
         // Only the shape is asserted; the env var is process-global, so it
         // is not mutated here.
-        let p = socket_path();
+        let p = socket_path().unwrap();
         assert!(p.to_string_lossy().ends_with(".sock"));
         assert!(p.is_absolute());
+    }
+
+    #[test]
+    fn a_layout_name_with_a_line_break_is_refused_before_it_reaches_the_wire() {
+        assert!(Request::layout("pvp\nfleet".into()).is_err(), "would be sent as `layout pvp`");
+        assert!(Request::layout("pvp\rfleet".into()).is_err());
+        assert_eq!(Request::layout("pvp fleet".into()), Ok(Request::Layout("pvp fleet".into())));
+    }
+
+    /// A fresh path under the test temp dir, removed when dropped.
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("yutani-ipc-test-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            let _ = std::fs::remove_file(&p);
+            Scratch(p)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn mode_of(p: &Path) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(p).unwrap().mode() & 0o777
+    }
+
+    #[test]
+    fn a_missing_fallback_dir_is_created_private_and_then_accepted_again() {
+        let s = Scratch::new("create");
+        private_dir(&s.0, uid()).unwrap();
+        assert!(s.0.is_dir());
+        assert_eq!(mode_of(&s.0), 0o700, "must be private whatever the umask");
+        private_dir(&s.0, uid()).expect("our own private dir must be accepted on the next start");
+    }
+
+    #[test]
+    fn a_fallback_dir_that_others_can_write_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = Scratch::new("mode");
+        std::fs::create_dir(&s.0).unwrap();
+        std::fs::set_permissions(&s.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = private_dir(&s.0, uid()).unwrap_err();
+        assert!(err.to_string().contains("not private"), "got {err}");
+    }
+
+    #[test]
+    fn a_fallback_dir_owned_by_someone_else_is_refused() {
+        let s = Scratch::new("owner");
+        std::fs::create_dir(&s.0).unwrap();
+        // The dir is ours; asking for a different uid is the same check
+        // from the other side (a real foreign dir cannot be made in a test).
+        let err = private_dir(&s.0, uid().wrapping_add(1)).unwrap_err();
+        assert!(err.to_string().contains("owned by"), "got {err}");
+    }
+
+    #[test]
+    fn a_symlink_or_file_in_place_of_the_fallback_dir_is_refused() {
+        let real = Scratch::new("real");
+        private_dir(&real.0, uid()).unwrap();
+        let link = Scratch::new("link");
+        std::os::unix::fs::symlink(&real.0, &link.0).unwrap();
+        let err = private_dir(&link.0, uid()).unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "a symlink to a private dir is still not ours: {err}");
+        let file = Scratch::new("file");
+        std::fs::write(&file.0, b"").unwrap();
+        assert!(private_dir(&file.0, uid()).is_err());
     }
 }

@@ -74,9 +74,15 @@ impl ToplevelInfoHandler for AppData {
     }
 
     fn toplevel_closed(&mut self, _: &Connection, _: &QueueHandle<Self>, handle: &Handle) {
-        tracing::info!("toplevel closed");
-        self.stop_capture(handle);
-        self.send_event(Event::ClientRemoved(handle.clone()));
+        // Same gate as `reclassify_all`/`update_toplevel`: every window on
+        // the desktop closes through here, and a `ClientRemoved` for one
+        // that was never a client costs the UI a layout save and a dock
+        // relayout each time.
+        if self.captures.contains_key(handle) {
+            tracing::info!("toplevel closed");
+            self.stop_capture(handle);
+            self.send_event(Event::ClientRemoved(handle.clone()));
+        }
     }
 }
 

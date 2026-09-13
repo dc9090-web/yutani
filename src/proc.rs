@@ -75,16 +75,20 @@ pub fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> io::Result<O
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     let mut stdout = child.stdout.take().expect("stdout was requested as piped");
     let mut stderr = child.stderr.take().expect("stderr was requested as piped");
-    let stdout_reader = std::thread::spawn(move || {
+    // `Builder::spawn` reports a refused thread (EAGAIN under a pid or
+    // thread limit) as an error like any other; `thread::spawn` would panic,
+    // which in `yutani launch` aborts before the game starts and in the app
+    // kills the adoption task.
+    let stdout_reader = std::thread::Builder::new().spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout.read_to_end(&mut buf);
         buf
-    });
-    let stderr_reader = std::thread::spawn(move || {
+    })?;
+    let stderr_reader = std::thread::Builder::new().spawn(move || {
         let mut buf = Vec::new();
         let _ = stderr.read_to_end(&mut buf);
         buf
-    });
+    })?;
     let killed = wait_or_kill(&mut child, timeout)?;
     let status = child.wait()?;
     if killed {

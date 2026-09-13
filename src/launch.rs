@@ -21,18 +21,21 @@
 //! no stdout), we skip `systemd-run` entirely and run the command directly,
 //! warning on stderr, so the game still starts exactly once.
 //!
-//! Once the preflight has passed, `systemd-run`'s exit status is propagated
-//! as-is: `systemd-run --scope --wait`-like invocations exec the scope and
-//! wait for it, so a non-zero status is the *game's own* exit, not a
-//! wrapping failure, and is not retried directly (that would run the game
-//! twice). One sharp edge is inherent to this: if the game binary itself is
-//! missing, `systemd-run` cannot exec it and exits with its own "command not
-//! found" code (1), which then looks exactly like a game that exited 1 — we
-//! cannot tell those apart from here.
+//! Once the preflight has passed, this process `exec`s `systemd-run`, which
+//! registers the scope and then `exec`s the game in turn: the game ends up
+//! *being* the `yutani launch` pid, so whatever tracks that pid (Steam does,
+//! for `%command%`) sees the game's own exit status, and a signal sent to
+//! it reaches the game instead of stopping at a wrapper. `exec` only ever
+//! returns when it fails, before anything has started, so a missing
+//! `systemd-run` falls through to the direct path without ever running the
+//! game twice. One sharp edge is inherent to this: if the game binary itself
+//! is missing, `systemd-run` cannot exec it and exits with its own "command
+//! not found" code (1), which then looks exactly like a game that exited 1
+//! — we cannot tell those apart from here.
 
 use std::io;
-use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, ExitCode, ExitStatus, Output};
+use std::os::unix::process::CommandExt;
+use std::process::{Command, ExitCode, Output};
 use std::time::Duration;
 
 use crate::tunnel::SLICE;
@@ -97,20 +100,26 @@ fn preflight_warning(preflight: &io::Result<Option<Output>>) -> String {
     }
 }
 
-/// Exit code for a finished child, POSIX-shell style: the process's own
-/// exit code, or `128 + signal` if it was killed by a signal (it then has
-/// no exit code at all), or `1` if somehow neither is set.
-pub fn exit_code(status: ExitStatus) -> u8 {
-    match (status.code(), status.signal()) {
-        (Some(code), _) => code as u8,
-        (None, Some(sig)) => 128u8.wrapping_add(sig as u8),
-        (None, None) => 1,
-    }
+/// Replace this process with `argv`. A successful `execvp` never comes
+/// back, so this only ever returns — with the reason — when nothing was
+/// started, which is exactly when the caller may still try something else.
+fn exec(argv: &[String]) -> io::Error {
+    Command::new(&argv[0]).args(&argv[1..]).exec()
+}
+
+/// Run `command` in this process's place with no wrapper. Returns only if
+/// the exec failed, as the shell's "command not found" code (127) after
+/// saying why on stderr.
+fn run_directly(command: &[String]) -> u8 {
+    let err = exec(command);
+    eprintln!("yutani launch: cannot run {}: {err}", command[0]);
+    127
 }
 
 /// Never stops the game from starting: if the preflight fails, or
 /// `systemd-run` is missing, run the command directly and say so on
-/// stderr. See the module doc comment for the full rationale.
+/// stderr. See the module doc comment for the full rationale. Returns only
+/// when the command could not be started at all.
 pub fn run(command: Vec<String>) -> ExitCode {
     if command.is_empty() {
         eprintln!("yutani launch: nothing to run (usage: yutani launch -- <command…>)");
@@ -119,28 +128,19 @@ pub fn run(command: Vec<String>) -> ExitCode {
     let preflight = run_preflight();
     let answer = preflight.as_ref().ok().and_then(|o| o.as_ref());
     if should_wrap(answer) {
-        let argv = systemd_run_argv(&command);
-        match Command::new(&argv[0]).args(&argv[1..]).status() {
-            Ok(status) => return ExitCode::from(exit_code(status)),
-            Err(err) => {
-                eprintln!("yutani launch: systemd-run unavailable ({err}); running without the tunnel cgroup");
-            }
-        }
+        let err = exec(&systemd_run_argv(&command));
+        eprintln!("yutani launch: systemd-run unavailable ({err}); running without the tunnel cgroup");
     } else {
         eprintln!("{}", preflight_warning(&preflight));
     }
-    match Command::new(&command[0]).args(&command[1..]).status() {
-        Ok(status) => ExitCode::from(exit_code(status)),
-        Err(err) => {
-            eprintln!("yutani launch: cannot run {}: {err}", command[0]);
-            ExitCode::from(127)
-        }
-    }
+    ExitCode::from(run_directly(&command))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
 
     fn output(code: i32, stdout: &[u8]) -> Output {
         Output { status: ExitStatus::from_raw(code << 8), stdout: stdout.to_vec(), stderr: Vec::new() }
@@ -200,16 +200,15 @@ mod tests {
     }
 
     #[test]
-    fn exit_code_passes_through_a_normal_exit() {
-        assert_eq!(exit_code(ExitStatus::from_raw(0 << 8)), 0);
-        assert_eq!(exit_code(ExitStatus::from_raw(7 << 8)), 7);
+    fn a_failed_exec_comes_back_as_an_error_instead_of_replacing_the_process() {
+        // `exec` never returns on success (this test would be replaced by
+        // the target), so the only thing to assert is the failure path.
+        let err = exec(&["/nonexistent-yutani-binary".to_string()]);
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "got {err}");
     }
 
     #[test]
-    fn exit_code_is_128_plus_signal_for_a_signal_kill() {
-        // Raw wait status for "killed by signal 9" (SIGKILL): low 7 bits are
-        // the signal number, no exit-code bits set.
-        assert_eq!(exit_code(ExitStatus::from_raw(9)), 137);
-        assert_eq!(exit_code(ExitStatus::from_raw(15)), 143);
+    fn running_a_missing_command_directly_reports_127() {
+        assert_eq!(run_directly(&["/nonexistent-yutani-binary".to_string()]), 127);
     }
 }
