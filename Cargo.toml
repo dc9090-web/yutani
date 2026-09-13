@@ -44,3 +44,13 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# wayland-backend 0.3.17 with one fix in `ConnectionState::drop` (see
+# vendor/wayland-backend/README.yutani.md): dropping a backend made with
+# `from_foreign_display` — which libcosmic does for every clipboard it
+# replaces — freed the user data of its proxies without marking them dead,
+# and an event already queued on the SCTK thread that named one of them
+# (`wl_surface.enter(wl_output)`) then read freed memory. Remove this patch
+# once upstream wayland-rs ships the same change.
+[patch.crates-io]
+wayland-backend = { path = "vendor/wayland-backend" }
