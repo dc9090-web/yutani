@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use cosmic::Element;
 use cosmic::iced::Length;
@@ -26,6 +26,10 @@ pub const ONE_CHARACTER: &str = "Only one character has settings here; there is 
 pub const NO_PROFILE: &str = "No EVE profile directory was found.";
 pub const NO_SELECTION: &str = "Pick a character to copy from.";
 pub const NO_ACCOUNT_SELECTION: &str = "Pick an account to copy from.";
+/// EVE leaves a truncated `core_char` after a crash on logout; being the
+/// newest it is the default selection, and copying it would broadcast an
+/// empty file to every character.
+pub const EMPTY_SOURCE: &str = "The selected character's file is empty; pick another one to copy from.";
 /// ESI answered, but not about every id we asked for; the caption has to
 /// explain the bare numbers left in the dropdown.
 pub const SOME_UNNAMED: &str = "some characters could not be named";
@@ -159,13 +163,90 @@ pub fn copy_blocker(state: &State, clients_running: bool) -> Option<&'static str
     // A dropdown index past the end of the listing (libcosmic publishes one
     // on ctrl+scroll, and a refresh can shrink the list under a queued
     // message): without this the copy would be a silent no-op.
-    if state.selected_character().is_none() {
-        return Some(NO_SELECTION);
+    let Some(source) = listing.characters.get(state.source_character) else { return Some(NO_SELECTION) };
+    if source.size == 0 {
+        return Some(EMPTY_SOURCE);
     }
     if clients_running {
         return Some(RUNNING_CLIENT);
     }
     None
+}
+
+/// A settings file written this close to `now` is one a client may still
+/// be writing: EVE flushes `core_char_*`/`core_user_*` on logout and again
+/// while the process exits, after its window is already gone.
+pub const RECENT_WRITE_WINDOW: Duration = Duration::from_secs(3);
+
+/// EVE processes owned by `uid` under `proc_root` (`/proc`), as
+/// `(pid, name)` sorted by pid. Matched on `comm` or argv[0] the way
+/// `adopt::scan` does, but without its slice filter: a client launched
+/// through `yutani launch` is in the slice and is exactly the one whose
+/// exit we are waiting for.
+pub fn running_eve_processes(proc_root: &Path, patterns: &[String], uid: u32) -> Vec<(u32, String)> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(dir) = std::fs::read_dir(proc_root) else { return Vec::new() };
+    let mut out = Vec::new();
+    for entry in dir.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.uid() != uid {
+            continue;
+        }
+        let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+        let cmdline = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        let argv0 = cmdline.split(|b| *b == 0).next().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
+        let name = if crate::adopt::is_eve_process(comm.trim(), patterns) {
+            comm.trim().to_string()
+        } else if crate::adopt::is_eve_process(&argv0, patterns) {
+            argv0.rsplit(['/', '\\']).next().unwrap_or(&argv0).to_string()
+        } else {
+            continue;
+        };
+        out.push((pid, name));
+    }
+    out.sort();
+    out
+}
+
+/// The listed file (character or account) whose mtime is within
+/// [`RECENT_WRITE_WINDOW`] of `now`, the newest when several are. Measured
+/// in both directions: a file a second in the future is a write with a
+/// slightly-ahead clock, a file minutes in the future is skew, not a write.
+pub fn recent_write(listing: &Listing, now: SystemTime) -> Option<&Entry> {
+    listing
+        .characters
+        .iter()
+        .chain(&listing.accounts)
+        .filter(|e| match now.duration_since(e.modified) {
+            Ok(age) => age < RECENT_WRITE_WINDOW,
+            Err(ahead) => ahead.duration() < RECENT_WRITE_WINDOW,
+        })
+        .max_by_key(|e| e.modified)
+}
+
+/// Why a copy or restore must not start *right now*, as a note-line
+/// fragment. Checked on the button press, not per frame: the toplevel
+/// list (`clients_running`) empties the moment a client's window closes,
+/// and `exefile.exe` writes these files while it is still tearing down
+/// after that. Two independent conditions, each named so the user knows
+/// what to wait for: a matching process still alive (a `/proc` walk, a
+/// few ms), and a listed file written within [`RECENT_WRITE_WINDOW`] — its
+/// mtime re-read from disk, since the listing the page holds can be
+/// minutes old.
+pub fn write_blocker(listing: &Listing, patterns: &[String], proc_root: &Path, uid: u32, now: SystemTime) -> Option<String> {
+    if let Some((pid, name)) = running_eve_processes(proc_root, patterns, uid).first() {
+        return Some(format!("{name} (pid {pid}) is still running; wait for it to exit and press again"));
+    }
+    let fresh = yutani::eve_settings::list(&listing.dir).unwrap_or_else(|_| listing.clone());
+    let entry = recent_write(&fresh, now)?;
+    let name = entry.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    Some(format!("{name} was written a moment ago, a client may still be writing it; wait a few seconds and press again"))
+}
+
+/// [`write_blocker`] against the real `/proc`, our uid and the clock.
+pub fn write_blocker_now(listing: &Listing, patterns: &[String]) -> Option<String> {
+    write_blocker(listing, patterns, Path::new("/proc"), crate::ipc::uid(), SystemTime::now())
 }
 
 pub fn copy_note(source: &str, report: &Report) -> String {
@@ -200,6 +281,28 @@ pub fn copy_failure_note(failure: &Failure, backup: &Path) -> String {
     )
 }
 
+/// The note for a failed restore, shaped like [`copy_failure_note`]:
+/// `saved` is the pre-restore backup holding the live files the restore
+/// replaced before it failed — the newest backup now, so pressing Restore
+/// again puts them back. A failure before any file was replaced (the
+/// pre-restore backup itself, or the first file) has nothing to point at.
+pub fn restore_failure_note(failure: &Failure, saved: &Path) -> String {
+    if failure.replaced == 0 {
+        let mut note = format!("restore not started: {}", failure.error);
+        if failure.error.kind() == std::io::ErrorKind::AlreadyExists {
+            note.push_str(" — wait a second and press again");
+        }
+        return note;
+    }
+    format!(
+        "restore failed after replacing {} of {} files: {}; the files it replaced are in {}",
+        failure.replaced,
+        failure.planned,
+        failure.error,
+        saved.display()
+    )
+}
+
 /// A blocker constant reworded as a note-line fragment. The constants are
 /// captions under a button — capitalised, full sentences — and the note
 /// line is a lowercase phrase, so pushing one through verbatim reads wrong.
@@ -210,6 +313,7 @@ pub fn blocker_note(blocker: &str) -> String {
         NO_PROFILE => "no EVE profile directory found",
         NO_SELECTION => "pick a character to copy from",
         NO_ACCOUNT_SELECTION => "pick an account to copy from",
+        EMPTY_SOURCE => "the selected character's file is empty",
         other => other,
     }
     .to_string()
@@ -367,6 +471,18 @@ mod tests {
         assert_eq!(copy_blocker(&s, false), Some(NO_SELECTION));
     }
 
+    /// EVE leaves a truncated `core_char` behind after a crash on logout,
+    /// and being the newest it is the default selection: copying it would
+    /// broadcast an empty file to every character.
+    #[test]
+    fn an_empty_source_file_blocks_the_copy() {
+        let mut s = state_with(&[1, 2], &[10]);
+        s.listing.as_mut().unwrap().characters[0].size = 0;
+        assert_eq!(copy_blocker(&s, false), Some(EMPTY_SOURCE));
+        s.source_character = 1;
+        assert_eq!(copy_blocker(&s, false), None, "the other character is fine");
+    }
+
     /// Index 0 into an empty listing is still nothing: no panic, no
     /// selection, and the copy is blocked by the character count.
     #[test]
@@ -432,6 +548,32 @@ mod tests {
         );
     }
 
+    /// A restore that failed after replacing some files: the live files
+    /// it replaced are in the pre-restore backup, and the note has to say
+    /// so — pressing Restore again would put that backup back, which is
+    /// the way out. Nothing replaced: nothing to point at.
+    #[test]
+    fn a_failed_restore_says_how_far_it_got_and_where_the_live_files_went() {
+        let saved = PathBuf::from("/b/20260913T024200Z");
+        let failure = |kind, msg: &str, replaced| Failure {
+            error: std::io::Error::new(kind, msg.to_string()),
+            replaced,
+            planned: 7,
+        };
+        assert_eq!(
+            restore_failure_note(&failure(std::io::ErrorKind::PermissionDenied, "read-only", 3), &saved),
+            "restore failed after replacing 3 of 7 files: read-only; the files it replaced are in /b/20260913T024200Z"
+        );
+        assert_eq!(
+            restore_failure_note(&failure(std::io::ErrorKind::PermissionDenied, "read-only", 0), &saved),
+            "restore not started: read-only"
+        );
+        assert_eq!(
+            restore_failure_note(&failure(std::io::ErrorKind::AlreadyExists, "backup directory /b/x already exists", 0), &saved),
+            "restore not started: backup directory /b/x already exists — wait a second and press again"
+        );
+    }
+
     /// The blocker constants are button captions; the note line wants a
     /// lowercase fragment, not a capitalised sentence mid-sentence.
     #[test]
@@ -441,7 +583,8 @@ mod tests {
         assert_eq!(blocker_note(NO_PROFILE), "no EVE profile directory found");
         assert_eq!(blocker_note(NO_SELECTION), "pick a character to copy from");
         assert_eq!(blocker_note(NO_ACCOUNT_SELECTION), "pick an account to copy from");
-        for constant in [RUNNING_CLIENT, ONE_CHARACTER, NO_PROFILE, NO_SELECTION, NO_ACCOUNT_SELECTION] {
+        assert_eq!(blocker_note(EMPTY_SOURCE), "the selected character's file is empty");
+        for constant in [RUNNING_CLIENT, ONE_CHARACTER, NO_PROFILE, NO_SELECTION, NO_ACCOUNT_SELECTION, EMPTY_SOURCE] {
             let note = blocker_note(constant);
             assert!(!note.starts_with(|c: char| c.is_uppercase()), "{note}");
             assert!(!note.ends_with('.'), "{note}");
@@ -462,6 +605,104 @@ mod tests {
         assert!(!s.fetching);
         s.names_arrived(Names::from([(1, "One".to_string())]), None);
         assert_eq!(s.names_error, None, "every asked id has a name now");
+    }
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("yutani-characters-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A fake `/proc`: `<pid>/comm` and `<pid>/cmdline` under `root`.
+    fn fake_process(root: &Path, pid: u32, comm: &str, argv: &[&str]) {
+        let dir = root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("comm"), format!("{comm}\n")).unwrap();
+        let mut cmdline = Vec::new();
+        for a in argv {
+            cmdline.extend_from_slice(a.as_bytes());
+            cmdline.push(0);
+        }
+        std::fs::write(dir.join("cmdline"), cmdline).unwrap();
+    }
+
+    fn patterns() -> Vec<String> {
+        vec!["exefile.exe".into(), "eve-online.exe".into()]
+    }
+
+    /// The window is gone but `exefile.exe` is not: the process walk sees
+    /// it by `comm` or by argv[0], for our uid only, in or out of the slice.
+    #[test]
+    fn running_eve_processes_are_found_by_comm_or_argv0_for_our_uid() {
+        let root = tmpdir("proc");
+        let uid = crate::ipc::uid();
+        fake_process(&root, 300, "wineserver", &["wineserver"]);
+        fake_process(&root, 100, "exefile.exe", &["C:\\CCP\\EVE\\tq\\bin64\\exefile.exe"]);
+        fake_process(&root, 200, "wine64-preloader", &["/pfx/drive_c/EVE/eve-online.exe", "--x"]);
+        std::fs::create_dir_all(root.join("self")).unwrap();
+        std::fs::write(root.join("self/comm"), "exefile.exe\n").unwrap();
+        assert_eq!(
+            running_eve_processes(&root, &patterns(), uid),
+            vec![(100, "exefile.exe".to_string()), (200, "eve-online.exe".to_string())]
+        );
+        assert_eq!(running_eve_processes(&root, &patterns(), uid + 1), vec![], "another user's client is not ours");
+        assert_eq!(running_eve_processes(&root.join("nowhere"), &patterns(), uid), vec![]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A file written inside the window is one a client may still be
+    /// writing; a clock-skewed future mtime outside it is not.
+    #[test]
+    fn a_file_written_a_moment_ago_is_a_recent_write() {
+        let now = SystemTime::now();
+        let mut listing = Listing { dir: PathBuf::from("/p"), characters: vec![entry(1, 60, now), entry(2, 1, now)], accounts: vec![] };
+        assert_eq!(recent_write(&listing, now).map(|e| e.id), Some(2));
+        listing.characters[1].modified = now - Duration::from_secs(3);
+        assert_eq!(recent_write(&listing, now), None, "the window is 3 s");
+        listing.accounts.push(entry(10, 2, now));
+        assert_eq!(recent_write(&listing, now).map(|e| e.id), Some(10), "accounts count too");
+        listing.accounts[0].modified = now + Duration::from_secs(120);
+        assert_eq!(recent_write(&listing, now), None, "far in the future: clock skew, not a write");
+        listing.accounts[0].modified = now + Duration::from_secs(1);
+        assert_eq!(recent_write(&listing, now).map(|e| e.id), Some(10), "just in the future: a write");
+    }
+
+    /// Both conditions on the button press, each named: the process first,
+    /// then a fresh write — re-read from disk, since the listing the page
+    /// holds can be minutes old.
+    #[test]
+    fn the_press_is_refused_while_a_client_runs_or_just_wrote_a_file() {
+        let root = tmpdir("press");
+        let (proc_root, profile) = (root.join("proc"), root.join("profile"));
+        std::fs::create_dir_all(&proc_root).unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("core_char_1.dat"), b"~").unwrap();
+        std::fs::write(profile.join("core_char_2.dat"), b"~").unwrap();
+        let uid = crate::ipc::uid();
+        let now = SystemTime::now();
+        // The listing says both files are an hour old; the disk says now.
+        let stale = Listing {
+            dir: profile.clone(),
+            characters: vec![entry(1, 3600, now), entry(2, 3600, now)],
+            accounts: vec![],
+        };
+        let note = write_blocker(&stale, &patterns(), &proc_root, uid, now).expect("fresh on disk");
+        assert!(note.contains("core_char_") && note.contains("a moment ago") && note.contains("press again"), "{note}");
+        assert!(!note.starts_with(|c: char| c.is_uppercase()) && !note.ends_with('.'), "{note}");
+
+        fake_process(&proc_root, 4242, "exefile.exe", &["exefile.exe"]);
+        let note = write_blocker(&stale, &patterns(), &proc_root, uid, now).expect("process alive");
+        assert!(note.contains("exefile.exe") && note.contains("4242") && note.contains("press again"), "{note}");
+        assert!(!note.starts_with(|c: char| c.is_uppercase()) && !note.ends_with('.'), "{note}");
+
+        std::fs::remove_dir_all(proc_root.join("4242")).unwrap();
+        let old = now - Duration::from_secs(60);
+        for name in ["core_char_1.dat", "core_char_2.dat"] {
+            std::fs::File::open(profile.join(name)).unwrap().set_modified(old).unwrap();
+        }
+        assert_eq!(write_blocker(&stale, &patterns(), &proc_root, uid, now), None, "no process, nothing fresh");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Offline at first open must not mean numbers forever: a reply that

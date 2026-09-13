@@ -1529,6 +1529,11 @@ impl App {
             return self.settings_note(characters::blocker_note(reason));
         }
         let Some(listing) = state.characters.listing.as_ref() else { return };
+        // The toplevel list empties when the window closes; the process
+        // outlives it and writes these files while it exits.
+        if let Some(reason) = characters::write_blocker_now(listing, &self.config.tunnel.adopt_processes) {
+            return self.settings_note(reason);
+        }
         let Some(character) = state.characters.selected_character() else {
             return self.settings_note(characters::blocker_note(characters::NO_SELECTION));
         };
@@ -1566,6 +1571,9 @@ impl App {
         else {
             return self.settings_note("nothing to restore".to_string());
         };
+        if let Some(reason) = characters::write_blocker_now(listing, &self.config.tunnel.adopt_processes) {
+            return self.settings_note(reason);
+        }
         let dir = listing.dir.clone();
         let backups = copy::backups_dir(&dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")));
         let saved = backups.join(copy::backup_name(SystemTime::now()));
@@ -1577,14 +1585,17 @@ impl App {
             Ok(targets) if targets.is_empty() => {
                 format!("nothing to restore: no file in {} is in {}", backup.display(), dir.display())
             }
-            Ok(targets) => match copy::backup_files(&targets, &saved).and_then(|_| copy::restore(&backup, &dir)) {
+            Ok(targets) => match copy::backup_files(&targets, &saved)
+                .map_err(|error| copy::Failure { error, replaced: 0, planned: targets.len() })
+                .and_then(|_| copy::restore(&backup, &dir))
+            {
                 Ok(n) => format!(
                     "restored {n} file{} from {}; the files it replaced are in {}",
                     if n == 1 { "" } else { "s" },
                     backup.display(),
                     saved.display()
                 ),
-                Err(e) => format!("restore failed: {e}"),
+                Err(e) => characters::restore_failure_note(&e, &saved),
             },
         };
         self.settings_note(note);

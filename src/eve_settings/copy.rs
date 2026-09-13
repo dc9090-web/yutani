@@ -87,6 +87,11 @@ pub fn plan(listing: &Listing, character: u64, account: Option<u64>) -> Result<P
     Ok(Plan { source_character, source_account, targets })
 }
 
+/// The file inside a backup directory naming the profile directory its
+/// `.dat`s came from: not a settings file name, so [`restore_plan`]
+/// never treats it as one, and the reason it refuses another profile.
+pub const PROFILE_TAG: &str = "profile.txt";
+
 /// `<data dir>/yutani/backups`.
 pub fn backups_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("yutani").join("backups")
@@ -111,20 +116,39 @@ pub fn backup_name(now: SystemTime) -> String {
 }
 
 /// Write `from`'s bytes over `to` via a sibling temporary and a rename;
-/// the temporary never survives a failure of either step.
+/// the temporary never survives a failure of either step. The temporary
+/// is fsynced before the rename: without that, a crash or power loss
+/// shortly after a copy can leave the new file *and* its backup (which
+/// goes through this same path) zero-length on filesystems without
+/// ext4's `auto_da_alloc` — the one case the two-phase design cannot
+/// recover from, since Restore would have nothing good to put back.
 fn replace_via_tmp(from: &Path, to: &Path) -> std::io::Result<()> {
     let tmp = to.with_extension("tmp");
-    let result = std::fs::copy(from, &tmp).and_then(|_| std::fs::rename(&tmp, to));
+    let result = std::fs::copy(from, &tmp)
+        .and_then(|_| std::fs::File::open(&tmp)?.sync_all())
+        .and_then(|_| std::fs::rename(&tmp, to));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
+        return result;
     }
-    result
+    // The directory too, so the rename itself is on disk. Best effort:
+    // the file is already in place and its bytes are durable, and some
+    // filesystems refuse to fsync a directory — that must not turn a
+    // finished copy into a reported failure.
+    if let Some(dir) = to.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+            tracing::debug!("cannot fsync {}: {e}", dir.display());
+        }
+    }
+    Ok(())
 }
 
 /// Copy each of `files` into a freshly created `backup` directory under
 /// its own name; returns how many. The directory must not exist yet — a
 /// second run into the same directory would overwrite the originals it
-/// holds with the files that already replaced them.
+/// holds with the files that already replaced them. The profile
+/// directory (the files' parent) is written to [`PROFILE_TAG`] so a
+/// restore into a different profile can be refused.
 pub fn backup_files(files: &[PathBuf], backup: &Path) -> std::io::Result<usize> {
     if let Some(parent) = backup.parent() {
         std::fs::create_dir_all(parent)?;
@@ -136,6 +160,9 @@ pub fn backup_files(files: &[PathBuf], backup: &Path) -> std::io::Result<usize> 
             e
         }
     })?;
+    if let Some(dir) = files.first().and_then(|f| f.parent()) {
+        std::fs::write(backup.join(PROFILE_TAG), format!("{}\n", dir.display()))?;
+    }
     let mut saved = 0;
     for file in files {
         let name = file.file_name().ok_or_else(|| std::io::Error::other("target has no file name"))?;
@@ -194,6 +221,18 @@ pub fn latest_backup(backups: &Path) -> Option<PathBuf> {
 /// Pass this to [`backup_files`] to save the live files before a restore
 /// overwrites them.
 pub fn restore_plan(backup: &Path, dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    // The same character ids exist in every profile of the same accounts,
+    // so a backup taken from another profile (before `eve_settings_dir`
+    // changed, say) would restore cleanly and wrongly. A backup without
+    // the tag predates it and is trusted as before.
+    if let Ok(tagged) = std::fs::read_to_string(backup.join(PROFILE_TAG)) {
+        if tagged.trim() != dir.display().to_string() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("backup {} was taken from {}, not {}", backup.display(), tagged.trim(), dir.display()),
+            ));
+        }
+    }
     let mut targets = Vec::new();
     for entry in std::fs::read_dir(backup)? {
         let entry = entry?;
@@ -216,20 +255,18 @@ pub fn restore_plan(backup: &Path, dir: &Path) -> std::io::Result<Vec<PathBuf>> 
 
 /// Copy every settings file in `backup` back over the file of the same
 /// name in `dir`; returns how many. Backup entries with no counterpart in
-/// `dir` are skipped (see [`restore_plan`]).
-pub fn restore(backup: &Path, dir: &Path) -> std::io::Result<usize> {
+/// `dir` are skipped (see [`restore_plan`]). A failure says how far it
+/// got, like [`execute`]: the live files already replaced are only in
+/// the pre-restore backup, and the note has to say so.
+pub fn restore(backup: &Path, dir: &Path) -> Result<usize, Failure> {
+    let targets = restore_plan(backup, dir).map_err(|error| Failure { error, replaced: 0, planned: 0 })?;
+    let planned = targets.len();
     let mut restored = 0;
-    for entry in std::fs::read_dir(backup)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name.to_str().and_then(parse_file_name).is_none() || !entry.path().is_file() {
-            continue;
+    for to in &targets {
+        let name = to.file_name().ok_or_else(|| std::io::Error::other("target has no file name"));
+        if let Err(error) = name.and_then(|name| replace_via_tmp(&backup.join(name), to)) {
+            return Err(Failure { error, replaced: restored, planned });
         }
-        let to = dir.join(&name);
-        if !to.is_file() {
-            continue;
-        }
-        replace_via_tmp(&entry.path(), &to)?;
         restored += 1;
     }
     Ok(restored)
@@ -449,6 +486,60 @@ mod tests {
         assert_eq!(restore(&backup, &dir).unwrap(), 1);
         assert_eq!(std::fs::read(dir.join("core_char_1.dat")).unwrap(), b"old");
         assert!(!dir.join("core_char_2.dat").exists(), "not brought back from the dead");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A restore that dies part-way says how far it got — the note needs
+    /// `replaced` and `planned` like a failed copy, because the live files
+    /// it did replace are only in the pre-restore backup.
+    #[test]
+    fn a_restore_that_fails_part_way_reports_how_many_it_replaced() {
+        let dir = tmpdir("restore-partial");
+        let backup = dir.join("b");
+        std::fs::create_dir_all(&backup).unwrap();
+        for name in ["core_char_1.dat", "core_char_2.dat", "core_char_3.dat"] {
+            std::fs::write(dir.join(name), b"live").unwrap();
+            std::fs::write(backup.join(name), b"old").unwrap();
+        }
+        // The second target's temporary is a directory: the copy into it fails.
+        std::fs::create_dir(dir.join("core_char_2.tmp")).unwrap();
+        let err = restore(&backup, &dir).unwrap_err();
+        assert_eq!((err.replaced, err.planned), (1, 3), "{}", err.error);
+        assert_eq!(std::fs::read(dir.join("core_char_1.dat")).unwrap(), b"old");
+        assert_eq!(std::fs::read(dir.join("core_char_2.dat")).unwrap(), b"live", "not touched");
+        assert_eq!(std::fs::read(dir.join("core_char_3.dat")).unwrap(), b"live", "stopped at the failure");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A backup records the profile it came from, and a restore into a
+    /// different profile is refused: the same character ids exist in
+    /// every profile of the same accounts, so after a change of
+    /// `eve_settings_dir` the newest backup would otherwise be profile
+    /// A's originals written silently into profile B.
+    #[test]
+    fn a_backup_is_tagged_with_its_profile_and_restores_only_into_it() {
+        let dir = tmpdir("profile-tag");
+        let (a, b) = (dir.join("settings_Default"), dir.join("settings_Other"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("core_char_1.dat"), b"a").unwrap();
+        std::fs::write(b.join("core_char_1.dat"), b"b").unwrap();
+        let backup = dir.join("backups").join("20260913T024100Z");
+        assert_eq!(backup_files(&[a.join("core_char_1.dat")], &backup).unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(backup.join(PROFILE_TAG)).unwrap().trim(), a.display().to_string());
+        assert_eq!(restore_plan(&backup, &a).unwrap(), vec![a.join("core_char_1.dat")]);
+        let err = restore_plan(&backup, &b).unwrap_err();
+        assert!(err.to_string().contains("settings_Default") && err.to_string().contains("settings_Other"), "{err}");
+        let err = restore(&backup, &b).unwrap_err();
+        assert_eq!((err.replaced, err.planned), (0, 0));
+        assert_eq!(std::fs::read(b.join("core_char_1.dat")).unwrap(), b"b", "untouched");
+        // execute's backup is tagged the same way.
+        std::fs::write(a.join("core_char_2.dat"), b"a2").unwrap();
+        let listing = super::super::list(&a).unwrap();
+        let backup2 = dir.join("backups").join("20260913T024200Z");
+        execute(&plan(&listing, 1, None).unwrap(), &backup2).unwrap();
+        assert_eq!(std::fs::read_to_string(backup2.join(PROFILE_TAG)).unwrap().trim(), a.display().to_string());
+        assert!(restore_plan(&backup2, &b).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
