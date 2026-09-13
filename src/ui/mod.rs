@@ -777,7 +777,8 @@ impl App {
             return;
         };
         let (position, pinned) = (client.position, client.pinned);
-        let Some(output) = self.output_name_of(handle) else { return };
+        // Under the output the surface is actually on (see `recorded_output`).
+        let Some(output) = rules::recorded_output(&client.output, self.output_name_of(handle)) else { return };
         self.layout
             .thumbs
             .insert(name, ThumbPos { output, x: position.0, y: position.1, pinned });
@@ -786,6 +787,11 @@ impl App {
 
     /// If we have a saved position for this character, move there. Floating
     /// only: in dock mode the saved spot applies when (if) the mode changes.
+    /// The same resolution as `reposition_to_layout`: a layer surface is
+    /// bound to one output for life, so a saved spot on another output
+    /// (the thumbnail went up on the client's own output while the name
+    /// was unknown) is a destroy + recreate there, not a `set_margin` that
+    /// would put DP-2 coordinates on DP-1.
     fn apply_saved_position(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {
         if self.config.mode == Mode::Dock {
             return Task::none();
@@ -793,14 +799,22 @@ impl App {
         let Some(client) = self.clients.get(handle) else { return Task::none() };
         let Login::LoggedIn(name) = &client.info.login else { return Task::none() };
         let Some(saved) = self.layout.thumbs.get(name).cloned() else { return Task::none() };
+        let connected: Vec<String> = self.outputs.iter().map(|o| o.name.clone()).collect();
+        let Some(p) = layout::placement(&saved, &connected, &client.output) else { return Task::none() };
         let client = self.clients.get_mut(handle).unwrap();
-        client.position = (saved.x, saved.y);
-        client.pinned = saved.pinned;
+        client.position = (p.x, p.y);
+        client.pinned = p.pinned;
         let surface = client.surface;
         match surface {
+            // `output_for_thumb` now resolves to the saved output, so the
+            // reconcile recreates it there.
+            Some(_) if p.recreate => {
+                let destroy = self.destroy_surface(handle);
+                Task::batch([destroy, self.reconcile_surfaces()])
+            }
             // A drag canvas surface must keep its enlarged size until the
             // drag ends; a margin here would shrink it out from under the drag.
-            Some(id) if !self.in_canvas(id) => set_margin(id, saved.y, 0, 0, saved.x),
+            Some(id) if !self.in_canvas(id) => set_margin(id, p.y, 0, 0, p.x),
             _ => Task::none(),
         }
     }
@@ -2147,6 +2161,32 @@ mod tests {
         let (how, _task) = app.handle_request(&crate::ipc::Request::Status, &reply);
         assert!(matches!(how, Reply::Later), "answered on the update thread");
         assert!(rx.try_recv().is_err(), "the reply must come from the task, not from this call");
+    }
+
+    /// [I4] A character logs in on DP-1 (its thumbnail is created there,
+    /// on the client's own output) with a saved position on DP-2. When the
+    /// name resolves, the saved x/y must not be applied with a margin on
+    /// DP-1 — a layer surface is bound to one output for life — but the
+    /// surface destroyed and recreated on DP-2, as applying a layout does.
+    #[test]
+    fn a_saved_position_on_another_output_recreates_the_surface_there() {
+        let fake = Fake::new();
+        let mut app = app(Config { mode: Mode::Floating, visibility: Visibility::Always, ..Config::default() });
+        let dp1 = add_output(&mut app, &fake, "DP-1");
+        let _dp2 = add_output(&mut app, &fake, "DP-2");
+        app.layout.thumbs.insert("Aria".into(), ThumbPos { output: "DP-2".into(), x: 100, y: 100, pinned: false });
+        let a = fake.handle();
+        let _ = app.on_backend(Event::ClientAdded(a.clone(), info(true, vec![dp1])));
+        let before = surface_of(&app, &a).expect("shown");
+        assert_eq!(app.clients[&a].output, "DP-1", "created on the client's own output while unnamed");
+
+        app.clients.get_mut(&a).unwrap().info.login = Login::LoggedIn("Aria".into());
+        let _ = app.apply_saved_position(&a);
+
+        let client = &app.clients[&a];
+        assert_eq!(client.output, "DP-2", "the thumbnail belongs on the saved output");
+        assert_eq!(client.position, (100, 100));
+        assert!(client.surface.is_some_and(|id| id != before), "recreated, not margin-moved");
     }
 
     /// [I3] The watcher's answer to a `config.ron` that does not parse:

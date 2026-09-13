@@ -76,6 +76,16 @@ pub fn choose_position(
     (next, false)
 }
 
+/// The connector a dragged thumbnail's position is saved under: the output
+/// its surface was created on (`surface_output`, empty when it has none),
+/// else the one the layout resolves for the character. The two differ when
+/// the surface went up on a fallback output before its saved connector was
+/// plugged in; recording the resolved one would file DP-1 coordinates
+/// under DP-2.
+pub fn recorded_output(surface_output: &str, resolved: Option<String>) -> Option<String> {
+    if surface_output.is_empty() { resolved } else { Some(surface_output.to_string()) }
+}
+
 /// Which capture command (if any) brings the backend in line with `show`:
 /// `Some(true)` = pause, `Some(false)` = resume, `None` = already there.
 /// Keyed on the backend's actual paused state, not on whether a surface
@@ -165,6 +175,17 @@ mod tests {
         assert_eq!(grace_after_update(false, false, true), (false, true));
         // Long gone.
         assert_eq!(grace_after_update(false, false, false), (false, false));
+    }
+
+    /// [I4] A drag is saved under the output the surface is actually on,
+    /// not the one the layout would resolve for the character now (the two
+    /// differ when a connector appeared after the surface was created);
+    /// only a surface with no recorded output falls back to the layout's.
+    #[test]
+    fn a_position_is_recorded_under_the_output_the_surface_is_on() {
+        assert_eq!(recorded_output("DP-1", Some("DP-2".into())), Some("DP-1".to_string()));
+        assert_eq!(recorded_output("", Some("DP-2".into())), Some("DP-2".to_string()));
+        assert_eq!(recorded_output("", None), None);
     }
 
     #[test]
