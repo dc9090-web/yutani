@@ -71,7 +71,8 @@ also writes two `.desktop` files into `~/.local/share/applications/`:
 
 | Daemon / tunnel state | Icon | Treatment (handoff table) |
 |---|---|---|
-| daemon running, tunnel connected & handshake < 180 s | `y-symbolic` | plain |
+| daemon running, tunnel connected & handshake < 180 s, **≥ 1 EVE client** | `y-color` | the blue `#0A5CFF` mark, **not** symbolic — it keeps its own colour on the panel |
+| daemon running, tunnel connected & handshake < 180 s, no client running | `y-symbolic` | plain |
 | daemon running, tunnel disconnected (deliberately) | `y-symbolic` | plain |
 | tunnel connecting/disconnecting (unit activating/deactivating, ≤ 10 s) | `y-sync-symbolic` | spinner badge, 1.1 s rotation |
 | tunnel up but no handshake for ≥ 180 s (including one that never handshaked at all), or unit failed | `y-attention-symbolic` | attention badge |
@@ -79,6 +80,17 @@ also writes two `.desktop` files into `~/.local/share/applications/`:
 
 Button 26×26, radius 7, hover/active fills per handoff; sibling gap is the
 panel's.
+
+The blue row is the one departure from the handoff, which reserves
+`y-color` for the launcher. It is deliberate (approved 2026-09-13): the
+panel says at a glance whether Yutani is *doing* its job — tunnel up,
+healthy, and EVE behind it — not merely ready to. It is the only state
+drawn with `symbolic(false)`, because a symbolic tint would take the blue
+straight off it; it is still installed to `scalable/apps` and never among
+the symbolic icons. `icon_state` therefore takes the client count
+(`icon_state(tunnel, clients, pending)`): pending, a failed unit and a
+stale (or missing) handshake all outrank it, and 0 clients falls back to
+the plain mark.
 
 Two `TunnelStatus` fields exist for this table and nothing else, both
 `#[serde(default)]` so an older daemon's `status` reply still parses in a

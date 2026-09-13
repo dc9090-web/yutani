@@ -27,10 +27,12 @@ pub const SCALABLE_DIR: &str = "scalable/apps";
 /// What `yutani applet install` copies into `~/.local/share/icons/hicolor`:
 /// the directory under that root, the file name, and the bytes.
 ///
-/// The blue `y-color.svg` is deliberately *not* among the symbolic ones —
-/// the handoff calls it the app/launcher icon and says never to ship it as
-/// the panel mark, and anything under `symbolic/` is fair game for the
-/// shell to recolour, which would throw its blue away.
+/// The blue `y-color.svg` is deliberately *not* among the symbolic ones:
+/// anything under `symbolic/` is fair game for the shell to recolour, which
+/// would throw its blue away. It is the launcher icon — and, since the
+/// `IconState::Active` state (spec §3), the panel mark for a tunnel that is
+/// up with EVE behind it, which the applet draws from these bytes with
+/// `symbolic(false)` rather than by icon-theme name.
 pub const ICONS: [(&str, &str, &[u8]); 5] = [
     (SYMBOLIC_DIR, "y-symbolic.svg", Y_SYMBOLIC),
     (SYMBOLIC_DIR, "y-symbolic-dark.svg", Y_SYMBOLIC_DARK),

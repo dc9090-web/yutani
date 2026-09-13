@@ -116,11 +116,15 @@ fn divider<'a>(padding: cosmic::iced::Padding) -> Element<'a, Msg> {
 
 /// The Y mark in the panel: the state's icon, tinted by the panel theme
 /// (`symbolic(true)` + `applet::style()`'s `icon_color`), dimmed to 38 %
-/// when there is no daemon or no tunnel.
+/// when there is no daemon or no tunnel — except the Active state, which
+/// keeps its own blue (`IconState::symbolic`).
 pub fn panel_button(state: &Applet) -> Element<'_, Msg> {
-    let icon = icon_state(state.status.as_ref().map(|s| &s.tunnel), state.pending());
+    let clients = state.status.as_ref().map_or(0, |s| s.clients.len());
+    let icon = icon_state(state.status.as_ref().map(|s| &s.tunnel), clients, state.pending());
     let (w, h) = state.core.applet.suggested_size(true);
-    let mark = widget::icon(widget::icon::from_svg_bytes(icon.bytes()).symbolic(true))
+    // `symbolic(false)` for the Active state only: it is the full-colour
+    // `y-color` mark, and the panel's tint would take its blue off.
+    let mark = widget::icon(widget::icon::from_svg_bytes(icon.bytes()).symbolic(icon.symbolic()))
         .width(Length::Fixed(f32::from(w)))
         .height(Length::Fixed(f32::from(h)))
         .opacity(icon.opacity());

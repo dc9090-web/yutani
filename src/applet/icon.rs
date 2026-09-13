@@ -9,6 +9,10 @@ pub const HANDSHAKE_STALE_S: u64 = 180;
 pub enum IconState {
     /// The plain mark: connected and healthy, or deliberately disconnected.
     Plain,
+    /// The blue mark: the tunnel is connected *and* there is an EVE client
+    /// behind it. It is the one state where Yutani is doing its whole job,
+    /// and the only one that keeps a colour of its own on the panel.
+    Active,
     /// Ring badge: an action is in flight, or the tunnel has just come up
     /// and is still handshaking.
     Sync,
@@ -26,6 +30,7 @@ impl IconState {
         match self {
             IconState::Sync => "y-sync-symbolic",
             IconState::Attention => "y-attention-symbolic",
+            IconState::Active => "y-color",
             IconState::Plain | IconState::Dim => "y-symbolic",
         }
     }
@@ -34,18 +39,30 @@ impl IconState {
         if self == IconState::Dim { super::theme::DIM_OPACITY } else { 1.0 }
     }
 
+    /// Whether the panel may recolour this icon to its own ink. Every state
+    /// but [`IconState::Active`] is a single-colour mark that *should*
+    /// follow the panel; `Active` is the full-colour `y-color` mark, and
+    /// drawing it symbolic would tint its blue away — which is the entire
+    /// point of the state.
+    pub fn symbolic(self) -> bool {
+        self != IconState::Active
+    }
+
     pub fn bytes(self) -> &'static [u8] {
         match self {
             IconState::Sync => crate::assets::Y_SYNC_SYMBOLIC,
             IconState::Attention => crate::assets::Y_ATTENTION_SYMBOLIC,
+            IconState::Active => crate::assets::Y_COLOR,
             IconState::Plain | IconState::Dim => crate::assets::Y_SYMBOLIC,
         }
     }
 }
 
-/// `tunnel` is `None` when the daemon did not answer. `pending` is true for
+/// `tunnel` is `None` when the daemon did not answer. `clients` is how many
+/// EVE clients the daemon is tracking — it is what separates the blue
+/// [`IconState::Active`] mark from the plain one. `pending` is true for
 /// [`super::PENDING_S`] after a `tunnel connect|disconnect` was sent.
-pub fn icon_state(tunnel: Option<&TunnelStatus>, pending: bool) -> IconState {
+pub fn icon_state(tunnel: Option<&TunnelStatus>, clients: usize, pending: bool) -> IconState {
     let Some(t) = tunnel else { return IconState::Dim };
     if !t.installed {
         return IconState::Dim;
@@ -74,6 +91,10 @@ pub fn icon_state(tunnel: Option<&TunnelStatus>, pending: bool) -> IconState {
             }
         }
         (true, Some(age)) if age >= HANDSHAKE_STALE_S => IconState::Attention,
+        // A healthy tunnel with EVE behind it: the one state worth a
+        // colour. With nothing running the tunnel is merely ready, which is
+        // the plain mark — the panel must not claim more than is true.
+        (true, Some(_)) if clients > 0 => IconState::Active,
         (true, Some(_)) => IconState::Plain,
     }
 }
@@ -110,30 +131,30 @@ mod tests {
 
     #[test]
     fn no_daemon_and_no_tunnel_are_both_dim() {
-        assert_eq!(icon_state(None, false), IconState::Dim);
-        assert_eq!(icon_state(Some(&tunnel(false, false, None)), false), IconState::Dim);
+        assert_eq!(icon_state(None, 0, false), IconState::Dim);
+        assert_eq!(icon_state(Some(&tunnel(false, false, None)), 0, false), IconState::Dim);
         // Even a pending action cannot brighten a missing daemon.
-        assert_eq!(icon_state(None, true), IconState::Dim);
+        assert_eq!(icon_state(None, 0, true), IconState::Dim);
     }
 
     #[test]
     fn a_pending_action_shows_the_sync_icon() {
-        assert_eq!(icon_state(Some(&tunnel(true, false, None)), true), IconState::Sync);
-        assert_eq!(icon_state(Some(&tunnel(true, true, Some(3))), true), IconState::Sync);
+        assert_eq!(icon_state(Some(&tunnel(true, false, None)), 0, true), IconState::Sync);
+        assert_eq!(icon_state(Some(&tunnel(true, true, Some(3))), 0, true), IconState::Sync);
     }
 
     #[test]
     fn a_deliberate_disconnect_and_a_fresh_handshake_are_both_plain() {
-        assert_eq!(icon_state(Some(&tunnel(true, false, None)), false), IconState::Plain);
-        assert_eq!(icon_state(Some(&tunnel(true, true, Some(0))), false), IconState::Plain);
-        assert_eq!(icon_state(Some(&tunnel(true, true, Some(179))), false), IconState::Plain);
+        assert_eq!(icon_state(Some(&tunnel(true, false, None)), 0, false), IconState::Plain);
+        assert_eq!(icon_state(Some(&tunnel(true, true, Some(0))), 0, false), IconState::Plain);
+        assert_eq!(icon_state(Some(&tunnel(true, true, Some(179))), 0, false), IconState::Plain);
     }
 
     #[test]
     fn up_without_a_handshake_syncs_and_a_stale_handshake_demands_attention() {
-        assert_eq!(icon_state(Some(&tunnel(true, true, None)), false), IconState::Sync);
-        assert_eq!(icon_state(Some(&tunnel(true, true, Some(180))), false), IconState::Attention);
-        assert_eq!(icon_state(Some(&tunnel(true, true, Some(6_000))), false), IconState::Attention);
+        assert_eq!(icon_state(Some(&tunnel(true, true, None)), 0, false), IconState::Sync);
+        assert_eq!(icon_state(Some(&tunnel(true, true, Some(180))), 0, false), IconState::Attention);
+        assert_eq!(icon_state(Some(&tunnel(true, true, Some(6_000))), 0, false), IconState::Attention);
     }
 
     /// The sync badge is for a tunnel that is *settling*, so it has to be
@@ -141,15 +162,15 @@ mod tests {
     /// single handshake is not handshaking, it is broken.
     #[test]
     fn a_link_that_never_handshakes_stops_syncing_and_demands_attention() {
-        assert_eq!(icon_state(Some(&never_handshaked(Some(0))), false), IconState::Sync);
-        assert_eq!(icon_state(Some(&never_handshaked(Some(179))), false), IconState::Sync);
-        assert_eq!(icon_state(Some(&never_handshaked(Some(180))), false), IconState::Attention);
-        assert_eq!(icon_state(Some(&never_handshaked(Some(9_000))), false), IconState::Attention);
+        assert_eq!(icon_state(Some(&never_handshaked(Some(0))), 0, false), IconState::Sync);
+        assert_eq!(icon_state(Some(&never_handshaked(Some(179))), 0, false), IconState::Sync);
+        assert_eq!(icon_state(Some(&never_handshaked(Some(180))), 0, false), IconState::Attention);
+        assert_eq!(icon_state(Some(&never_handshaked(Some(9_000))), 0, false), IconState::Attention);
         // A pending connect still owns the icon for its own 10 s.
-        assert_eq!(icon_state(Some(&never_handshaked(Some(9_000))), true), IconState::Sync);
+        assert_eq!(icon_state(Some(&never_handshaked(Some(9_000))), 0, true), IconState::Sync);
         // An older daemon sends no uptime at all; with nothing to time out
         // on, it keeps the pre-`up_for_s` behaviour rather than crying wolf.
-        assert_eq!(icon_state(Some(&never_handshaked(None)), false), IconState::Sync);
+        assert_eq!(icon_state(Some(&never_handshaked(None)), 0, false), IconState::Sync);
     }
 
     /// Spec §3: "or unit failed". systemd calling the unit failed outranks
@@ -158,13 +179,49 @@ mod tests {
     #[test]
     fn a_failed_unit_demands_attention_whatever_the_link_looks_like() {
         let failed = |t: TunnelStatus| TunnelStatus { failed: true, ..t };
-        assert_eq!(icon_state(Some(&failed(tunnel(true, false, None))), false), IconState::Attention);
-        assert_eq!(icon_state(Some(&failed(tunnel(true, true, Some(0)))), false), IconState::Attention);
+        assert_eq!(icon_state(Some(&failed(tunnel(true, false, None))), 0, false), IconState::Attention);
+        assert_eq!(icon_state(Some(&failed(tunnel(true, true, Some(0)))), 0, false), IconState::Attention);
         // Nothing is installed: still nothing to show but the dim mark.
-        assert_eq!(icon_state(Some(&failed(tunnel(false, false, None))), false), IconState::Dim);
+        assert_eq!(icon_state(Some(&failed(tunnel(false, false, None))), 0, false), IconState::Dim);
         // A press that is still settling keeps the sync badge — the user
         // just asked for this, and the unit may be on its way back up.
-        assert_eq!(icon_state(Some(&failed(tunnel(true, false, None))), true), IconState::Sync);
+        assert_eq!(icon_state(Some(&failed(tunnel(true, false, None))), 0, true), IconState::Sync);
+    }
+
+    /// The whole point of the blue mark: the tunnel is up, healthy, *and*
+    /// carrying an EVE client. Anything short of all three is not it.
+    #[test]
+    fn the_blue_mark_needs_a_healthy_tunnel_and_a_client_behind_it() {
+        let healthy = tunnel(true, true, Some(21));
+        assert_eq!(icon_state(Some(&healthy), 1, false), IconState::Active);
+        assert_eq!(icon_state(Some(&healthy), 9, false), IconState::Active);
+        // Connected but nothing is running: ready, not active.
+        assert_eq!(icon_state(Some(&healthy), 0, false), IconState::Plain);
+        // Clients but no tunnel: the icon is about the tunnel first.
+        assert_eq!(icon_state(Some(&tunnel(true, false, None)), 3, false), IconState::Plain);
+        // A stale handshake is trouble however many clients are running.
+        assert_eq!(icon_state(Some(&tunnel(true, true, Some(180))), 3, false), IconState::Attention);
+        assert_eq!(icon_state(Some(&never_handshaked(Some(9_000))), 3, false), IconState::Attention);
+        // Still settling, or a press still in flight: sync owns the icon.
+        assert_eq!(icon_state(Some(&never_handshaked(Some(1))), 3, false), IconState::Sync);
+        assert_eq!(icon_state(Some(&healthy), 3, true), IconState::Sync);
+        // A failed unit outranks it, and a missing daemon or tunnel is dim.
+        assert_eq!(icon_state(Some(&TunnelStatus { failed: true, ..healthy.clone() }), 3, false), IconState::Attention);
+        assert_eq!(icon_state(Some(&tunnel(false, false, None)), 3, false), IconState::Dim);
+        assert_eq!(icon_state(None, 3, false), IconState::Dim);
+    }
+
+    /// `y-color` is the only icon the panel must not recolour: it is
+    /// installed to `scalable/apps` precisely because a symbolic tint would
+    /// throw its blue away.
+    #[test]
+    fn only_the_blue_mark_refuses_the_panel_tint() {
+        assert!(!IconState::Active.symbolic());
+        for state in [IconState::Plain, IconState::Sync, IconState::Attention, IconState::Dim] {
+            assert!(state.symbolic(), "{state:?}");
+        }
+        assert_eq!(IconState::Active.bytes(), crate::assets::Y_COLOR);
+        assert_eq!(IconState::Active.opacity(), 1.0);
     }
 
     #[test]
@@ -173,6 +230,12 @@ mod tests {
         assert_eq!(IconState::Sync.icon_name(), "y-sync-symbolic");
         assert_eq!(IconState::Attention.icon_name(), "y-attention-symbolic");
         assert_eq!(IconState::Dim.icon_name(), "y-symbolic");
+        assert_eq!(IconState::Active.icon_name(), "y-color");
+        // Every name is one of the files `applet install` actually writes.
+        for state in [IconState::Plain, IconState::Sync, IconState::Attention, IconState::Dim, IconState::Active] {
+            let file = format!("{}.svg", state.icon_name());
+            assert!(crate::assets::ICONS.iter().any(|(_, n, _)| *n == file), "{file}");
+        }
         assert_eq!(IconState::Plain.opacity(), 1.0);
         assert_eq!(IconState::Dim.opacity(), 0.38);
     }
