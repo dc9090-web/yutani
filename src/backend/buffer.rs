@@ -73,6 +73,12 @@ impl AppData {
             params.add(fd.as_fd(), i as u32, offset, stride, modifier.into());
             planes.push(Plane { fd, plane_idx: i as u32, offset, stride });
         }
+        // `create_immed` makes a rejected dmabuf a fatal protocol error
+        // rather than a `failed` event, and that is deliberate: the format
+        // and modifier come from the compositor's own per-session formats
+        // and gbm chose the modifier from that list, so a rejection is a
+        // compositor bug. Switching to `create` would also need the
+        // `DmabufHandler::created/failed` stubs to become real.
         let (buffer, _) = params.create_immed(
             width as i32,
             height as i32,
