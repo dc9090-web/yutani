@@ -111,14 +111,31 @@ pub fn backup_name(now: SystemTime) -> String {
 }
 
 /// Write `from`'s bytes over `to` via a sibling temporary and a rename;
-/// the temporary never survives a failure of either step.
+/// the temporary never survives a failure of either step. The temporary
+/// is fsynced before the rename: without that, a crash or power loss
+/// shortly after a copy can leave the new file *and* its backup (which
+/// goes through this same path) zero-length on filesystems without
+/// ext4's `auto_da_alloc` — the one case the two-phase design cannot
+/// recover from, since Restore would have nothing good to put back.
 fn replace_via_tmp(from: &Path, to: &Path) -> std::io::Result<()> {
     let tmp = to.with_extension("tmp");
-    let result = std::fs::copy(from, &tmp).and_then(|_| std::fs::rename(&tmp, to));
+    let result = std::fs::copy(from, &tmp)
+        .and_then(|_| std::fs::File::open(&tmp)?.sync_all())
+        .and_then(|_| std::fs::rename(&tmp, to));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
+        return result;
     }
-    result
+    // The directory too, so the rename itself is on disk. Best effort:
+    // the file is already in place and its bytes are durable, and some
+    // filesystems refuse to fsync a directory — that must not turn a
+    // finished copy into a reported failure.
+    if let Some(dir) = to.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+            tracing::debug!("cannot fsync {}: {e}", dir.display());
+        }
+    }
+    Ok(())
 }
 
 /// Copy each of `files` into a freshly created `backup` directory under
