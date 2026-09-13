@@ -29,6 +29,11 @@ pub fn systemctl_argv(verb: &str) -> Vec<String> {
 /// normally connected before EVE is launched. Starting a slice that is
 /// already active is a no-op, and an active slice stays active (and its
 /// cgroup stays put) after every scope under it has exited.
+///
+/// The worker does the same from root (`rules::slice_start_command`) and
+/// is the authority: a failure here is only warned about, so that a
+/// caller whose environment cannot reach the user manager still gets the
+/// tunnel, with the worker's own message if the slice truly cannot exist.
 pub fn slice_start_argv() -> Vec<String> {
     ["systemctl", "--user", "--no-ask-password", "start", SLICE].iter().map(|s| s.to_string()).collect()
 }
@@ -46,7 +51,9 @@ fn systemctl(verb: &str) -> anyhow::Result<()> {
 
 pub fn connect() -> anyhow::Result<()> {
     ensure!(installed(), "tunnel is not installed; run `yutani tunnel install <conf>`");
-    run(&slice_start_argv(), &format!("systemctl --user start {SLICE} (the tunnel's rules key on that slice's cgroup, so it must exist first)"))?;
+    if let Err(e) = run(&slice_start_argv(), &format!("systemctl --user start {SLICE}")) {
+        tracing::warn!("{e:#}; leaving it to the tunnel worker to start the slice");
+    }
     systemctl("start")
 }
 

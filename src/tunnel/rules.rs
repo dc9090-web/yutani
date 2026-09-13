@@ -24,6 +24,29 @@ fn cgroup_match(uid: u32) -> String {
     format!(r#"socket cgroupv2 level 5 "{}""#, cgroup_path(uid))
 }
 
+/// The slice's cgroup directory, which is what nft resolves the path in
+/// [`cgroup_match`] against when the ruleset is loaded.
+pub fn cgroup_dir(uid: u32) -> std::path::PathBuf {
+    std::path::Path::new("/sys/fs/cgroup").join(cgroup_path(uid))
+}
+
+/// Start `yutani-eve.slice` on that user's manager, from root. nft resolves
+/// the `socket cgroupv2` path to a cgroup *id* when the ruleset is loaded
+/// and fails ("Could not parse cgroupsv2 path") if the directory is not
+/// there — and after a reboot nothing has created it until the first
+/// `yutani launch` or adoption, which normally comes after the tunnel.
+///
+/// With `XDG_RUNTIME_DIR` pointing at the user's runtime directory,
+/// `systemctl --user` talks to that manager over its private socket
+/// (`/run/user/<uid>/systemd/private`), which the manager accepts from its
+/// own uid and from root — no user switch, no D-Bus session bus, no
+/// `--machine` transport. Starting a slice that is already active is a
+/// no-op; a started slice stays active, and its cgroup stays put, after
+/// every scope under it has exited.
+pub fn slice_start_command(uid: u32) -> Vec<String> {
+    argv(&["env", &format!("XDG_RUNTIME_DIR=/run/user/{uid}"), "systemctl", "--user", "--no-ask-password", "start", SLICE])
+}
+
 /// `dns_servers` are the resolvers `systemd-resolved` is pointed at for
 /// EVE's domains (see [`resolved_up_commands`]): their DNS traffic is
 /// marked for the tunnel by `setmark`, whoever sends it.
@@ -114,6 +137,20 @@ pub fn nft_ruleset(uid: u32, dns: Option<Ipv4Addr>, dns_servers: &[Ipv4Addr]) ->
     ));
     s.push_str("}\n");
     s
+}
+
+/// [`nft_ruleset`] again, as one atomic replacement of whatever the table
+/// holds. The cgroup match is compiled to a cgroup *id* when the rules are
+/// loaded; if the slice's cgroup is removed and created again (a logout
+/// and login, `systemctl --user stop yutani-eve.slice`) the id changes and
+/// the loaded rules silently match nothing — EVE's packets would go out
+/// unmarked, past the kill-switch. The worker reloads the rules with this
+/// whenever it sees the directory's identity change. `flush table` keeps
+/// the chains and drops every rule; re-declaring the chains with the same
+/// hook is accepted, and the whole file is one transaction, so there is no
+/// instant without rules.
+pub fn nft_reload_ruleset(uid: u32, dns: Option<Ipv4Addr>, dns_servers: &[Ipv4Addr]) -> String {
+    format!("table inet yutani\nflush table inet yutani\n{}", nft_ruleset(uid, dns, dns_servers))
 }
 
 /// Point `systemd-resolved` at the tunnel's resolvers for EVE's domains,
@@ -238,6 +275,31 @@ mod tests {
             "x",
         )
         .unwrap()
+    }
+
+    /// Root starts the slice on the user's own manager over its private
+    /// socket: `systemctl --user` with only `XDG_RUNTIME_DIR` set, no user
+    /// switch. A missing cgroup is what made every post-reboot connect
+    /// fail with "Could not parse cgroupsv2 path" (2026-09-14).
+    #[test]
+    fn the_slice_is_started_on_the_users_manager_over_its_private_socket() {
+        assert_eq!(
+            slice_start_command(1000),
+            ["env", "XDG_RUNTIME_DIR=/run/user/1000", "systemctl", "--user", "--no-ask-password", "start", "yutani-eve.slice"]
+        );
+        assert_eq!(cgroup_dir(1000).to_str().unwrap(), "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice");
+    }
+
+    /// A reload is the same ruleset behind an atomic flush of the table —
+    /// never `delete table`, which would leave an instant with no rules
+    /// and no kill-switch.
+    #[test]
+    fn a_reload_flushes_the_table_and_reloads_the_same_rules_in_one_transaction() {
+        let servers = [Ipv4Addr::new(1, 1, 1, 1)];
+        let reload = nft_reload_ruleset(1000, Some(Ipv4Addr::new(10, 2, 0, 1)), &servers);
+        let fresh = nft_ruleset(1000, Some(Ipv4Addr::new(10, 2, 0, 1)), &servers);
+        assert_eq!(reload, format!("table inet yutani\nflush table inet yutani\n{fresh}"));
+        assert!(!reload.contains("delete"));
     }
 
     #[test]

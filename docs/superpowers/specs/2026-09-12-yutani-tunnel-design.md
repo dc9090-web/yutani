@@ -150,6 +150,20 @@ running the teardown for whatever was already created.
 
 **Up**, in order:
 
+0. **slice** — if `/sys/fs/cgroup/<cgroup path>` does not exist, `env
+   XDG_RUNTIME_DIR=/run/user/<uid> systemctl --user --no-ask-password
+   start yutani-eve.slice` (root reaches the user's manager over its
+   private socket, which accepts uid 0; 5 s bound). nft compiles the
+   `socket cgroupv2` path to a cgroup *id* at load time and refuses a path
+   that is not there, so this must precede step 8. Fails the start, in
+   plain words ("is that user logged in?"), if the slice cannot be
+   started or its cgroup does not appear. The worker records the
+   directory's inode (= cgroup id) and, on every status tick, reloads the
+   ruleset atomically (`table inet yutani; flush table inet yutani;
+   table inet yutani {…}`) if it has changed, or restarts the slice (every
+   5 s) if it is gone — a logout/login would otherwise leave rules that
+   match nothing. (Added 2026-09-14 after the first post-reboot connect
+   failed with "Could not parse cgroupsv2 path".)
 1. `ip link add yutani0 type wireguard`
 2. `wg setconf yutani0 <tmpfile>` — the wg-native subset of
    `/etc/yutani/tunnel.conf` (`[Interface] PrivateKey`, `[Peer] PublicKey,
@@ -417,11 +431,13 @@ everything it would write, so the refusal is visible before the prompt.
   yutani-tunnel.service` (no `sudo`; authorised by the polkit rule).
   Exit 0/1 with systemctl's message on failure. Also IPC requests
   `tunnel connect` / `tunnel disconnect` handled by the daemon the same way.
-  `connect` first runs `systemctl --user start yutani-eve.slice`: nft
-  resolves the `socket cgroupv2` path against the live cgroup tree when
-  the worker loads the ruleset, so the slice's cgroup must already exist
-  (after a reboot nothing else has created it — found 2026-09-14, "Could
-  not parse cgroupsv2 path"). Starting an active slice is a no-op.
+  `connect` first runs `systemctl --user start yutani-eve.slice` (warn
+  only on failure): nft resolves the `socket cgroupv2` path against the
+  live cgroup tree when the worker loads the ruleset, so the slice's
+  cgroup must already exist (after a reboot nothing else has created it —
+  found 2026-09-14, "Could not parse cgroupsv2 path"). The worker is the
+  authority for this (§4, "slice"); this is only the earliest, cheapest
+  place to do it. Starting an active slice is a no-op.
 - `yutani tunnel status` (CLI) prints the same data the `status` IPC
   request returns.
 - **IPC `status`** (new request; reply `ok <json>` on one line):
@@ -501,10 +517,16 @@ the already-running client without a second adoption.
 - Daemon not running: `yutani tunnel connect` still works (it is just
   `systemctl`); the applet shows the daemon-offline state.
 - Reboot: the unit is not enabled; EVE is direct until `connect` (the
-  applet makes that one click). Enabling at boot is a later option (it
-  would need the worker itself to create the slice, e.g. `systemctl
-  --user --machine=<user>@ start yutani-eve.slice`, since `connect`
-  would not run).
+  applet makes that one click). Enabling at boot is a later option; the
+  worker creates the slice itself (§4, "slice"), so it would only need
+  the user to be logged in when the unit starts.
+- Slice cgroup missing at start (nothing has created it since boot):
+  the worker starts it on the user's manager. Slice cgroup removed and
+  recreated while the tunnel is up (logout/login, `systemctl --user stop
+  yutani-eve.slice`): the loaded rules match the old cgroup id, so the
+  worker's tick reloads them atomically for the new one; while it is gone
+  the worker retries the start every 5 s (journal: one warning when it
+  goes, one info line when the rules are reloaded).
 - Other WireGuard tunnels (tailscale is WireGuard-based but uses its own
   table/rules) are unaffected: we use our own interface, table and marks.
 - `install` when the conf changed: overwrites; a running unit must be

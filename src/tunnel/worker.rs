@@ -3,7 +3,7 @@
 //! down on SIGTERM/SIGINT (and on any failure while coming up).
 
 use anyhow::{Context as _, anyhow};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -124,6 +124,10 @@ struct Loaded {
     uid: u32,
     dns_servers: Vec<std::net::Ipv4Addr>,
     dns_domains: Vec<String>,
+    /// The slice's cgroup directory ([`rules::cgroup_dir`]; a scratch
+    /// directory in tests). Its existence and identity are what the nft
+    /// cgroup match depends on — see [`ensure_slice`] and [`SliceWatch`].
+    cgroup_dir: PathBuf,
 }
 
 fn load(conf_path: &Path) -> anyhow::Result<Loaded> {
@@ -131,7 +135,147 @@ fn load(conf_path: &Path) -> anyhow::Result<Loaded> {
     let label = conf_path.file_stem().and_then(|s| s.to_str()).unwrap_or("tunnel");
     let conf = WgConf::parse(&text, label).map_err(|e| anyhow!("{}: {e}", conf_path.display()))?;
     let uid = uid_from_conf(&text).context("conf has no `# yutani: uid = N` line; re-run `yutani tunnel install`")?;
-    Ok(Loaded { conf, uid, dns_servers: dns_servers_from_conf(&text), dns_domains: dns_domains_from_conf(&text) })
+    Ok(Loaded {
+        conf,
+        uid,
+        dns_servers: dns_servers_from_conf(&text),
+        dns_domains: dns_domains_from_conf(&text),
+        cgroup_dir: rules::cgroup_dir(uid),
+    })
+}
+
+/// The identity of the slice's cgroup right now: the directory's inode,
+/// which on cgroup2 is the kernel's cgroup id — the very number nft
+/// compiled the `socket cgroupv2` path into. `None` when the directory is
+/// not there (nothing has created the slice yet, or it has been stopped).
+fn cgroup_ident(dir: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(dir).ok().filter(|m| m.is_dir()).map(|m| m.ino())
+}
+
+/// How long the user's manager may take to start the slice. It answers in
+/// milliseconds; one that does not is not there (the user logged out and
+/// the runtime directory is being torn down) or wedged, and either way
+/// the tick must not hang on it.
+const SLICE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Make sure the slice's cgroup exists before the rules that name it are
+/// loaded, and say which cgroup that is. Nothing to do when it is there
+/// already (the normal case: `connect` starts the slice first, and after
+/// the first EVE launch it stays); otherwise start it on the user's
+/// manager. A start that fails, or that succeeds without the directory
+/// appearing, is fatal to a start and reported in plain words — the
+/// tunnel cannot protect EVE without that cgroup, and the only real cause
+/// is that the user is not logged in.
+fn ensure_slice(x: &dyn Exec, uid: u32, dir: &Path) -> anyhow::Result<u64> {
+    if let Some(id) = cgroup_ident(dir) {
+        return Ok(id);
+    }
+    x.run(&rules::slice_start_command(uid), Some(SLICE_TIMEOUT)).with_context(|| {
+        format!(
+            "cannot start {} on uid {uid}'s user manager (is that user logged in?); the tunnel's rules key on that slice's cgroup, so it must exist first",
+            super::SLICE
+        )
+    })?;
+    cgroup_ident(dir).ok_or_else(|| anyhow!("{} started, but its cgroup {} did not appear", super::SLICE, dir.display()))
+}
+
+/// Load the ruleset again, atomically ([`rules::nft_reload_ruleset`]).
+fn reload_rules(x: &dyn Exec, loaded: &Loaded) -> anyhow::Result<()> {
+    x.run_with_stdin(
+        &["nft".to_string(), "-f".to_string(), "-".to_string()],
+        &rules::nft_reload_ruleset(loaded.uid, loaded.conf.dns, &loaded.dns_servers),
+    )
+}
+
+/// What one look at the slice's cgroup means for rules that were loaded
+/// against `loaded_id`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SliceCheck {
+    /// Same cgroup the rules were compiled for.
+    Unchanged,
+    /// The directory is there but is a different cgroup: it was removed and
+    /// created again, and the loaded rules now match nothing.
+    Recreated(u64),
+    /// The directory is not there at all.
+    Gone,
+}
+
+fn slice_check(loaded_id: u64, now: Option<u64>) -> SliceCheck {
+    match now {
+        Some(id) if id == loaded_id => SliceCheck::Unchanged,
+        Some(id) => SliceCheck::Recreated(id),
+        None => SliceCheck::Gone,
+    }
+}
+
+/// While the slice is gone, how often to try starting it again. Gone means
+/// the user logged out (or stopped the slice by hand); a `systemctl` per
+/// second against a manager that is not there would be noise, and a
+/// five-second wait before EVE can be routed again after a login is not.
+const SLICE_RETRY_S: u64 = 5;
+
+/// `last_attempt` is `None` before the first attempt since the cgroup went
+/// missing, which is made at once.
+fn should_retry_slice(last_attempt: Option<u64>, now: u64) -> bool {
+    last_attempt.is_none_or(|last| now < last || now - last >= SLICE_RETRY_S)
+}
+
+/// One tick's share of keeping the cgroup match true. The rules name the
+/// slice's cgroup by path but were compiled to its id; if that cgroup is
+/// ever removed and recreated while the tunnel is up — a logout and login,
+/// `systemctl --user stop yutani-eve.slice`, a user manager restart — the
+/// rules keep matching the old id, and EVE's packets go out unmarked, past
+/// the kill-switch, on the next launch. So every tick compares the
+/// directory's identity with the one the rules were loaded for: a new one
+/// means reload; a missing one means start the slice again (at most every
+/// [`SLICE_RETRY_S`]) and reload once it is back. A reload that fails is
+/// tried again on the next tick, since the identity still differs.
+struct SliceWatch {
+    id: u64,
+    gone: bool,
+    last_attempt: Option<u64>,
+}
+
+impl SliceWatch {
+    fn new(id: u64) -> Self {
+        SliceWatch { id, gone: false, last_attempt: None }
+    }
+
+    fn tick(&mut self, x: &dyn Exec, loaded: &Loaded, now: u64) {
+        match slice_check(self.id, cgroup_ident(&loaded.cgroup_dir)) {
+            SliceCheck::Unchanged => {}
+            SliceCheck::Recreated(id) => self.reload(x, loaded, id),
+            SliceCheck::Gone => {
+                if !self.gone {
+                    tracing::warn!(
+                        "{}'s cgroup is gone (user logged out, or the slice was stopped); EVE cannot be routed until it is back — retrying every {SLICE_RETRY_S} s",
+                        super::SLICE
+                    );
+                    self.gone = true;
+                    self.last_attempt = None;
+                }
+                if should_retry_slice(self.last_attempt, now) {
+                    self.last_attempt = Some(now);
+                    match ensure_slice(x, loaded.uid, &loaded.cgroup_dir) {
+                        Ok(id) => self.reload(x, loaded, id),
+                        Err(e) => tracing::debug!("slice: {e:#}"),
+                    }
+                }
+            }
+        }
+    }
+
+    fn reload(&mut self, x: &dyn Exec, loaded: &Loaded, id: u64) {
+        match reload_rules(x, loaded) {
+            Ok(()) => {
+                tracing::info!("{}'s cgroup was recreated; rules reloaded for it", super::SLICE);
+                self.id = id;
+                self.gone = false;
+            }
+            Err(e) => tracing::warn!("{}'s cgroup was recreated but the rules could not be reloaded: {e:#}; retrying next tick", super::SLICE),
+        }
+    }
 }
 
 /// Bounds on each teardown command. `systemctl stop` allows the worker
@@ -242,14 +386,19 @@ fn resolved_up(x: &dyn Exec, servers: &[std::net::Ipv4Addr], domains: &[String])
 }
 
 /// Everything between "the conf is loaded" and "the tunnel is up", in
-/// order: clear leftovers, `up`, then resolved — the link must exist before
-/// resolved can be told anything about it, and the nft rule that puts
-/// those queries into the tunnel is loaded by `up` itself.
-fn bring_up(x: &dyn Exec, loaded: &Loaded, wg_conf_tmp: &Path) -> anyhow::Result<()> {
+/// order: clear leftovers, the slice, `up`, then resolved — the slice's
+/// cgroup must exist before `up` loads the rules that name it (and a user
+/// who is not logged in is found out before a link is created for
+/// nothing), the link must exist before resolved can be told anything
+/// about it, and the nft rule that puts those queries into the tunnel is
+/// loaded by `up` itself. Yields the id of the cgroup the rules were
+/// loaded for, which [`SliceWatch`] keeps them true to.
+fn bring_up(x: &dyn Exec, loaded: &Loaded, wg_conf_tmp: &Path) -> anyhow::Result<u64> {
     remove_leftovers(x);
+    let slice_id = ensure_slice(x, loaded.uid, &loaded.cgroup_dir)?;
     up(x, &loaded.conf, loaded.uid, &loaded.dns_servers, wg_conf_tmp)?;
     resolved_up(x, &loaded.dns_servers, &loaded.dns_domains);
-    Ok(())
+    Ok(slice_id)
 }
 
 /// `IFF_UP` (bit 0) of `/sys/class/net/<iface>/flags`, which is hex.
@@ -436,10 +585,14 @@ async fn serve(
     int: &mut tokio::signal::unix::Signal,
 ) -> anyhow::Result<()> {
     let _teardown = Teardown::new(|| down(x));
-    if let Err(e) = bring_up(x, loaded, wg_conf_tmp) {
-        tracing::error!("tunnel start failed: {e:#}; tearing down");
-        return Err(e);
-    }
+    let slice_id = match bring_up(x, loaded, wg_conf_tmp) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!("tunnel start failed: {e:#}; tearing down");
+            return Err(e);
+        }
+    };
+    let mut slice = SliceWatch::new(slice_id);
     let since = now_unix();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     // The exit-IP refresh can block a tick for as long as
@@ -452,6 +605,7 @@ async fn serve(
         tokio::select! {
             _ = tick.tick() => {
                 keep_route(x, link_is_up());
+                slice.tick(x, loaded, now_unix());
                 if let Err(e) = write_status(x, &loaded.conf, since, &mut exit) {
                     tracing::warn!("status: {e:#}");
                 }
@@ -501,6 +655,7 @@ pub fn dry_run(
     let label = conf_path.file_stem().and_then(|s| s.to_str()).unwrap_or("tunnel");
     let conf = WgConf::parse(&text, label).map_err(|e| anyhow!("{}: {e}", conf_path.display()))?;
     let mut out = format!("# conf ({})\n{}\n# up\n", conf.label, conf.redacted());
+    out.push_str(&format!("{}  # unless its cgroup already exists\n", rules::slice_start_command(uid).join(" ")));
     for argv in rules::up_commands(&conf, WG_CONF_TMP) {
         out.push_str(&argv.join(" "));
         out.push('\n');
@@ -677,6 +832,7 @@ mod tests {
         stdin: RefCell<Vec<String>>,
         fail: fn(&[String]) -> bool,
         answer: fn(&[String]) -> String,
+        on_run: Option<Box<dyn Fn(&[String])>>,
     }
 
     impl Recorder {
@@ -685,7 +841,14 @@ mod tests {
         }
 
         fn answering(fail: fn(&[String]) -> bool, answer: fn(&[String]) -> String) -> Self {
-            Recorder { calls: RefCell::new(Vec::new()), stdin: RefCell::new(Vec::new()), fail, answer }
+            Recorder { calls: RefCell::new(Vec::new()), stdin: RefCell::new(Vec::new()), fail, answer, on_run: None }
+        }
+
+        /// What the machine does when a command runs — here, the user
+        /// manager creating the slice's cgroup on `systemctl --user start`.
+        fn with_side_effect(mut self, f: impl Fn(&[String]) + 'static) -> Self {
+            self.on_run = Some(Box::new(f));
+            self
         }
 
         fn joined(&self) -> Vec<String> {
@@ -696,6 +859,9 @@ mod tests {
     impl Exec for Recorder {
         fn run(&self, argv: &[String], timeout: Option<Duration>) -> anyhow::Result<String> {
             self.calls.borrow_mut().push((argv.to_vec(), timeout));
+            if let Some(f) = &self.on_run {
+                f(argv);
+            }
             if (self.fail)(argv) { Err(anyhow!("`{}` failed (stub)", argv.join(" "))) } else { Ok((self.answer)(argv)) }
         }
 
@@ -720,7 +886,21 @@ mod tests {
         .unwrap();
         let dns_servers = crate::tunnel::DEFAULT_DNS_SERVERS.to_vec();
         let dns_domains = crate::tunnel::DEFAULT_DNS_DOMAINS.iter().map(|d| (*d).to_string()).collect();
-        Loaded { conf, uid: 1000, dns_servers, dns_domains }
+        Loaded { conf, uid: 1000, dns_servers, dns_domains, cgroup_dir: PathBuf::from("/nonexistent/yutani-eve.slice") }
+    }
+
+    /// A `Loaded` whose slice cgroup is `<dir>/slice`, created — the state
+    /// after `connect` has started the slice, or after the first launch.
+    fn loaded_with_slice(dir: &Path) -> Loaded {
+        let slice = dir.join("slice");
+        std::fs::create_dir_all(&slice).unwrap();
+        let mut l = loaded();
+        l.cgroup_dir = slice;
+        l
+    }
+
+    fn is_slice_start(argv: &[String]) -> bool {
+        argv == rules::slice_start_command(1000).as_slice()
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
@@ -746,8 +926,8 @@ mod tests {
         let dir = scratch("start");
         let wg = dir.join("wg.conf");
         let rec = Recorder::new(nothing_to_tear_down);
-        let l = loaded();
-        bring_up(&rec, &l, &wg).unwrap();
+        let l = loaded_with_slice(&dir);
+        assert_eq!(bring_up(&rec, &l, &wg).unwrap(), cgroup_ident(&l.cgroup_dir).unwrap());
         let mut expected = joined(&rules::down_commands());
         expected.extend(joined(&rules::up_commands(&l.conf, wg.to_str().unwrap())));
         expected.push("nft -f -".to_string());
@@ -769,12 +949,130 @@ mod tests {
             nothing_to_tear_down(argv) || argv.join(" ") == "ip link add yutani0 type wireguard"
         }
         let rec = Recorder::new(link_add_fails);
-        let e = bring_up(&rec, &loaded(), &wg).unwrap_err().to_string();
+        let e = bring_up(&rec, &loaded_with_slice(&dir), &wg).unwrap_err().to_string();
         assert!(e.contains("ip link add yutani0"), "got {e}");
         let calls = rec.joined();
         assert_eq!(calls.last().map(String::as_str), Some("ip link add yutani0 type wireguard"));
         assert!(!calls.iter().any(|c| c.starts_with("resolvectl dns")));
         assert!(!wg.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// After a reboot nothing has created the slice's cgroup, and nft
+    /// cannot load a `socket cgroupv2` rule for a path that is not there
+    /// ("Could not parse cgroupsv2 path" — what broke every connect on
+    /// 2026-09-14). So a start that finds no cgroup starts the slice on
+    /// the user's manager itself, before the link and the rules, and
+    /// reports the cgroup it then found.
+    #[test]
+    fn a_missing_slice_is_started_on_the_user_manager_before_the_rules_are_loaded() {
+        let dir = scratch("start-slice");
+        let wg = dir.join("wg.conf");
+        let mut l = loaded();
+        l.cgroup_dir = dir.join("slice");
+        let slice = l.cgroup_dir.clone();
+        let rec = Recorder::new(nothing_to_tear_down).with_side_effect(move |argv| {
+            if is_slice_start(argv) {
+                std::fs::create_dir_all(&slice).unwrap();
+            }
+        });
+        let id = bring_up(&rec, &l, &wg).unwrap();
+        assert_eq!(Some(id), cgroup_ident(&l.cgroup_dir));
+        let mut expected = joined(&rules::down_commands());
+        expected.push(rules::slice_start_command(1000).join(" "));
+        expected.extend(joined(&rules::up_commands(&l.conf, wg.to_str().unwrap())));
+        expected.push("nft -f -".to_string());
+        expected.extend(joined(&rules::resolved_up_commands(&l.dns_servers, &l.dns_domains)));
+        assert_eq!(rec.joined(), expected);
+        let bound = rec.calls.borrow().iter().find(|(a, _)| is_slice_start(a)).map(|(_, t)| *t).unwrap();
+        assert_eq!(bound, Some(SLICE_TIMEOUT), "a manager that is not there must not hang the start");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The one real reason the slice cannot be started is that the user is
+    /// not logged in. That fails the start in plain words, before a link
+    /// is created for nothing — and so does a start that "succeeds"
+    /// without the cgroup appearing.
+    #[test]
+    fn a_slice_that_cannot_be_started_fails_the_start_before_the_link_exists() {
+        let dir = scratch("start-slice-fail");
+        let wg = dir.join("wg.conf");
+        let mut l = loaded();
+        l.cgroup_dir = dir.join("slice");
+        fn slice_start_fails(argv: &[String]) -> bool {
+            nothing_to_tear_down(argv) || is_slice_start(argv)
+        }
+        let rec = Recorder::new(slice_start_fails);
+        let e = format!("{:#}", bring_up(&rec, &l, &wg).unwrap_err());
+        assert!(e.contains("yutani-eve.slice") && e.contains("logged in"), "got {e}");
+        assert!(!rec.joined().iter().any(|c| c.starts_with("ip link add")));
+        // Started, but no cgroup: the manager said yes to something else.
+        let rec = Recorder::new(nothing_to_tear_down);
+        let e = format!("{:#}", bring_up(&rec, &l, &wg).unwrap_err());
+        assert!(e.contains("did not appear"), "got {e}");
+        assert!(!rec.joined().iter().any(|c| c.starts_with("ip link add")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_look_at_the_cgroup_says_whether_the_loaded_rules_still_name_it() {
+        assert_eq!(slice_check(7, Some(7)), SliceCheck::Unchanged);
+        assert_eq!(slice_check(7, Some(8)), SliceCheck::Recreated(8));
+        assert_eq!(slice_check(7, None), SliceCheck::Gone);
+        assert!(should_retry_slice(None, 0), "the first attempt is immediate");
+        assert!(!should_retry_slice(Some(100), 104));
+        assert!(should_retry_slice(Some(100), 105));
+        assert!(should_retry_slice(Some(200), 100), "a clock that went backwards is not a reason to wait");
+    }
+
+    /// The rules are compiled to the cgroup's id, so a slice that was
+    /// stopped and started again (a logout and login) leaves them matching
+    /// nothing: the tick notices the new identity and reloads them
+    /// atomically. While the cgroup is gone the slice is started again at
+    /// most every `SLICE_RETRY_S`, and reloaded the moment it is back.
+    #[test]
+    fn the_rules_are_reloaded_when_the_slice_cgroup_is_recreated_and_the_slice_restarted_when_gone() {
+        let dir = scratch("slice-watch");
+        let l = loaded_with_slice(&dir);
+        let reload = rules::nft_reload_ruleset(1000, l.conf.dns, &l.dns_servers);
+        let slice_start = rules::slice_start_command(1000).join(" ");
+        // Steady state: the same cgroup, nothing to do.
+        let rec = Recorder::new(|_| false);
+        let mut w = SliceWatch::new(cgroup_ident(&l.cgroup_dir).unwrap());
+        w.tick(&rec, &l, 1000);
+        assert!(rec.joined().is_empty(), "got {:?}", rec.joined());
+        // Recreated between two ticks: a new inode, so one atomic reload.
+        std::fs::remove_dir(&l.cgroup_dir).unwrap();
+        std::fs::create_dir(&l.cgroup_dir).unwrap();
+        let new_id = cgroup_ident(&l.cgroup_dir).unwrap();
+        w.tick(&rec, &l, 1001);
+        assert_eq!(rec.joined(), vec!["nft -f -".to_string()]);
+        assert_eq!(rec.stdin.borrow().as_slice(), [reload.clone()]);
+        assert_eq!(w.id, new_id);
+        // Gone, and the manager is not there: one start attempt now, none
+        // for the next SLICE_RETRY_S - 1 seconds, then another.
+        std::fs::remove_dir(&l.cgroup_dir).unwrap();
+        let rec = Recorder::new(is_slice_start);
+        w.tick(&rec, &l, 2000);
+        w.tick(&rec, &l, 2001);
+        w.tick(&rec, &l, 2004);
+        assert_eq!(rec.joined(), vec![slice_start.clone()]);
+        w.tick(&rec, &l, 2005);
+        assert_eq!(rec.joined(), vec![slice_start.clone(), slice_start.clone()]);
+        assert_eq!(w.id, new_id, "no reload while there is nothing to load for");
+        // Back (the user logged in): the start succeeds, the cgroup is a
+        // new one, the rules are reloaded for it.
+        let slice = l.cgroup_dir.clone();
+        let rec = Recorder::new(|_| false).with_side_effect(move |argv| {
+            if is_slice_start(argv) {
+                std::fs::create_dir_all(&slice).unwrap();
+            }
+        });
+        w.tick(&rec, &l, 2010);
+        assert_eq!(rec.joined(), vec![slice_start, "nft -f -".to_string()]);
+        assert_eq!(rec.stdin.borrow().as_slice(), [reload]);
+        assert_eq!(w.id, cgroup_ident(&l.cgroup_dir).unwrap());
+        assert!(!w.gone);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -828,7 +1126,7 @@ mod tests {
         let dir = scratch("signal");
         let wg = dir.join("wg.conf");
         let rec = Recorder::new(nothing_to_tear_down);
-        let l = loaded();
+        let l = loaded_with_slice(&dir);
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let started = std::time::Instant::now();
         let result: anyhow::Result<()> = rt.block_on(async {
@@ -922,6 +1220,7 @@ mod tests {
         assert!(out.contains("resolvectl domain yutani0 ~eveonline.com ~ccpgames.com ~evetech.net"));
         assert!(out.contains("resolvectl default-route yutani0 false"));
         assert!(out.contains("resolvectl revert yutani0"));
+        assert!(out.contains("env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user --no-ask-password start yutani-eve.slice"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
