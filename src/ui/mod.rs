@@ -11,7 +11,7 @@ use cosmic::iced::mouse;
 use cosmic::iced::core::layout::Limits;
 use cosmic::iced::platform_specific::shell::commands::activation;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
-    destroy_layer_surface, get_layer_surface, set_anchor, set_margin, set_size,
+    destroy_layer_surface, get_layer_surface, set_anchor, set_exclusive_zone, set_margin, set_size,
 };
 use cosmic::iced::runtime::platform_specific::wayland::layer_surface::{
     IcedMargin, IcedOutput, SctkLayerSurfaceSettings,
@@ -594,7 +594,10 @@ impl App {
             namespace: "yutani".into(),
             margin: IcedMargin { top: position.1, left: position.0, ..Default::default() },
             size: Some((Some(width), Some(height))),
-            exclusive_zone: 0,
+            // Floating: -1, so the surface may overlap the panel's exclusive
+            // strip and reach the screen's real edge; Dock: 0, so it does
+            // not. Changed in place by `apply_config` on a mode switch.
+            exclusive_zone: self.config.mode.exclusive_zone(),
             // This pinned iced ignores size_limits for layer surfaces; NONE is harmless.
             size_limits: Limits::NONE,
             ..Default::default()
@@ -1069,6 +1072,10 @@ impl App {
         self.config = new;
         let mut tasks = Vec::new();
         if mode_changed {
+            // Surfaces survive a mode switch, so the zone they were created
+            // with has to follow the mode (see `Mode::exclusive_zone`).
+            let zone = self.config.mode.exclusive_zone();
+            tasks.extend(self.clients.values().filter_map(|c| c.surface).map(|id| set_exclusive_zone(id, zone)));
             match self.config.mode {
                 // Positions now come from the layout; forget the floating
                 // ones so a later switch back doesn't reuse dock coordinates

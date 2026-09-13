@@ -16,6 +16,21 @@ pub enum Mode {
     Dock,
 }
 
+impl Mode {
+    /// The wlr-layer-shell exclusive zone the thumbnail surfaces ask for.
+    /// Floating thumbnails use `-1`: ignore every other surface's exclusive
+    /// zone, so a drag can reach the true top of the screen instead of
+    /// stopping under the panel's strip (a zone of `0` is *kept out* of
+    /// other zones). Dock mode keeps `0`, so a dock along the panel's edge
+    /// sits below the panel rather than on top of it.
+    pub fn exclusive_zone(self) -> i32 {
+        match self {
+            Mode::Floating => -1,
+            Mode::Dock => 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Edge {
     Top,
@@ -360,6 +375,14 @@ pub fn parse_color(hex: &str) -> Option<[f32; 4]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Floating must be able to overlap the panel (the user drags to the
+    /// screen's real top edge); the dock must not.
+    #[test]
+    fn floating_ignores_exclusive_zones_and_dock_respects_them() {
+        assert_eq!(Mode::Floating.exclusive_zone(), -1);
+        assert_eq!(Mode::Dock.exclusive_zone(), 0);
+    }
 
     #[test]
     fn defaults_match_spec() {

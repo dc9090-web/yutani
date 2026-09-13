@@ -259,7 +259,11 @@ and the name.
 ### Floating mode
 
 One `zwlr_layer_surface` per client: layer **Overlay**, anchor top-left,
-exclusive zone 0, keyboard interactivity **None**, positioned with margins,
+exclusive zone **−1** (so the surface ignores the panel's exclusive strip
+and a drag reaches the screen's real top edge — requested 2026-09-13; dock
+mode keeps 0 so a dock along the panel's edge sits below the panel, and a
+mode switch updates every live surface with `set_exclusive_zone`),
+keyboard interactivity **None**, positioned with margins,
 on the output the layout names (fallback: the output the client was first
 seen on; then the primary output). Rounded corners are not a compositor
 request (cosmic-comp's `cosmic_corner_radius_layer_v1` is a blur-shape hint
