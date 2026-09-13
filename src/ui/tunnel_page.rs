@@ -25,6 +25,9 @@ use super::settings::Msg;
 
 pub const NO_FILE: &str = "Choose the WireGuard configuration file first.";
 pub const NOT_A_FILE: &str = "That path is not a readable file.";
+/// A drop that carried no `.conf` (a folder, a text file, or a payload the
+/// widget could not decode).
+pub const NOT_A_CONF_DROP: &str = "dropped, but that was not a .conf file";
 pub const BUSY: &str = "Waiting for the previous action to finish…";
 
 /// Whether the XDG file-chooser portal is compiled in (libcosmic's
@@ -259,11 +262,11 @@ pub fn view<'a>(state: &'a State, config: &'a Config) -> Element<'a, Msg> {
             widget::button::destructive("Uninstall")
                 .on_press_maybe((!state.busy).then_some(Msg::UninstallTunnel))
                 .into(),
-            widget::button::standard("Refresh").on_press(Msg::RefreshTunnel).into(),
+            widget::button::standard("Refresh").on_press_maybe((!state.busy).then_some(Msg::RefreshTunnel)).into(),
         ]));
     } else {
         tunnel = tunnel.add(widget::settings::item_row(vec![
-            widget::button::standard("Refresh").on_press(Msg::RefreshTunnel).into(),
+            widget::button::standard("Refresh").on_press_maybe((!state.busy).then_some(Msg::RefreshTunnel)).into(),
         ]));
     }
 

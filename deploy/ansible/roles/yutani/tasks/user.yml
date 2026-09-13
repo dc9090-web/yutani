@@ -9,7 +9,6 @@
     XDG_RUNTIME_DIR: "/run/user/{{ yutani_uid }}"
     DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ yutani_uid }}/bus"
   ansible.builtin.command: "{{ yutani_prefix }}/yutani applet install"
-  register: yutani_applet
   changed_when: false
 
 - name: Systemd user unit (restart on crash)

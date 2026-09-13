@@ -1588,7 +1588,12 @@ impl App {
     /// shows its name, and `install` (as root) is the only thing that reads
     /// what is inside it.
     fn on_files_dropped(&mut self, paths: &[PathBuf]) {
-        let Some(conf) = tunnel_page::conf_candidate(paths) else { return };
+        let Some(conf) = tunnel_page::conf_candidate(paths) else {
+            // The drop was accepted (the cursor said so); say why nothing
+            // happened rather than leaving the user to wonder.
+            self.settings_note(tunnel_page::NOT_A_CONF_DROP.to_string());
+            return;
+        };
         let name = conf.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let tab = settings::page_index(settings::Page::Tunnel);
         if let Some(state) = self.settings.as_mut() {

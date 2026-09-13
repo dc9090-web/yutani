@@ -22,7 +22,6 @@
               '--exe', yutani_prefix ~ '/yutani']
              + (['--dns-servers', yutani_dns_servers | join(',')] if yutani_dns_servers | length > 0 else [])
              + (['--dns-domains', yutani_dns_domains | join(',')] if yutani_dns_domains | length > 0 else []) }}
-      register: yutani_tunnel
       changed_when: true
       # The report names the endpoint and address; keep them out of the log.
       # On failure, re-run the command by hand as root to see the reason.

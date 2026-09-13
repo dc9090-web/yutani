@@ -3,7 +3,8 @@
 yutani_user: ""
 yutani_repo: "https://github.com/dc9090-web/yutani.git"
 yutani_version: "master"
-yutani_src_dir: "/home/{{ yutani_user }}/.local/src/yutani"
+# Resolved after the passwd lookup; override to put the clone elsewhere.
+yutani_src_dir: "{{ yutani_home }}/.local/src/yutani"
 yutani_prefix: "/usr/local/bin"
 yutani_manage_packages: true
 yutani_install_shortcuts: true

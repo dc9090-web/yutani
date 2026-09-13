@@ -9,9 +9,10 @@
     database: passwd
     key: "{{ yutani_user }}"
 
-- name: Remember the uid
+- name: Remember the uid and home
   ansible.builtin.set_fact:
     yutani_uid: "{{ ansible_facts.getent_passwd[yutani_user][1] }}"
+    yutani_home: "{{ ansible_facts.getent_passwd[yutani_user][4] }}"
 
 - name: Packages and the Rust toolchain
   ansible.builtin.import_tasks: packages.yml

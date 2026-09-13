@@ -52,6 +52,10 @@ pub fn page_index(page: Page) -> Option<usize> {
     index_of(&PAGES, &page)
 }
 
+/// The settings window's drag-and-drop destination id (see `view`). Far
+/// above anything iced's widget-id counter reaches in a session.
+pub const SETTINGS_DROP_ID: u64 = 0x5955_5441_4E49_0001; // "YUTANI" + 1
+
 pub const MODES: [(&str, Mode); 2] = [("Floating", Mode::Floating), ("Dock", Mode::Dock)];
 pub const EDGES: [(&str, Edge); 4] =
     [("Top", Edge::Top), ("Bottom", Edge::Bottom), ("Left", Edge::Left), ("Right", Edge::Right)];
@@ -467,11 +471,21 @@ pub fn view<'a>(
     // `iced::window::Event::FileDropped` is winit's X11/macOS/Windows
     // event and never fires here. A drop the widget cannot decode arrives
     // as `None`, i.e. no files, and changes nothing.
+    // The destination's id is pinned: the widget mints a fresh one on every
+    // `view`, and the compositor resolves a drop against the id it saw at
+    // the last pointer motion — with thumbnails redrawing at 30 fps the two
+    // would rarely match and the drop would be lost. And the drag is a
+    // COPY: this window records a path, it never takes the file, so a file
+    // manager that honours MOVE must not delete the user's only copy of the
+    // private key before Install has run.
     let dropzone: Element<'a, Msg> =
         widget::dnd_destination::dnd_destination_for_data::<super::tunnel_page::DroppedFiles, _>(
             page,
             |data, _action| Msg::FilesDropped(data.map(|files| files.0).unwrap_or_default()),
         )
+        .drag_id(SETTINGS_DROP_ID)
+        .action(cosmic::iced::clipboard::dnd::DndAction::Copy)
+        .preferred_action(cosmic::iced::clipboard::dnd::DndAction::Copy)
         .into();
     let content: Element<'a, Msg> = widget::container(widget::column::with_children(vec![
         widget::header_bar()

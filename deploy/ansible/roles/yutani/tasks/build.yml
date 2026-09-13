@@ -15,7 +15,7 @@
     cmd: cargo build --release --locked
     chdir: "{{ yutani_src_dir }}"
   environment:
-    PATH: "/home/{{ yutani_user }}/.cargo/bin:{{ ansible_facts.env.PATH }}"
+    PATH: "{{ yutani_home }}/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
   register: yutani_build
   changed_when: "'Compiling' in yutani_build.stderr"
   # `command` skips itself in check mode, but its `chdir` is validated first

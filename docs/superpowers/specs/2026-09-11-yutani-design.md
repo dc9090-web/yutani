@@ -29,7 +29,7 @@ Non-goals
 
 ## 2. Platform facts (verified on the target machine, 2026-09-11)
 
-CachyOS, COSMIC 1.7 (cosmic-comp 1.7.0), Wayland session, two outputs.
+CachyOS, COSMIC 1.8 (cosmic-comp 1.8.0; started on 1.7), Wayland session, two outputs.
 cosmic-comp advertises:
 
 | Protocol | Used for |
