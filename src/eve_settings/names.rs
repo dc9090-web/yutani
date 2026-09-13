@@ -19,6 +19,9 @@ const USER_AGENT: &str = "User-Agent: yutani (COSMIC EVE companion)";
 /// curl's own limit; the process timeout is the backstop above it.
 const CURL_MAX_TIME: &str = "8";
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
+/// EVE character names are at most 37 characters; a reply that says
+/// otherwise is not trusted past this into the cache or a label.
+pub const MAX_NAME_LEN: usize = 64;
 
 pub fn cache_path(config_dir: &Path) -> PathBuf {
     config_dir.join("yutani").join("characters.ron")
@@ -54,7 +57,11 @@ pub fn parse_response(json: &str) -> Result<Names, String> {
         let short: String = json.chars().take(120).collect();
         format!("ESI did not return names: {short}")
     })?;
-    Ok(entries.into_iter().filter(|n| n.category == "character").map(|n| (n.id, n.name)).collect())
+    Ok(entries
+        .into_iter()
+        .filter(|n| n.category == "character")
+        .map(|n| (n.id, n.name.chars().take(MAX_NAME_LEN).collect()))
+        .collect())
 }
 
 pub fn curl_command(ids: &[u64]) -> Command {
@@ -103,13 +110,22 @@ pub fn fetch(ids: &[u64]) -> Result<Names, String> {
 /// so an offline machine still shows the cached names. Blocking — run it
 /// on the blocking pool.
 pub fn resolve(ids: Vec<u64>, cache: PathBuf) -> (Names, Option<String>) {
+    resolve_with(ids, cache, fetch)
+}
+
+/// [`resolve`] with the ESI call swapped out, so the cache handling can
+/// be tested without a network.
+pub fn resolve_with(ids: Vec<u64>, cache: PathBuf, fetch: impl FnOnce(&[u64]) -> Result<Names, String>) -> (Names, Option<String>) {
     let mut names = load_cache(&cache);
     let missing: Vec<u64> = ids.iter().copied().filter(|id| !names.contains_key(id)).collect();
     if missing.is_empty() {
         return (names, None);
     }
     match fetch(&missing) {
-        Ok(fresh) => {
+        Ok(mut fresh) => {
+            // Only what was asked for: an id we never sent is not ours to
+            // cache, whatever the reply says.
+            fresh.retain(|id, _| missing.contains(id));
             if !fresh.is_empty() {
                 names.extend(fresh);
                 if let Err(e) = save_cache(&cache, &names) {
@@ -171,6 +187,39 @@ mod tests {
         assert_eq!(load_cache(&path), names);
         std::fs::write(&path, "(((").unwrap();
         assert!(load_cache(&path).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ESI's reply is trusted only as far as the schema: a name of any
+    /// length would go into the cache and the dropdown label as-is. EVE
+    /// names are at most 37 characters; anything past 64 is not a name.
+    #[test]
+    fn a_name_longer_than_any_eve_name_is_cut_short() {
+        let long = "x".repeat(200);
+        let json = format!(r#"[{{"category":"character","id":7,"name":"{long}"}}]"#);
+        let names = parse_response(&json).unwrap();
+        assert_eq!(names[&7].chars().count(), MAX_NAME_LEN);
+        let exact = "y".repeat(MAX_NAME_LEN);
+        let json = format!(r#"[{{"category":"character","id":8,"name":"{exact}"}}]"#);
+        assert_eq!(parse_response(&json).unwrap()[&8], exact, "at the limit is kept whole");
+    }
+
+    /// Ids we did not ask for must not reach the cache: a reply carrying
+    /// extra characters would otherwise plant names for ids the profile
+    /// never had — the cache-poisoning surface.
+    #[test]
+    fn resolve_keeps_only_the_ids_it_asked_for() {
+        let dir = std::env::temp_dir().join(format!("yutani-names-extra-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = cache_path(&dir);
+        let fetcher = |ids: &[u64]| -> Result<Names, String> {
+            assert_eq!(ids, [5, 6]);
+            Ok([(5, "Five".to_string()), (6, "Six".to_string()), (99, "Intruder".to_string())].into_iter().collect())
+        };
+        let (got, err) = resolve_with(vec![5, 6], path.clone(), fetcher);
+        assert!(err.is_none());
+        assert_eq!(got.keys().copied().collect::<Vec<_>>(), vec![5, 6]);
+        assert_eq!(load_cache(&path).keys().copied().collect::<Vec<_>>(), vec![5, 6], "not in the cache either");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
