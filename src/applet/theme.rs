@@ -209,11 +209,11 @@ pub fn hairline<'a, M: 'a>() -> cosmic::Element<'a, M> {
     .into()
 }
 
-/// A filled, optionally glowing round dot (the header status dot).
-/// The badge's diameter for a panel icon `icon_px` tall: about a third of
-/// the mark, never below 5 px (a smaller dot vanishes) or above 8.
+/// The badge's diameter for a panel icon `icon_px` tall: half the mark,
+/// never below 7 px or above 12 (enlarged from a third / 5–8 px on
+/// 2026-09-13: at panel size XS the smaller dot was easy to miss).
 pub fn badge_px(icon_px: f32) -> f32 {
-    (icon_px * 0.34).round().clamp(5.0, 8.0)
+    (icon_px * 0.5).round().clamp(7.0, 12.0)
 }
 
 /// The Active badge: a filled blue circle with a dark hairline ring.
@@ -229,6 +229,7 @@ pub fn badge_class(diameter: f32) -> cosmic::theme::Container<'static> {
     })
 }
 
+/// A filled, optionally glowing round dot (the header status dot).
 pub fn dot_class(color: Color, glow: bool) -> cosmic::theme::Container<'static> {
     cosmic::theme::Container::custom(move |_| container::Style {
         background: Some(Background::Color(color)),
@@ -347,6 +348,15 @@ pub fn menu_row_class(text: Color, hover: Color, pressed: Color, held: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Half the icon, clamped: XS panels get a 8 px dot, huge ones stop at 12.
+    #[test]
+    fn the_badge_is_half_the_icon_within_bounds() {
+        assert_eq!(badge_px(16.0), 8.0);
+        assert_eq!(badge_px(24.0), 12.0);
+        assert_eq!(badge_px(10.0), 7.0);
+        assert_eq!(badge_px(64.0), 12.0);
+    }
     use crate::model::config::parse_color;
 
     /// Every colour const must equal the handoff's hex literal, parsed by

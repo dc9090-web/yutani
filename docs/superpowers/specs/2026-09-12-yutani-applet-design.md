@@ -87,8 +87,8 @@ requested 2026-09-13 afternoon in place of the earlier all-blue mark): the
 panel says at a glance whether Yutani is *doing* its job — tunnel up,
 healthy, and EVE behind it — not merely ready to. It is drawn as the plain
 `y-symbolic` mark, tinted by the panel like every other state, with a blue
-dot (`#0A5CFF`, the launcher's blue, 1 px near-black ring, ~a third of the
-icon height clamped to 5–8 px) laid over the bottom-right corner by the
+dot (`#0A5CFF`, the launcher's blue, 1 px near-black ring, half the icon
+height clamped to 7–12 px) laid over the bottom-right corner by the
 applet's view (`IconState::badge`), so the Y itself still follows a light
 panel theme. `y-color` stays a launcher-only icon under `scalable/apps`.
 `icon_state` therefore takes the client count
