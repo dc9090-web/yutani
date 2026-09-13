@@ -8,6 +8,7 @@
 //! `connect`/`disconnect` to `systemctl`.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
@@ -72,6 +73,16 @@ pub struct State {
     pub busy: bool,
     /// Whether the file chooser could be built in ([`CAN_BROWSE`]).
     pub can_browse: bool,
+    /// What `conf_path` (trimmed) was the last time [`install_blocker`]
+    /// looked, and whether it named a file then. `install_blocker` runs
+    /// from `view`, which iced calls after every update batch, so without
+    /// this the path is `stat`ed ~30x/s while the page shows — and a Files
+    /// drop from an SMB share is a gvfs path, where each `stat` is a
+    /// network round trip on the UI thread. One look per distinct text
+    /// instead; a file moved after that is reported by `install` itself.
+    /// Interior mutability because `view` only borrows the state. Not set
+    /// by hand: `Default` is the whole of it.
+    pub conf_check: RefCell<Option<(String, bool)>>,
 }
 
 /// The files of one drop, as libcosmic's drag-and-drop destination widget
@@ -177,7 +188,16 @@ pub fn install_blocker(state: &State) -> Option<&'static str> {
     if text.is_empty() {
         return Some(NO_FILE);
     }
-    if !Path::new(text).is_file() {
+    let mut check = state.conf_check.borrow_mut();
+    let is_file = match check.as_ref() {
+        Some((seen, is_file)) if seen == text => *is_file,
+        _ => {
+            let is_file = Path::new(text).is_file();
+            *check = Some((text.to_string(), is_file));
+            is_file
+        }
+    };
+    if !is_file {
         return Some(if text.contains('\u{FFFD}') { NOT_UTF8 } else { NOT_A_FILE });
     }
     None
@@ -345,12 +365,41 @@ mod tests {
         let mut s = State::default();
         s.conf_path = dir.join("caf\u{FFFD}.conf").display().to_string();
         assert_eq!(install_blocker(&s), Some(NOT_UTF8));
-        // …unless a file really is called that, which is fine.
+        // …unless a file really is called that, which is fine. (A fresh
+        // state: the same text is not looked at twice, see `conf_check`.)
         std::fs::write(dir.join("caf\u{FFFD}.conf"), "[Interface]\n").unwrap();
+        let mut s = State { conf_path: s.conf_path, ..Default::default() };
         assert_eq!(install_blocker(&s), None);
         // A missing file whose name is plain UTF-8 is still just missing.
         s.conf_path = dir.join("cafe.conf").display().to_string();
         assert_eq!(install_blocker(&s), Some(NOT_A_FILE));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_field_path_is_checked_once_per_text_not_once_per_redraw() {
+        // `install_blocker` runs from `view`, so it must not `stat` the
+        // path on every redraw: for a gvfs path from a Files drop that is a
+        // network round trip on the UI thread ~30x/s. Same text, same
+        // answer — even after the file has gone (`install` itself reports a
+        // file moved since). New text, fresh look.
+        let dir = std::env::temp_dir().join(format!("yutani-tunnel-stat-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("x.conf");
+        std::fs::write(&conf, "[Interface]\n").unwrap();
+        let mut s = State::default();
+        s.conf_path = conf.display().to_string();
+        assert_eq!(install_blocker(&s), None);
+        std::fs::remove_file(&conf).unwrap();
+        assert_eq!(install_blocker(&s), None, "the same text is not stat'ed again");
+        // Surrounding whitespace is not new text.
+        s.conf_path = format!("  {}  ", conf.display());
+        assert_eq!(install_blocker(&s), None);
+        s.conf_path = dir.join("y.conf").display().to_string();
+        assert_eq!(install_blocker(&s), Some(NOT_A_FILE));
+        s.conf_path = conf.display().to_string();
+        assert_eq!(install_blocker(&s), Some(NOT_A_FILE), "coming back to a text is a fresh look");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
