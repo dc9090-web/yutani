@@ -15,7 +15,7 @@ use cosmic::Element;
 use cosmic::iced::Length;
 use cosmic::widget;
 
-use yutani::eve_settings::copy::Report;
+use yutani::eve_settings::copy::{Failure, Report};
 use yutani::eve_settings::names::Names;
 use yutani::eve_settings::{Entry, Listing, relative_age};
 
@@ -178,16 +178,41 @@ pub fn copy_note(source: &str, report: &Report) -> String {
     note
 }
 
-/// The note for a failed `copy::execute`. The refusal to reuse a backup
-/// directory (two presses inside one second) and a failure to make that
-/// directory both happen before any file is touched, so the "already
-/// replaced" half of the usual note would be a lie.
-pub fn copy_failure_note(error: &std::io::Error, backup: &Path) -> String {
-    if error.kind() == std::io::ErrorKind::AlreadyExists {
-        format!("copy not started: {error} — wait a second and press again")
-    } else {
-        format!("copy failed: {error}; the files already replaced are in {}", backup.display())
+/// The note for a failed `copy::execute`. Everything that goes wrong
+/// while the backup is being taken — including the refusal to reuse a
+/// backup directory after two presses inside one second — happens before
+/// any file is replaced, so `replaced == 0` and the "already replaced"
+/// half of the usual note would be a lie.
+pub fn copy_failure_note(failure: &Failure, backup: &Path) -> String {
+    if failure.replaced == 0 {
+        let mut note = format!("copy not started: {}", failure.error);
+        if failure.error.kind() == std::io::ErrorKind::AlreadyExists {
+            note.push_str(" — wait a second and press again");
+        }
+        return note;
     }
+    format!(
+        "copy failed after replacing {} of {} files: {}; the originals are in {}",
+        failure.replaced,
+        failure.planned,
+        failure.error,
+        backup.display()
+    )
+}
+
+/// A blocker constant reworded as a note-line fragment. The constants are
+/// captions under a button — capitalised, full sentences — and the note
+/// line is a lowercase phrase, so pushing one through verbatim reads wrong.
+pub fn blocker_note(blocker: &str) -> String {
+    match blocker {
+        RUNNING_CLIENT => "close every EVE client first",
+        ONE_CHARACTER => "only one character has settings here",
+        NO_PROFILE => "no EVE profile directory found",
+        NO_SELECTION => "pick a character to copy from",
+        NO_ACCOUNT_SELECTION => "pick an account to copy from",
+        other => other,
+    }
+    .to_string()
 }
 
 pub fn view(state: &State, clients_running: bool) -> Element<'_, Msg> {
@@ -242,6 +267,11 @@ pub fn view(state: &State, clients_running: bool) -> Element<'_, Msg> {
                     .on_press_maybe((!clients_running && state.listing.is_some()).then_some(Msg::RestoreBackup))
                     .into(),
             ]));
+            // The same reason the Copy button gives: a running client
+            // would rewrite the restored files the moment it logs out.
+            if clients_running {
+                backups = backups.add(widget::text::caption(RUNNING_CLIENT));
+            }
         }
         None => backups = backups.add(widget::text::caption("No backups yet. One is taken before every copy.")),
     }
@@ -373,21 +403,49 @@ mod tests {
         assert_eq!(copy_note("KestrelVance", &report), "copied KestrelVance to 3 characters and 1 account; backup in /b/x");
     }
 
-    /// The refusal to reuse a backup directory happens before any file is
-    /// touched, so the note must not claim files were replaced.
+    /// Everything that fails during the backup phase happens before any
+    /// file is touched, so the note must not claim files were replaced.
     #[test]
     fn a_refused_copy_does_not_claim_files_were_replaced() {
         let backup = PathBuf::from("/b/20260913T024100Z");
-        let refused = std::io::Error::new(std::io::ErrorKind::AlreadyExists, "backup /b/20260913T024100Z exists");
+        let failure = |kind, msg: &str, replaced| Failure {
+            error: std::io::Error::new(kind, msg.to_string()),
+            replaced,
+            planned: 7,
+        };
         assert_eq!(
-            copy_failure_note(&refused, &backup),
+            copy_failure_note(
+                &failure(std::io::ErrorKind::AlreadyExists, "backup /b/20260913T024100Z exists", 0),
+                &backup
+            ),
             "copy not started: backup /b/20260913T024100Z exists — wait a second and press again"
         );
-        let broke = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "read-only");
+        // A backup that broke for any other reason: nothing was replaced
+        // either, and there is no "wait and press again" to offer.
         assert_eq!(
-            copy_failure_note(&broke, &backup),
-            "copy failed: read-only; the files already replaced are in /b/20260913T024100Z"
+            copy_failure_note(&failure(std::io::ErrorKind::PermissionDenied, "read-only", 0), &backup),
+            "copy not started: read-only"
         );
+        assert_eq!(
+            copy_failure_note(&failure(std::io::ErrorKind::PermissionDenied, "read-only", 3), &backup),
+            "copy failed after replacing 3 of 7 files: read-only; the originals are in /b/20260913T024100Z"
+        );
+    }
+
+    /// The blocker constants are button captions; the note line wants a
+    /// lowercase fragment, not a capitalised sentence mid-sentence.
+    #[test]
+    fn blocker_notes_read_as_note_line_fragments() {
+        assert_eq!(blocker_note(RUNNING_CLIENT), "close every EVE client first");
+        assert_eq!(blocker_note(ONE_CHARACTER), "only one character has settings here");
+        assert_eq!(blocker_note(NO_PROFILE), "no EVE profile directory found");
+        assert_eq!(blocker_note(NO_SELECTION), "pick a character to copy from");
+        assert_eq!(blocker_note(NO_ACCOUNT_SELECTION), "pick an account to copy from");
+        for constant in [RUNNING_CLIENT, ONE_CHARACTER, NO_PROFILE, NO_SELECTION, NO_ACCOUNT_SELECTION] {
+            let note = blocker_note(constant);
+            assert!(!note.starts_with(|c: char| c.is_uppercase()), "{note}");
+            assert!(!note.ends_with('.'), "{note}");
+        }
     }
 
     #[test]

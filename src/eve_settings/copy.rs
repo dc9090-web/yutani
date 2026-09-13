@@ -2,8 +2,10 @@
 //!
 //! The `.dat` files are CCP's opaque binary format: copied whole, never
 //! merged. Every overwrite is temp-file + rename in the target's directory,
-//! after the target has been copied into the backup directory under its
-//! own name, so `restore` is a plain copy back.
+//! and `execute` runs in two phases — *every* target is copied into the
+//! backup directory under its own name before *any* target is overwritten
+//! — so `restore` is a plain copy back and a failed backup has changed
+//! nothing at all.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -29,6 +31,28 @@ pub struct Report {
     pub characters: usize,
     pub accounts: usize,
     pub backup: PathBuf,
+}
+
+/// What went wrong and how far the copy got: `replaced` is 0 when the
+/// failure came before any target was touched (backup phase, or the
+/// backup directory already existing), so the note can say so honestly.
+#[derive(Debug)]
+pub struct Failure {
+    pub error: std::io::Error,
+    pub replaced: usize,
+    pub planned: usize,
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+impl std::error::Error for Failure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
 }
 
 /// Every other character (and, with `account`, every other account) gets
@@ -97,11 +121,11 @@ fn replace_via_tmp(from: &Path, to: &Path) -> std::io::Result<()> {
     result
 }
 
-/// Back up every target into `backup`, then overwrite each with its
-/// source. A failure part-way leaves the targets already replaced in
-/// their new state — they are all in the backup, so `restore` puts
-/// everything back.
-pub fn execute(plan: &Plan, backup: &Path) -> std::io::Result<Report> {
+/// Copy each of `files` into a freshly created `backup` directory under
+/// its own name; returns how many. The directory must not exist yet — a
+/// second run into the same directory would overwrite the originals it
+/// holds with the files that already replaced them.
+pub fn backup_files(files: &[PathBuf], backup: &Path) -> std::io::Result<usize> {
     if let Some(parent) = backup.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -112,14 +136,33 @@ pub fn execute(plan: &Plan, backup: &Path) -> std::io::Result<Report> {
             e
         }
     })?;
-    let mut report = Report { characters: 0, accounts: 0, backup: backup.to_path_buf() };
-    for target in &plan.targets {
-        let name = target.to.file_name().ok_or_else(|| std::io::Error::other("target has no file name"))?;
+    let mut saved = 0;
+    for file in files {
+        let name = file.file_name().ok_or_else(|| std::io::Error::other("target has no file name"))?;
         // The backup itself goes through the temporary too: a copy that
         // dies part-way must not leave a truncated file under the real
         // name, or a later restore would write it over a good original.
-        replace_via_tmp(&target.to, &backup.join(name))?;
-        replace_via_tmp(&target.from, &target.to)?;
+        replace_via_tmp(file, &backup.join(name))?;
+        saved += 1;
+    }
+    Ok(saved)
+}
+
+/// Two phases, in this order: *every* target is copied into `backup`,
+/// and only then is any target overwritten. Interleaving the two would
+/// mean a backup that fails on the fourth target leaves the first three
+/// already replaced with no way back; this way a phase-1 failure has
+/// touched nothing (`Failure::replaced` is 0), and a phase-2 failure
+/// leaves every original in the backup for `restore`.
+pub fn execute(plan: &Plan, backup: &Path) -> Result<Report, Failure> {
+    let planned = plan.targets.len();
+    let files: Vec<PathBuf> = plan.targets.iter().map(|t| t.to.clone()).collect();
+    backup_files(&files, backup).map_err(|error| Failure { error, replaced: 0, planned })?;
+    let mut report = Report { characters: 0, accounts: 0, backup: backup.to_path_buf() };
+    for target in &plan.targets {
+        if let Err(error) = replace_via_tmp(&target.from, &target.to) {
+            return Err(Failure { error, replaced: report.characters + report.accounts, planned });
+        }
         match target.kind {
             Kind::Character => report.characters += 1,
             Kind::Account => report.accounts += 1,
@@ -139,7 +182,33 @@ pub fn latest_backup(backups: &Path) -> Option<PathBuf> {
         .map(|name| backups.join(name))
 }
 
-/// Copy every settings file in `backup` back over `dir`; returns how many.
+/// The files in `dir` a `restore` from `backup` would replace, sorted.
+/// Pass this to [`backup_files`] to save the live files before a restore
+/// overwrites them.
+pub fn restore_plan(backup: &Path, dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut targets = Vec::new();
+    for entry in std::fs::read_dir(backup)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_str().and_then(parse_file_name).is_none() || !entry.path().is_file() {
+            continue;
+        }
+        let to = dir.join(&name);
+        // A restore reverts files; it does not create files the profile
+        // never had. A character deleted from the profile since the
+        // backup would otherwise come back from the dead.
+        if !to.is_file() {
+            continue;
+        }
+        targets.push(to);
+    }
+    targets.sort();
+    Ok(targets)
+}
+
+/// Copy every settings file in `backup` back over the file of the same
+/// name in `dir`; returns how many. Backup entries with no counterpart in
+/// `dir` are skipped (see [`restore_plan`]).
 pub fn restore(backup: &Path, dir: &Path) -> std::io::Result<usize> {
     let mut restored = 0;
     for entry in std::fs::read_dir(backup)? {
@@ -149,6 +218,9 @@ pub fn restore(backup: &Path, dir: &Path) -> std::io::Result<usize> {
             continue;
         }
         let to = dir.join(&name);
+        if !to.is_file() {
+            continue;
+        }
         replace_via_tmp(&entry.path(), &to)?;
         restored += 1;
     }
@@ -274,7 +346,8 @@ mod tests {
             .collect();
 
         let err = execute(&plan(&listing, 2, Some(20)).unwrap(), &backup).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(err.error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(err.replaced, 0, "refused before any target was touched");
 
         let backup_files_after_second: std::collections::BTreeMap<_, _> = std::fs::read_dir(&backup)
             .unwrap()
@@ -292,18 +365,97 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A failure while backing up must leave the profile exactly as it
+    /// was: the second target cannot be backed up (its file does not
+    /// exist), so not even the first target may have been replaced.
+    #[test]
+    fn a_failure_backing_up_leaves_every_profile_file_untouched() {
+        let dir = profile("backup-fails");
+        let entry = |name: &str| Entry {
+            id: 0,
+            path: dir.join(name),
+            size: 4,
+            modified: SystemTime::UNIX_EPOCH,
+        };
+        let source = entry("core_char_1.dat");
+        let plan = Plan {
+            source_character: source.clone(),
+            source_account: None,
+            // The second target has no file behind it, so phase 1 fails
+            // on it — after the first target was already backed up but
+            // before anything was overwritten.
+            targets: vec![
+                Target { from: source.path.clone(), to: dir.join("core_char_2.dat"), kind: Kind::Character },
+                Target { from: source.path.clone(), to: dir.join("core_char_404.dat"), kind: Kind::Character },
+            ],
+        };
+        let backup = dir.join("backups").join("20260913T024100Z");
+        let err = execute(&plan, &backup).unwrap_err();
+        assert_eq!(err.error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!((err.replaced, err.planned), (0, 2));
+        assert_eq!(std::fs::read(dir.join("core_char_2.dat")).unwrap(), b"BBBB", "not overwritten");
+        assert_eq!(std::fs::read(dir.join("core_char_1.dat")).unwrap(), b"AAAA", "source untouched");
+        assert!(!dir.join("core_char_404.dat").exists());
+        // No temporary survives the failure, in the profile or the backup.
+        for parent in [&dir, &backup] {
+            let leftovers: Vec<_> = std::fs::read_dir(parent)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .filter(|n| n.ends_with(".tmp"))
+                .collect();
+            assert!(leftovers.is_empty(), "{} has {leftovers:?}", parent.display());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn restore_ignores_anything_that_is_not_a_settings_file() {
         let dir = tmpdir("restore-junk");
         let backup = dir.join("b");
         std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(dir.join("core_char_5.dat"), b"stale").unwrap();
         std::fs::write(backup.join("core_char_5.dat"), b"five").unwrap();
         std::fs::write(backup.join("notes.txt"), b"nope").unwrap();
         std::fs::write(backup.join("core_char__.dat"), b"nope").unwrap();
+        assert_eq!(restore_plan(&backup, &dir).unwrap(), vec![dir.join("core_char_5.dat")]);
         assert_eq!(restore(&backup, &dir).unwrap(), 1);
         assert_eq!(std::fs::read(dir.join("core_char_5.dat")).unwrap(), b"five");
         assert!(!dir.join("notes.txt").exists());
         assert!(!dir.join("core_char__.dat").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A restore reverts files; a character whose file is gone from the
+    /// profile is not resurrected by the backup that still holds it.
+    #[test]
+    fn restore_skips_backup_files_the_profile_no_longer_has() {
+        let dir = tmpdir("restore-gone");
+        let backup = dir.join("b");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(dir.join("core_char_1.dat"), b"live").unwrap();
+        std::fs::write(backup.join("core_char_1.dat"), b"old").unwrap();
+        std::fs::write(backup.join("core_char_2.dat"), b"deleted").unwrap();
+        assert_eq!(restore_plan(&backup, &dir).unwrap(), vec![dir.join("core_char_1.dat")]);
+        assert_eq!(restore(&backup, &dir).unwrap(), 1);
+        assert_eq!(std::fs::read(dir.join("core_char_1.dat")).unwrap(), b"old");
+        assert!(!dir.join("core_char_2.dat").exists(), "not brought back from the dead");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What the Restore path does before it restores: save the live files
+    /// into a fresh directory, refusing to reuse one.
+    #[test]
+    fn backup_files_saves_each_file_and_never_reuses_a_directory() {
+        let dir = tmpdir("backup-files");
+        std::fs::write(dir.join("core_char_1.dat"), b"one").unwrap();
+        std::fs::write(dir.join("core_char_2.dat"), b"two").unwrap();
+        let backup = dir.join("backups").join("20260913T024100Z");
+        let files = vec![dir.join("core_char_1.dat"), dir.join("core_char_2.dat")];
+        assert_eq!(backup_files(&files, &backup).unwrap(), 2);
+        assert_eq!(std::fs::read(backup.join("core_char_1.dat")).unwrap(), b"one");
+        assert_eq!(std::fs::read(backup.join("core_char_2.dat")).unwrap(), b"two");
+        let err = backup_files(&files, &backup).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -11,9 +11,6 @@ pub mod names;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// EVE Online's Steam app id: the Proton prefix lives under `compatdata/8500`.
-pub const EVE_STEAM_APP_ID: &str = "8500";
-
 /// Inside a Steam library, the Wine `AppData\Local\CCP\EVE` directory.
 const EVE_IN_LIBRARY: &str = "steamapps/compatdata/8500/pfx/drive_c/users/steamuser/AppData/Local/CCP/EVE";
 const TRANQUILITY_SERVER_DIR: &str = "c_ccp_eve_tq_tranquility";
@@ -151,7 +148,9 @@ pub fn discover(override_dir: Option<&Path>, home: &Path) -> Result<PathBuf, Str
     })
 }
 
-/// The settings files in `dir`, newest first.
+/// The settings files in `dir`, newest first. A symlinked core file is
+/// skipped on purpose: the copy replaces a file by renaming a temporary
+/// over it, which would replace the user's link with a plain file.
 pub fn list(dir: &Path) -> std::io::Result<Listing> {
     let mut listing = Listing { dir: dir.to_path_buf(), ..Listing::default() };
     for entry in std::fs::read_dir(dir)? {

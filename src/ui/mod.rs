@@ -1413,18 +1413,18 @@ impl App {
         // Re-checked here and not only on the button: the listing behind
         // the disabled state can be a redraw old.
         if let Some(reason) = characters::copy_blocker(&state.characters, !self.clients.is_empty()) {
-            return self.settings_note(reason.to_string());
+            return self.settings_note(characters::blocker_note(reason));
         }
         let Some(listing) = state.characters.listing.as_ref() else { return };
         let Some(character) = state.characters.selected_character() else {
-            return self.settings_note(characters::NO_SELECTION.to_string());
+            return self.settings_note(characters::blocker_note(characters::NO_SELECTION));
         };
         let account = state.characters.account_to_copy();
         // Asked for an account copy, there is one to copy to, and yet no
         // account is named: copying without it would silently do half the
         // job the toggle promised.
         if state.characters.copy_account && account.is_none() && listing.accounts.len() >= 2 {
-            return self.settings_note(characters::NO_ACCOUNT_SELECTION.to_string());
+            return self.settings_note(characters::blocker_note(characters::NO_ACCOUNT_SELECTION));
         }
         let source = state.characters.source_label();
         let backups = yutani::eve_settings::copy::backups_dir(&dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")));
@@ -1439,19 +1439,40 @@ impl App {
         self.settings_note(note);
     }
 
-    /// Characters page: put the newest backup back over the profile.
+    /// Characters page: put the newest backup back over the profile —
+    /// after backing up the live files it is about to replace. Without
+    /// that, a restore is the one operation here with no way back: the
+    /// settings written since the backup would be gone unrecorded.
     fn settings_restore_backup(&mut self) {
+        use yutani::eve_settings::copy;
         let Some(state) = self.settings.as_ref() else { return };
         if !self.clients.is_empty() {
-            return self.settings_note(characters::RUNNING_CLIENT.to_string());
+            return self.settings_note(characters::blocker_note(characters::RUNNING_CLIENT));
         }
         let (Some(backup), Some(listing)) = (state.characters.last_backup.clone(), state.characters.listing.as_ref())
         else {
             return self.settings_note("nothing to restore".to_string());
         };
-        let note = match yutani::eve_settings::copy::restore(&backup, &listing.dir) {
-            Ok(n) => format!("restored {n} file{} from {}", if n == 1 { "" } else { "s" }, backup.display()),
+        let dir = listing.dir.clone();
+        let backups = copy::backups_dir(&dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")));
+        let saved = backups.join(copy::backup_name(SystemTime::now()));
+        let note = match copy::restore_plan(&backup, &dir) {
             Err(e) => format!("restore failed: {e}"),
+            // Nothing in the backup matches a file in the profile. Making
+            // an empty backup directory here would hide the real newest
+            // backup behind it, so do nothing at all.
+            Ok(targets) if targets.is_empty() => {
+                format!("nothing to restore: no file in {} is in {}", backup.display(), dir.display())
+            }
+            Ok(targets) => match copy::backup_files(&targets, &saved).and_then(|_| copy::restore(&backup, &dir)) {
+                Ok(n) => format!(
+                    "restored {n} file{} from {}; the files it replaced are in {}",
+                    if n == 1 { "" } else { "s" },
+                    backup.display(),
+                    saved.display()
+                ),
+                Err(e) => format!("restore failed: {e}"),
+            },
         };
         self.settings_note(note);
     }

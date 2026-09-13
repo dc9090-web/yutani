@@ -391,7 +391,7 @@ pub fn view<'a>(
         .into(),
     });
     let note: Element<'a, Msg> = widget::column::with_children(notes).spacing(4).into();
-    // Three pages now, the longest of which does not fit 700 px.
+    // Five pages now, the longest of which does not fit 700 px.
     let scrolled: Element<'a, Msg> = widget::scrollable(body).height(Length::Fill).into();
     let tabs: Element<'a, Msg> =
         widget::segmented_control::horizontal(&state.pages).on_activate(Msg::Page).into();
