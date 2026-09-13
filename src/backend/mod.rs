@@ -235,6 +235,12 @@ impl AppData {
                     tracing::debug!("ignoring zero-sized thumb size {size:?} for {handle:?}");
                     return;
                 }
+                // The UI's size may race a `ClientRemoved` already queued the
+                // other way; `stop_capture` is the only thing that removes
+                // entries, so an insert for a gone client would stay forever.
+                if !self.captures.contains_key(&handle) {
+                    return;
+                }
                 self.thumb_sizes.insert(handle, ThumbSpec { size, radius_px });
             }
         }
