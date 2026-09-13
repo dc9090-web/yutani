@@ -65,7 +65,9 @@ also writes two `.desktop` files into `~/.local/share/applications/`:
   `Exec=<abs yutani-applet>`: what the panel needs to list the applet.
 - `com.yutani.Yutani.desktop` — an ordinary visible launcher named
   "Yutani", `Icon=y-color` (the `scalable/apps` copy above),
-  `Categories=Game;Utility;`, `Exec=<abs canonicalised yutani>`: what puts
+  `Categories=Game;Utility;`, `Exec=<abs canonicalised yutani> start` (through
+  the systemd user unit when `yutani service install` has written one, so a
+  crash restarts the daemon; in-process otherwise): what puts
   Yutani in the Applications list, so the daemon can be started without a
   terminal. `update-desktop-database` is run afterwards if present, so it
   appears without a re-login.

@@ -66,6 +66,13 @@ enum Command {
         #[command(subcommand)]
         action: ShortcutsAction,
     },
+    /// Start the daemon: through the systemd user unit when `yutani service install` has been run, else in this process
+    Start,
+    /// Install or remove a systemd user unit that restarts the daemon after a crash
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// Install or remove the COSMIC panel applet (icons, .desktop files, Applications launcher)
     Applet {
         #[command(subcommand)]
@@ -83,6 +90,14 @@ enum ShortcutsAction {
     /// Write Yutani's bindings into COSMIC's custom shortcuts (idempotent)
     Install,
     /// Remove Yutani's bindings, leaving everything else untouched
+    Uninstall,
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Write ~/.config/systemd/user/yutani.service (Restart=on-failure) and reload (idempotent)
+    Install,
+    /// Stop and remove the unit
     Uninstall,
 }
 
@@ -140,6 +155,21 @@ enum TunnelAction {
     UninstallRoot,
 }
 
+/// The daemon itself, in this process (the bare `yutani` and `yutani start`
+/// without a unit).
+fn run_daemon() -> anyhow::Result<ExitCode> {
+    if cli::is_running() {
+        eprintln!("yutani is already running");
+        return Ok(ExitCode::from(1));
+    }
+    let config = model::config::Config::load();
+    // The IPC server owns the socket file: it is removed on `quit`, and a
+    // stale one (crash/SIGTERM) is replaced at bind. Do not remove it here:
+    // if this process lost libcosmic's single-instance race, `ui::run`
+    // returns Ok at once and the socket belongs to the winning instance.
+    ui::run(config).map(|()| ExitCode::SUCCESS).map_err(anyhow::Error::from)
+}
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -177,6 +207,30 @@ fn main() -> ExitCode {
         }
         Some(Command::Shortcuts { action: ShortcutsAction::Uninstall }) => shortcuts::uninstall().map(|n| {
             println!("removed {n} shortcuts from {}", shortcuts::custom_path().display());
+            ExitCode::SUCCESS
+        }),
+        Some(Command::Start) => {
+            if yutani::service::installed() {
+                yutani::service::start_unit().map(|()| ExitCode::SUCCESS)
+            } else {
+                run_daemon()
+            }
+        }
+        Some(Command::Service { action: ServiceAction::Install }) => {
+            std::env::current_exe()
+                .and_then(|e| e.canonicalize())
+                .map_err(|e| anyhow::anyhow!("cannot resolve the running yutani binary: {e}"))
+                .and_then(|exe| yutani::service::install(&exe))
+                .map(|path| {
+                println!("wrote {}", path.display());
+                println!("the Applications launcher (yutani start) now starts it through systemd;");
+                println!("a crash restarts it after a second, `yutani quit` stops it.");
+                println!("to start it at login: systemctl --user enable {}", yutani::service::UNIT_NAME);
+                ExitCode::SUCCESS
+            })
+        }
+        Some(Command::Service { action: ServiceAction::Uninstall }) => yutani::service::uninstall().map(|removed| {
+            println!("{}", if removed { "removed the unit" } else { "no unit installed" });
             ExitCode::SUCCESS
         }),
         Some(Command::Applet { action: AppletAction::Install }) => {
@@ -238,20 +292,7 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }),
         },
-        None => {
-            if cli::is_running() {
-                eprintln!("yutani is already running");
-                Ok(ExitCode::from(1))
-            } else {
-                let config = model::config::Config::load();
-                // The IPC server owns the socket file: it is removed on
-                // `quit`, and a stale one (crash/SIGTERM) is replaced at bind.
-                // Do not remove it here: if this process lost libcosmic's
-                // single-instance race, `ui::run` returns Ok at once and the
-                // socket belongs to the winning instance.
-                ui::run(config).map(|()| ExitCode::SUCCESS).map_err(anyhow::Error::from)
-            }
-        }
+        None => run_daemon(),
     };
     match result {
         Ok(code) => code,

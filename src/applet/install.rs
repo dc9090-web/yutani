@@ -110,7 +110,8 @@ pub fn desktop_entry(exec: &str) -> String {
 }
 
 /// The launcher entry: an ordinary visible application that starts the
-/// daemon. `Icon=y-color` is the full-colour mark `ICONS` puts in
+/// daemon — through `yutani start`, so a `yutani service install` (crash
+/// auto-restart) is honoured without rewriting this file. `Icon=y-color` is the full-colour mark `ICONS` puts in
 /// `hicolor/scalable/apps` — the handoff's app icon, and the one thing in
 /// the theme the shell will not recolour.
 pub fn launcher_entry(exec: &str) -> String {
@@ -119,7 +120,7 @@ pub fn launcher_entry(exec: &str) -> String {
          Type=Application\n\
          Name=Yutani\n\
          Comment=Live thumbnails and client switching for EVE Online\n\
-         Exec={exec}\n\
+         Exec={exec} start\n\
          Icon=y-color\n\
          Terminal=false\n\
          Categories=Game;Utility;\n\
@@ -286,7 +287,7 @@ mod tests {
             "Type=Application",
             "Name=Yutani",
             "Comment=Live thumbnails and client switching for EVE Online",
-            "Exec=/usr/local/bin/yutani",
+            "Exec=/usr/local/bin/yutani start",
             "Icon=y-color",
             "Terminal=false",
             "Categories=Game;Utility;",
@@ -323,7 +324,7 @@ mod tests {
         let applet = std::fs::read_to_string(&s.paths.applet).unwrap();
         assert!(applet.contains("Exec=/opt/yutani-applet"));
         let launcher = std::fs::read_to_string(&s.paths.launcher).unwrap();
-        assert!(launcher.contains("Exec=/opt/yutani\n"));
+        assert!(launcher.contains("Exec=/opt/yutani start\n"));
         assert!(launcher.contains("Icon=y-color"));
         // Running it again rewrites the same seven files, not more.
         assert_eq!(install(&s), 7);
