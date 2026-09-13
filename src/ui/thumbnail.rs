@@ -14,12 +14,19 @@ use crate::model::config::{Config, Mode, parse_color};
 /// window's aspect as displayed (a raw frame with a 90°/270° transform is
 /// shown with its axes swapped).
 pub fn size(config: &Config, image: Option<&CaptureImage>) -> (u32, u32) {
+    size_at_width(config.thumb_width, config.border_px, image)
+}
+
+/// `size` at an explicit content width: the hover zoom scales the width
+/// alone, and this runs per frame and per dock relayout, so it takes the
+/// two numbers rather than a `Config` (six `Vec<String>`s to clone).
+fn size_at_width(thumb_width: u32, border_px: u32, image: Option<&CaptureImage>) -> (u32, u32) {
     match image {
         Some(img) if img.width > 0 && img.height > 0 => {
             let (w, h) = if swaps_axes(img.transform) { (img.height, img.width) } else { (img.width, img.height) };
-            size_for(config, w, h)
+            size_for_width(thumb_width, border_px, w, h)
         }
-        _ => size_for(config, 16, 9),
+        _ => size_for_width(thumb_width, border_px, 16, 9),
     }
 }
 
@@ -29,17 +36,20 @@ pub fn zoomed_size(config: &Config, image: Option<&CaptureImage>, zoomed: bool) 
     if !zoomed {
         return size(config, image);
     }
-    let scaled = Config {
-        thumb_width: (config.thumb_width as f32 * config.zoom_factor).round() as u32,
-        ..config.clone()
-    };
-    size(&scaled, image)
+    let width = (config.thumb_width as f32 * config.zoom_factor).round() as u32;
+    size_at_width(width, config.border_px, image)
 }
 
 pub fn size_for(config: &Config, src_w: u32, src_h: u32) -> (u32, u32) {
-    let inner_w = config.thumb_width.max(1);
+    size_for_width(config.thumb_width, config.border_px, src_w, src_h)
+}
+
+/// Surface size for a `src_w`×`src_h` source shown `thumb_width` wide
+/// inside a `border_px` border.
+pub fn size_for_width(thumb_width: u32, border_px: u32, src_w: u32, src_h: u32) -> (u32, u32) {
+    let inner_w = thumb_width.max(1);
     let inner_h = ((inner_w as u64 * src_h as u64) / src_w.max(1) as u64) as u32;
-    (inner_w + 2 * config.border_px, inner_h.max(1) + 2 * config.border_px)
+    (inner_w + 2 * border_px, inner_h.max(1) + 2 * border_px)
 }
 
 pub fn view<'a>(client: &'a Client, config: &Config) -> Element<'a, Msg> {
