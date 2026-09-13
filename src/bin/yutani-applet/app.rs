@@ -16,6 +16,7 @@ use yutani::applet::display::{Display, degrade, display};
 use yutani::applet::rate::{Rates, Sampler};
 use yutani::applet::{
     Action, PENDING_S, Poll, daemon_exe, note_visible, pending_done, poll_interval, still_pending,
+    waiting_note,
 };
 use yutani::tunnel::status::Status;
 
@@ -38,17 +39,22 @@ pub struct Applet {
     /// behind it. See [`Poll`].
     pub poll: Poll,
     pub accounts_open: bool,
-    /// The last `err …` reply, shown for 3 s.
+    /// The last `err …` reply, shown for 3 s — or what a tunnel action is
+    /// still doing, shown until the daemon answers it.
     pub note: Option<Note>,
 }
 
-/// A one-line error note (spec §7): what went wrong, when it was said, and
-/// which menu row it belongs under. `action` is `None` for a failed poll,
-/// which belongs to no row and sits at the foot of the menu instead.
+/// A one-line note under a menu row (spec §7): what went wrong, when it was
+/// said, and which row it belongs under. `action` is `None` for a failed
+/// poll, which belongs to no row and sits at the foot of the menu instead.
+/// A `progress` note is not an error but what a slow action is doing while
+/// it is awaited (`waiting_note`); it is muted rather than red and lives
+/// until the action's reply replaces or clears it, not for `NOTE_MS`.
 pub struct Note {
     pub text: String,
     pub at_ms: u64,
     pub action: Option<Action>,
+    pub progress: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -122,7 +128,29 @@ impl Applet {
 
     fn note(&mut self, text: String, action: Option<Action>) {
         let at_ms = self.now_ms();
-        self.note = Some(Note { text, at_ms, action });
+        self.note = Some(Note { text, at_ms, action, progress: false });
+    }
+
+    /// Say what `action` is doing while its reply is awaited, if it is one
+    /// of the slow ones.
+    fn waiting(&mut self, action: Action) {
+        if let Some(text) = waiting_note(action) {
+            let at_ms = self.now_ms();
+            self.note = Some(Note { text, at_ms, action: Some(action), progress: true });
+        }
+    }
+
+    /// The reply to `action` is in: whatever it said, the wait is over.
+    fn done_waiting(&mut self, action: Action) {
+        if self.note.as_ref().is_some_and(|n| n.progress && n.action == Some(action)) {
+            self.note = None;
+        }
+    }
+
+    /// The note the menu shows right now: an error for `NOTE_MS` after it
+    /// was set, a progress note for as long as it is there.
+    pub fn visible_note(&self) -> Option<&Note> {
+        self.note.as_ref().filter(|n| n.progress || note_visible(n.at_ms, self.now_ms()))
     }
 }
 
@@ -176,9 +204,7 @@ impl cosmic::Application for Applet {
             if matches!(message, Msg::Status(_)) { self.replied() } else { Task::none() };
         match message {
             Msg::Tick => {
-                if let Some(note) = self.note.as_ref()
-                    && !note_visible(note.at_ms, self.now_ms())
-                {
+                if self.note.is_some() && self.visible_note().is_none() {
                     self.note = None;
                 }
                 if self.poll.tick() { Self::status_task() } else { Task::none() }
@@ -242,6 +268,7 @@ impl cosmic::Application for Applet {
                     let want = matches!(action, Action::Connect);
                     self.pending = Some((want, Instant::now() + Duration::from_secs(PENDING_S)));
                 }
+                self.waiting(action);
                 cosmic::task::future(async move {
                     let result =
                         client::send(request).await.map(|_| ()).map_err(|err| err.to_string());
@@ -263,7 +290,10 @@ impl cosmic::Application for Applet {
                 self.rates = Rates::default();
                 self.poll()
             }
-            Msg::Done(_, Ok(())) => self.poll(),
+            Msg::Done(action, Ok(())) => {
+                self.done_waiting(action);
+                self.poll()
+            }
             Msg::Done(action, Err(msg)) => {
                 if matches!(action, Action::Connect | Action::Disconnect) {
                     self.pending = None;
@@ -341,6 +371,8 @@ pub fn close_popup_message(id: Id) -> Msg {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cosmic::Application as _;
+    use yutani::applet::NOTE_MS;
 
     /// How many of this process's children `/proc` currently lists as
     /// zombies (state `Z`) — i.e. exited but not yet `wait`ed on.
@@ -394,5 +426,39 @@ mod tests {
         let mut cmd = Command::new("/no/such/binary-yutani-test");
         let err = spawn_detached(&mut cmd).expect_err("must not exist");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    fn applet() -> Applet {
+        Applet::init(Core::default(), ()).0
+    }
+
+    /// I2: a connect/disconnect can take up to 15 s to be answered, so the
+    /// menu says what is happening under the row the whole time — a note
+    /// that, unlike an error, does not expire after `NOTE_MS` — and the
+    /// daemon's answer replaces it: nothing on success, the error on failure.
+    #[test]
+    fn a_tunnel_press_says_what_is_happening_until_the_daemon_answers() {
+        let mut applet = applet();
+        let _ = applet.update(Msg::Press(Action::Connect));
+        let note = applet.note.as_ref().expect("a waiting note");
+        assert_eq!(note.action, Some(Action::Connect));
+        assert!(note.progress, "waiting, not an error");
+        assert!(note.text.contains("onnecting"), "{}", note.text);
+        assert!(applet.visible_note().is_some(), "shown at once");
+        // Well past NOTE_MS, still waiting: still shown, and a tick keeps it.
+        applet.started = Instant::now() - Duration::from_millis(NOTE_MS * 3);
+        let _ = applet.update(Msg::Tick);
+        assert!(applet.visible_note().is_some(), "a waiting note does not expire");
+
+        let _ = applet.update(Msg::Done(Action::Connect, Ok(())));
+        assert!(applet.note.is_none(), "the answer ends the wait");
+
+        let _ = applet.update(Msg::Press(Action::Disconnect));
+        assert!(applet.note.as_ref().is_some_and(|n| n.progress && n.text.contains("isconnecting")));
+        let _ = applet.update(Msg::Done(Action::Disconnect, Err("timeout after 15000ms".into())));
+        let note = applet.note.as_ref().expect("the error replaces the wait");
+        assert!(!note.progress);
+        assert_eq!(note.action, Some(Action::Disconnect));
+        assert!(note.text.contains("timeout"), "{}", note.text);
     }
 }

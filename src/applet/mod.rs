@@ -57,6 +57,19 @@ impl Action {
     }
 }
 
+/// What the menu says under a Connect/Disconnect row while the daemon is
+/// still working on it — up to [`client::TUNNEL_TIMEOUT`], most of which
+/// would otherwise be a row that looks ignored. `None` for every other
+/// action: they are answered at once.
+pub fn waiting_note(action: Action) -> Option<String> {
+    let verb = match action {
+        Action::Connect => "connecting",
+        Action::Disconnect => "disconnecting",
+        _ => return None,
+    };
+    Some(format!("{verb}… (up to {} s)", client::TUNNEL_TIMEOUT.as_secs()))
+}
+
 /// 1 s with the popup open, 5 s with it closed (spec §2). The applet's
 /// timer subscription is keyed on this duration, so flipping it restarts
 /// the timer — which is exactly the intent.
@@ -160,6 +173,16 @@ mod tests {
         assert_eq!(Action::Quit.request(), Some(Request::Quit));
         assert_eq!(Action::Preferences.request(), Some(crate::ipc::Request::Settings));
         assert_eq!(Action::StartDaemon.request(), None);
+    }
+
+    /// I2: only the two tunnel actions keep the user waiting.
+    #[test]
+    fn only_the_tunnel_actions_have_something_to_say_while_waiting() {
+        assert_eq!(waiting_note(Action::Connect).as_deref(), Some("connecting… (up to 15 s)"));
+        assert_eq!(waiting_note(Action::Disconnect).as_deref(), Some("disconnecting… (up to 15 s)"));
+        for action in [Action::ShowThumbs, Action::HideThumbs, Action::Focus(1), Action::Quit, Action::Preferences, Action::StartDaemon] {
+            assert_eq!(waiting_note(action), None, "{action:?}");
+        }
     }
 
     #[test]
