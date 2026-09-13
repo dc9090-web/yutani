@@ -208,11 +208,30 @@ fn ensure_dir(dir: &Path, mode: u32) -> anyhow::Result<()> {
     create_dir_with_mode(dir, mode)
 }
 
-fn write(path: &str, text: &str, mode: u32, dir_mode: u32) -> anyhow::Result<()> {
+/// Write `text` at `path` with `mode`, creating (or verifying) its
+/// directory. Returns whether anything changed: a file that already holds
+/// exactly `text` at exactly `mode` is left alone, so a repeated install of
+/// the same conf is a no-op an installer (Ansible's `changed_when`) can
+/// tell apart from a real one.
+fn write(path: &str, text: &str, mode: u32, dir_mode: u32) -> anyhow::Result<bool> {
     if let Some(dir) = Path::new(path).parent() {
         ensure_dir(dir, dir_mode)?;
     }
-    write_with_mode(path, text, mode)
+    if already_written(path, text, mode) {
+        return Ok(false);
+    }
+    write_with_mode(path, text, mode).map(|()| true)
+}
+
+/// Whether `path` already holds exactly `text` at exactly `mode`. Any
+/// doubt (unreadable, a directory, a symlink) is "no", and the write goes
+/// ahead as it always did.
+fn already_written(path: &str, text: &str, mode: u32) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return false };
+    if !meta.is_file() || meta.permissions().mode() & 0o7777 != mode {
+        return false;
+    }
+    std::fs::read(path).is_ok_and(|bytes| bytes == text.as_bytes())
 }
 
 /// The stored conf as it is safe to print: key material replaced.
@@ -251,6 +270,11 @@ fn check_pkexec_uid(pkexec_uid: Option<&str>, uid: u32) -> anyhow::Result<()> {
     ensure!(got == uid, "PKEXEC_UID is {got} but --uid is {uid}: refusing to install for another user");
     Ok(())
 }
+
+/// The last line of an `install_root` report when every file it would
+/// have written already held exactly that (a re-run with the same conf and
+/// the same DNS settings). `deploy/ansible` keys its `changed` flag on it.
+pub const NOTHING_CHANGED_MARKER: &str = "# nothing changed: the same tunnel was already installed";
 
 /// Marks a failed check in a dry-run report (see `install_root`'s `refuse`
 /// closure). Shared with [`report_has_failure`] so the two can never drift.
@@ -346,15 +370,21 @@ pub fn install_root(
         return Ok(report);
     }
     // 0700: only root ever reads the conf, and it holds the private key.
-    write(CONF_PATH, &stored, 0o600, 0o700)?;
-    write(UNIT_PATH, &unit, 0o644, 0o755)?;
-    write(POLKIT_PATH, &rule, 0o644, 0o755)?;
+    // All three are written before the result is looked at: a partial
+    // earlier install (say, a conf without its unit) is completed, not
+    // skipped.
+    let changed = [
+        write(CONF_PATH, &stored, 0o600, 0o700)?,
+        write(UNIT_PATH, &unit, 0o644, 0o755)?,
+        write(POLKIT_PATH, &rule, 0o644, 0o755)?,
+    ]
+    .contains(&true);
     let st = Command::new("systemctl").arg("daemon-reload").status().context("systemctl daemon-reload")?;
     ensure!(st.success(), "systemctl daemon-reload failed");
     if parsed.dns.is_none() {
         eprintln!("warning: the conf has no DNS entry; EVE's DNS lookups will not go through the tunnel");
     }
-    Ok(report)
+    Ok(if changed { report } else { format!("{report}{NOTHING_CHANGED_MARKER}\n") })
 }
 
 /// Uninstall proceeds even when nothing is installed, so a stop that had
@@ -761,6 +791,29 @@ mod tests {
         created.unwrap();
         use std::os::unix::fs::PermissionsExt as _;
         assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777, 0o755);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_file_already_holding_the_text_at_the_mode_is_not_rewritten() {
+        let base = std::env::temp_dir().join(format!("yutani-install-unchanged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("tunnel.conf");
+        let path = path.to_str().unwrap();
+        // Nothing there yet: a write is due.
+        assert!(!already_written(path, "[Interface]\n", 0o600));
+        write_with_mode(path, "[Interface]\n", 0o600).unwrap();
+        assert!(already_written(path, "[Interface]\n", 0o600));
+        // Different text, or the same text at a different mode: due again.
+        assert!(!already_written(path, "[Interface]\nDNS = 1.1.1.1\n", 0o600));
+        assert!(!already_written(path, "[Interface]\n", 0o644));
+        // A symlink to the right content is not the file root wrote.
+        let link = base.join("link.conf");
+        std::os::unix::fs::symlink(path, &link).unwrap();
+        assert!(!already_written(link.to_str().unwrap(), "[Interface]\n", 0o600));
+        // The marker only ever ends a report; the dry run never claims it.
+        assert!(!NOTHING_CHANGED_MARKER.contains(CHECK_FAILED_MARKER));
         std::fs::remove_dir_all(&base).unwrap();
     }
 }

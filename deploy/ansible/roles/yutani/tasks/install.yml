@@ -11,3 +11,5 @@
   loop:
     - yutani
     - yutani-applet
+  # user.yml restarts a running daemon when this changed.
+  register: yutani_binaries

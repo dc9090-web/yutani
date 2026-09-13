@@ -464,8 +464,11 @@ pub fn view<'a>(
         .padding(16)
         .width(Length::Fill)
         .height(Length::Fill);
-    // The whole page is the drop target for the Tunnel page's `.conf`
-    // (`tunnel_page::DroppedFiles` names the MIME types it takes). This —
+    // The whole window — header bar included, so a file let go anywhere
+    // on it lands — is the drop target for the Tunnel page's `.conf`
+    // (`tunnel_page::DroppedFiles` names the MIME types it takes). The
+    // destination widget hands every ordinary event to its child first,
+    // so the header bar's drag and close still work inside it. This —
     // libcosmic's drag-and-drop destination widget, fed by the compositor's
     // data device — is the only route a drop takes on Wayland;
     // `iced::window::Event::FileDropped` is winit's X11/macOS/Windows
@@ -478,24 +481,25 @@ pub fn view<'a>(
     // COPY: this window records a path, it never takes the file, so a file
     // manager that honours MOVE must not delete the user's only copy of the
     // private key before Install has run.
-    let dropzone: Element<'a, Msg> =
-        widget::dnd_destination::dnd_destination_for_data::<super::tunnel_page::DroppedFiles, _>(
-            page,
-            |data, _action| Msg::FilesDropped(data.map(|files| files.0).unwrap_or_default()),
-        )
-        .drag_id(SETTINGS_DROP_ID)
-        .action(cosmic::iced::clipboard::dnd::DndAction::Copy)
-        .preferred_action(cosmic::iced::clipboard::dnd::DndAction::Copy)
-        .into();
-    let content: Element<'a, Msg> = widget::container(widget::column::with_children(vec![
+    let window = widget::column::with_children(vec![
         widget::header_bar()
             .title("Yutani Settings")
             .on_close(Msg::Close)
             .on_drag(Msg::Drag)
             .focused(focused)
             .into(),
-        dropzone,
-    ]))
+        page.into(),
+    ]);
+    let dropzone: Element<'a, Msg> =
+        widget::dnd_destination::dnd_destination_for_data::<super::tunnel_page::DroppedFiles, _>(
+            window,
+            |data, _action| Msg::FilesDropped(data.map(|files| files.0).unwrap_or_default()),
+        )
+        .drag_id(SETTINGS_DROP_ID)
+        .action(cosmic::iced::clipboard::dnd::DndAction::Copy)
+        .preferred_action(cosmic::iced::clipboard::dnd::DndAction::Copy)
+        .into();
+    let content: Element<'a, Msg> = widget::container(dropzone)
     .class(cosmic::theme::Container::WindowBackground)
     .width(Length::Fill)
     .height(Length::Fill)

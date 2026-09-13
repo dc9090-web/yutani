@@ -33,6 +33,41 @@
     enabled: true
   when: yutani_install_service | bool and yutani_enable_service_at_login | bool
 
+# New binaries only take effect in a daemon that is restarted. Only a
+# daemon that is running under its unit is restarted: one that is not
+# running is left alone (the user starts Yutani when they want it), and one
+# started outside the unit (`yutani start` before `service install`) is not
+# systemd's to restart. The tunnel is a separate root unit and stays up. The
+# panel keeps running the old applet until it is restarted (log out and in,
+# or `pkill -x cosmic-panel`); the README says so.
+- name: Is the daemon running under its unit?
+  become: true
+  become_user: "{{ yutani_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ yutani_uid }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ yutani_uid }}/bus"
+  ansible.builtin.command: systemctl --user is-active yutani.service
+  register: yutani_unit_active
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: yutani_install_service | bool
+
+- name: Restart the running daemon on new binaries
+  become: true
+  become_user: "{{ yutani_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ yutani_uid }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ yutani_uid }}/bus"
+  ansible.builtin.systemd:
+    scope: user
+    name: yutani.service
+    state: restarted
+  when:
+    - yutani_install_service | bool
+    - yutani_binaries is changed
+    - yutani_unit_active.rc | default(1) == 0
+
 - name: COSMIC keyboard shortcuts
   become: true
   become_user: "{{ yutani_user }}"

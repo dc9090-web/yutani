@@ -135,6 +135,13 @@ pub struct App {
     pub last_eve_focus: Option<Instant>,
     /// The settings window while it is open (spec §6).
     pub settings: Option<settings::State>,
+    /// The `.conf` a tunnel install/uninstall/connect/disconnect started
+    /// from, while that action runs on the blocking pool. It lives here and
+    /// not in the window's state because the window can be closed and
+    /// reopened while pkexec is still asking for the password: the new
+    /// window must start out busy, must not start a second pkexec, and the
+    /// note at the end must name the file the action *started* with.
+    pub tunnel_in_flight: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -1163,7 +1170,10 @@ impl App {
                 .map(|token| cosmic::Action::App(Msg::Settings(settings::Msg::Raise(token))));
         }
         let (id, open) = cosmic::iced::window::open(settings::window_settings(Self::APP_ID));
-        self.settings = Some(settings::State::new(id, &self.config));
+        let mut state = settings::State::new(id, &self.config);
+        // A tunnel action outlives the window it was started from.
+        state.tunnel.busy = self.tunnel_in_flight.is_some();
+        self.settings = Some(state);
         let title = self.set_window_title("Yutani Settings".to_string(), id);
         Task::batch([title, open.map(|_| cosmic::Action::App(Msg::Settings(settings::Msg::Opened)))])
     }
@@ -1612,17 +1622,17 @@ impl App {
     /// happened. It never names anything from inside the `.conf`, only its
     /// file name.
     fn tunnel_done(&mut self, action: settings::TunnelAction, result: Result<(), String>) -> String {
-        let Some(state) = self.settings.as_mut() else { return String::new() };
-        state.tunnel.busy = false;
         // The file the action *started* with, not whatever the field holds
         // now: the path can have been re-typed or dropped on while pkexec
         // was asking for a password, and the note would then name a file
-        // that was never installed.
-        let conf = state
-            .tunnel
-            .pending_conf
-            .take()
-            .unwrap_or_else(|| PathBuf::from(state.tunnel.conf_path.trim()));
+        // that was never installed. Taken whether or not the window is
+        // still there — the action is over either way.
+        let conf = self.tunnel_in_flight.take().unwrap_or_default();
+        let Some(state) = self.settings.as_mut() else {
+            tracing::info!(?action, ok = result.is_ok(), "tunnel action finished after its window closed");
+            return String::new();
+        };
+        state.tunnel.busy = false;
         match (action, result) {
             (settings::TunnelAction::Install, result) => tunnel_page::install_note(&conf, result),
             (_, Err(e)) => e,
@@ -1665,11 +1675,17 @@ impl App {
     /// and are not covered by this flag: systemd serialises the two, and
     /// the status refresh at the end reports whatever actually happened.
     fn run_tunnel_action(&mut self, action: settings::TunnelAction) -> Task<cosmic::Action<Msg>> {
+        // One at a time: a message that slips in while pkexec is up (from a
+        // window reopened mid-prompt, say) must not start a second prompt.
+        if self.tunnel_in_flight.is_some() {
+            self.settings_note(tunnel_page::BUSY.to_string());
+            return Task::none();
+        }
         let Some(state) = self.settings.as_mut() else { return Task::none() };
         state.tunnel.busy = true;
         let conf = PathBuf::from(state.tunnel.conf_path.trim());
         // What the note at the end has to name; cleared by `tunnel_done`.
-        state.tunnel.pending_conf = Some(conf.clone());
+        self.tunnel_in_flight = Some(conf.clone());
         let (servers, domains) = (self.config.tunnel.dns_servers.clone(), self.config.tunnel.dns_domains.clone());
         cosmic::iced::Task::perform(
             async move {
@@ -1783,6 +1799,7 @@ impl Application for App {
             drag: None,
             hidden: false,
             last_eve_focus: None,
+            tunnel_in_flight: None,
             settings: None,
         };
         (app, Task::none())

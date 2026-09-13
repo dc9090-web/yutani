@@ -10,6 +10,9 @@
         group: root
         mode: "0600"
       no_log: true
+      # Scaffolding for the step below, removed again in `always`: not a
+      # change to the machine.
+      changed_when: false
 
     - name: Write the tunnel unit, conf and polkit rule
       become: true
@@ -22,7 +25,11 @@
               '--exe', yutani_prefix ~ '/yutani']
              + (['--dns-servers', yutani_dns_servers | join(',')] if yutani_dns_servers | length > 0 else [])
              + (['--dns-domains', yutani_dns_domains | join(',')] if yutani_dns_domains | length > 0 else []) }}
-      changed_when: true
+      register: yutani_tunnel_install
+      # `install-root` ends its report with this line when every file it
+      # writes already held exactly that (same conf, same DNS settings):
+      # the marker is `NOTHING_CHANGED_MARKER` in src/tunnel/install.rs.
+      changed_when: "'# nothing changed:' not in yutani_tunnel_install.stdout"
       # The report names the endpoint and address; keep them out of the log.
       # On failure, re-run the command by hand as root to see the reason.
       no_log: true
@@ -32,3 +39,4 @@
       ansible.builtin.file:
         path: /root/yutani-wg.conf
         state: absent
+      changed_when: false

@@ -2,8 +2,10 @@
 
 One role, `yutani`, takes a fresh COSMIC machine (Arch/CachyOS today) to a
 fully installed Yutani. Re-running it is safe: every Yutani subcommand it
-calls rewrites the same files, and the build reports `changed` only when
-cargo actually compiled something.
+calls rewrites the same files, and only three things ever report `changed`
+— the build when cargo actually compiled something, the binaries when they
+differ from the installed ones, and the tunnel when its files differ from
+what is already under `/etc/yutani`.
 
 ## What it does
 
@@ -20,7 +22,9 @@ cargo actually compiled something.
 4. **User integration** (as the desktop user, with their `XDG_RUNTIME_DIR`
    and session bus): `yutani applet install`, `yutani service install`
    (plus `systemctl --user enable yutani.service` when
-   `yutani_enable_service_at_login`), and `yutani shortcuts install`.
+   `yutani_enable_service_at_login`), a restart of the daemon when new
+   binaries were installed and it is running under its unit (a daemon that
+   is not running is left alone), and `yutani shortcuts install`.
 5. **Tunnel** (root, only when `yutani_wg_conf` is set): the WireGuard
    configuration is copied to the target at mode `0600`, `yutani tunnel
    install-root` writes `/etc/yutani/tunnel.conf`, the unit and the polkit
@@ -85,3 +89,9 @@ them.
 One manual step is left, as with the hand install: **Settings → Desktop →
 Panel → Applets → add "Yutani"**. The tunnel, if installed, is started with
 `yutani tunnel connect` or from the settings window's Tunnel page.
+
+A running daemon picks up new binaries on the spot (the play restarts its
+unit). The panel applet does not: cosmic-panel keeps the process it
+started, so after an upgrade the applet runs the old binary until the panel
+is restarted — log out and in, or `pkill -x cosmic-panel` (the session
+respawns it).

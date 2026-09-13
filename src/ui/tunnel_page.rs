@@ -16,7 +16,6 @@ use cosmic::Element;
 use cosmic::iced::Length;
 use cosmic::iced::clipboard::mime::AllowedMimeTypes;
 use cosmic::widget;
-use cosmic::widget::dnd_destination::FILE_TRANSFER_MIME;
 
 use yutani::model::config::Config;
 use yutani::tunnel::status::TunnelStatus;
@@ -31,10 +30,20 @@ pub const NOT_A_CONF_DROP: &str = "dropped, but that was not a .conf file";
 pub const BUSY: &str = "Waiting for the previous action to finish…";
 
 /// Whether the XDG file-chooser portal is compiled in (libcosmic's
-/// `xdg-portal` feature, enabled in `Cargo.toml`). A one-line change here
-/// is the whole fallback if that feature ever has to go: the Browse…
-/// button disappears and the typed path and drop route stay.
+/// `xdg-portal` feature, enabled in `Cargo.toml`). If that feature ever
+/// has to go, the fallback is this constant plus `App::browse_tunnel_conf`
+/// (the only other place that names `cosmic::dialog::file_chooser`): the
+/// Browse… button disappears and the typed path and drop route stay. This
+/// module deliberately imports nothing else the feature gates — the
+/// portal's drag MIME type is spelled out below rather than taken from
+/// libcosmic — so the drop route does not go with it.
 pub const CAN_BROWSE: bool = true;
+
+/// The type the XDG document portal offers for a file dragged out of a
+/// sandboxed app: its payload is a portal token, not a path. Spelled out
+/// here (and checked against libcosmic's constant in the tests) so that
+/// the drop route does not depend on the `xdg-portal` feature.
+pub const FILE_TRANSFER_MIME: &str = "application/vnd.portal.filetransfer";
 
 /// The MIME type a file manager offers for a dragged file: one URI per
 /// line (RFC 2483). A Wayland client hears about a drop *only* through the
@@ -47,13 +56,12 @@ pub const URI_LIST_MIME: &str = "text/uri-list";
 pub struct State {
     /// The `.conf` path as typed, browsed or dropped.
     pub conf_path: String,
-    /// The path an install/uninstall in flight was started with, so the
-    /// note it leaves names *that* file and not whatever has been typed
-    /// into the field since. `None` while nothing is in flight.
-    pub pending_conf: Option<PathBuf>,
     /// The last status read (`None` before the first refresh).
     pub status: Option<TunnelStatus>,
-    /// An install/uninstall/connect/disconnect is in flight.
+    /// An install/uninstall/connect/disconnect is in flight. The action
+    /// itself belongs to the daemon (`App::tunnel_in_flight`), which
+    /// outlives this window: a window opened while pkexec is still asking
+    /// for the password starts out busy too.
     pub busy: bool,
     /// Whether the file chooser could be built in ([`CAN_BROWSE`]).
     pub can_browse: bool,
@@ -382,5 +390,35 @@ mod tests {
         );
         assert!(DroppedFiles::try_from((b"1234567".to_vec(), FILE_TRANSFER_MIME.to_string())).is_err());
         assert_eq!(DroppedFiles::allowed().first().map(String::as_str), Some(URI_LIST_MIME));
+    }
+
+    #[test]
+    fn the_portal_mime_type_is_the_one_libcosmic_uses() {
+        // Spelled out locally so the drop route survives without the
+        // `xdg-portal` feature; it must still be the type libcosmic (and
+        // the portal) actually speak.
+        assert_eq!(FILE_TRANSFER_MIME, cosmic::widget::dnd_destination::FILE_TRANSFER_MIME);
+    }
+
+    #[test]
+    fn percent_decoding_keeps_bad_escapes_and_non_utf8_bytes() {
+        assert_eq!(percent_decode("a%20b"), b"a b");
+        // Either case of hex digit.
+        assert_eq!(percent_decode("%2f%2F"), b"//");
+        // An escape that is not one stays as the characters it is.
+        assert_eq!(percent_decode("100%"), b"100%");
+        assert_eq!(percent_decode("50%4"), b"50%4");
+        assert_eq!(percent_decode("%zz%g0"), b"%zz%g0");
+        // A `%` right before a good escape: the first is literal, the
+        // second decodes.
+        assert_eq!(percent_decode("%%41"), b"%A");
+        // A file name that is not UTF-8 is still a file name on Linux.
+        assert_eq!(percent_decode("caf%E9.conf"), b"caf\xe9.conf");
+        assert_eq!(percent_decode(""), b"");
+        // Through the URI route, the bytes reach the path unchanged.
+        assert_eq!(
+            parse_uri_list(b"file:///tmp/caf%E9%20x.conf"),
+            vec![PathBuf::from(OsString::from_vec(b"/tmp/caf\xe9 x.conf".to_vec()))]
+        );
     }
 }
