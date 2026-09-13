@@ -224,9 +224,11 @@ pub fn restore_plan(backup: &Path, dir: &Path) -> std::io::Result<Vec<PathBuf>> 
     // The same character ids exist in every profile of the same accounts,
     // so a backup taken from another profile (before `eve_settings_dir`
     // changed, say) would restore cleanly and wrongly. A backup without
-    // the tag predates it and is trusted as before.
+    // the tag predates it and is trusted as before. Compared as paths,
+    // not strings: the tag is a `parent()` and never ends in a separator,
+    // while an `eve_settings_dir` override reaches here as written.
     if let Ok(tagged) = std::fs::read_to_string(backup.join(PROFILE_TAG)) {
-        if tagged.trim() != dir.display().to_string() {
+        if Path::new(tagged.trim()) != dir {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("backup {} was taken from {}, not {}", backup.display(), tagged.trim(), dir.display()),
@@ -540,6 +542,25 @@ mod tests {
         execute(&plan(&listing, 1, None).unwrap(), &backup2).unwrap();
         assert_eq!(std::fs::read_to_string(backup2.join(PROFILE_TAG)).unwrap().trim(), a.display().to_string());
         assert!(restore_plan(&backup2, &b).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `eve_settings_dir` written with a trailing slash reaches `restore_plan`
+    /// verbatim; the tag (`dir.join(name).parent()`) never has one. The two
+    /// name the same directory and the restore must not be refused.
+    #[test]
+    fn a_trailing_slash_on_the_profile_dir_still_matches_the_tag() {
+        let dir = tmpdir("profile-tag-slash");
+        let a = dir.join("settings_Default");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("core_char_1.dat"), b"a").unwrap();
+        let slashed = PathBuf::from(format!("{}/", a.display()));
+        let backup = dir.join("backups").join("20260913T024100Z");
+        assert_eq!(backup_files(&[slashed.join("core_char_1.dat")], &backup).unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(backup.join(PROFILE_TAG)).unwrap().trim(), a.display().to_string());
+        let targets = restore_plan(&backup, &slashed).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(targets, vec![slashed.join("core_char_1.dat")]);
+        assert!(restore_plan(&backup, &dir.join("settings_Other/")).is_err(), "another profile is still refused");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
