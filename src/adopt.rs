@@ -187,6 +187,12 @@ impl Tracker {
     }
 }
 
+/// Whether `pid` still exists (has a `/proc` entry). A candidate can exit
+/// between `scan` and `adopt`; `busctl` then fails with "No such process",
+/// which is not an adoption failure worth a warning.
+fn process_exists(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
 
 /// Scan every 2 s; adopt what's new; report each pid's outcome once
 /// (successes always, failures only until warned — see [`Tracker`]).
@@ -219,6 +225,11 @@ fn run(patterns: &Vec<String>) -> iced::futures::stream::BoxStream<'static, Adop
                 let target = c.clone();
                 let result = off_thread(move || adopt(&target).map_err(|e| format!("{e:#}"))).await.unwrap_or_else(Err);
                 let ok = result.is_ok();
+                if !ok && !process_exists(c.pid) {
+                    // It merely quit (EVE closing in the window between the
+                    // scan and the call); nothing to warn about or back off.
+                    continue;
+                }
                 if tracker.note(c.pid, ok) {
                     let _ = tx.send(AdoptEvent { pid: c.pid, name: c.name.clone(), result }).await;
                 }
@@ -289,6 +300,15 @@ mod tests {
                 "0",
             ]
         );
+    }
+
+    #[test]
+    fn process_exists_tells_a_live_pid_from_one_that_has_quit() {
+        assert!(process_exists(std::process::id()));
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!process_exists(pid), "a reaped child has no /proc entry");
     }
 
     #[test]
