@@ -184,12 +184,24 @@ pub enum Msg {
     /// thumbnails if it has not come back.
     FocusGraceOver,
     Adopt(adopt::AdoptEvent),
+    /// The Characters page's files, read on the blocking pool by
+    /// `refresh_characters`; `on_characters_listed` takes them from here.
+    CharactersListed(CharactersListed),
     /// Files were dropped on one of our windows. Only the settings window
     /// cares (the Tunnel page takes a `.conf` this way); `FileHovered` is
     /// deliberately *not* a message — it repeats for every pointer motion
     /// while the drag is over the window.
     FileDropped(SurfaceId, Vec<PathBuf>),
     Settings(settings::Msg),
+}
+
+/// What the Characters page reads from disk: the profile listing (or why
+/// there is none), the newest backup, and the cached character names.
+#[derive(Clone, Debug)]
+pub struct CharactersListed {
+    pub listing: Result<yutani::eve_settings::Listing, String>,
+    pub last_backup: Option<PathBuf>,
+    pub cached: yutani::eve_settings::names::Names,
 }
 
 /// How an IPC request is answered. Every request produces exactly one
@@ -1615,7 +1627,11 @@ impl App {
     }
 
     /// Characters page: re-read the profile listing, the newest backup and
-    /// the name cache, then ask ESI for any id still unnamed (blocking pool).
+    /// the name cache — on the blocking pool: `discover` walks the EVE
+    /// settings tree and every Steam library root in `libraryfolders.vdf`,
+    /// and a library on a spun-down disk or an unreachable mount would
+    /// otherwise stall every thumbnail for the stat/readdir latency. The
+    /// result arrives as `Msg::CharactersListed`.
     fn refresh_characters(&mut self) -> Task<cosmic::Action<Msg>> {
         // No window, nothing to refresh: the listing walk and the cache
         // read would be thrown away.
@@ -1624,15 +1640,37 @@ impl App {
         }
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let override_dir = self.config.eve_settings_dir.clone();
-        let listing = yutani::eve_settings::discover(override_dir.as_deref().map(Path::new), &home)
-            .and_then(|dir| yutani::eve_settings::list(&dir).map_err(|e| format!("cannot read {}: {e}", dir.display())));
         let backups = yutani::eve_settings::copy::backups_dir(&dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")));
         let cache = yutani::eve_settings::names::cache_path(&dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")));
-        let cached = yutani::eve_settings::names::load_cache(&cache);
+        cosmic::iced::Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || CharactersListed {
+                    listing: yutani::eve_settings::discover(override_dir.as_deref().map(Path::new), &home).and_then(
+                        |dir| yutani::eve_settings::list(&dir).map_err(|e| format!("cannot read {}: {e}", dir.display())),
+                    ),
+                    last_backup: yutani::eve_settings::copy::latest_backup(&backups),
+                    cached: yutani::eve_settings::names::load_cache(&cache),
+                })
+                .await
+                .unwrap_or_else(|e| CharactersListed {
+                    listing: Err(format!("listing task failed: {e}")),
+                    last_backup: None,
+                    cached: Default::default(),
+                })
+            },
+            |listed| cosmic::Action::App(Msg::CharactersListed(listed)),
+        )
+    }
+
+    /// The second half of `refresh_characters`: take what was read, then
+    /// ask ESI for any id still unnamed (blocking pool). A window closed
+    /// meanwhile has nothing to take it.
+    fn on_characters_listed(&mut self, listed: CharactersListed) -> Task<cosmic::Action<Msg>> {
+        let cache = yutani::eve_settings::names::cache_path(&dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")));
         let Some(state) = self.settings.as_mut() else { return Task::none() };
-        state.characters.set_listing(listing);
-        state.characters.last_backup = yutani::eve_settings::copy::latest_backup(&backups);
-        state.characters.names.extend(cached);
+        state.characters.set_listing(listed.listing);
+        state.characters.last_backup = listed.last_backup;
+        state.characters.names.extend(listed.cached);
         let missing = state.characters.unnamed();
         // Nothing to ask for, or an answer is already on its way: asking
         // twice would hit ESI twice for the same ids.
@@ -2031,6 +2069,7 @@ impl Application for App {
                 ipc::remove_socket();
                 cosmic::iced::exit()
             }
+            Msg::CharactersListed(listed) => self.on_characters_listed(listed),
             Msg::Adopt(ev) => {
                 match ev.result {
                     Ok(()) => tracing::info!(pid = ev.pid, name = %ev.name, "adopted into yutani-eve.slice"),
@@ -2382,6 +2421,22 @@ mod tests {
         app.clients.get_mut(&a).unwrap().hovered = true;
         assert!(app.resize_if_needed(&a).is_some(), "zoomed: a new size");
         assert!(app.resize_if_needed(&a).is_none(), "and sent once");
+    }
+
+    /// [P3] The Characters page's listing walks the EVE settings tree and
+    /// every Steam library root; a library on a spun-down disk or an
+    /// unreachable mount stalls for the stat/readdir latency, and that
+    /// must not happen on the thread that draws every thumbnail. The
+    /// refresh hands back a task and touches nothing of the page's state
+    /// itself; the listing lands with `Msg::CharactersListed`.
+    #[test]
+    fn the_characters_listing_is_read_off_the_update_thread() {
+        let mut app = app(Config::default());
+        app.settings = Some(settings::State::new(SurfaceId::unique(), &app.config));
+        let _task = app.refresh_characters();
+        let characters = &app.settings.as_ref().unwrap().characters;
+        assert!(characters.listing.is_none() && characters.error.is_none(), "read synchronously");
+        assert!(characters.last_backup.is_none());
     }
 
     /// [I3] The watcher's answer to a `config.ron` that does not parse:
