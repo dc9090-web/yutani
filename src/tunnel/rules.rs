@@ -43,6 +43,17 @@ pub fn nft_ruleset(uid: u32, dns: Option<Ipv4Addr>) -> String {
             "        {m} meta nfproto ipv4 meta l4proto {{ tcp, udp }} th dport 53 dnat ip to {dns}\n    }}\n"
         ));
     }
+    // The application picks its source address when it connects, *before*
+    // the `setmark` chain runs, so a socket in the slice binds the LAN
+    // address (10.1.1.221); marking the packet reroutes it to `yutani0` but
+    // leaves that source in place, and the peer's cryptokey routing drops
+    // an inner source outside our AllowedIPs. Masquerading on the way out
+    // rewrites it to the interface's own address (10.2.0.2); conntrack
+    // un-NATs the replies.
+    s.push_str(
+        "    chain postrouting {\n        type nat hook postrouting priority srcnat; policy accept;\n",
+    );
+    s.push_str(&format!("        oifname \"{IFACE}\" masquerade\n    }}\n"));
     s.push_str(
         "    chain killswitch {\n        type filter hook output priority filter; policy accept;\n",
     );
@@ -52,6 +63,25 @@ pub fn nft_ruleset(uid: u32, dns: Option<Ipv4Addr>) -> String {
     ));
     s.push_str("}\n");
     s
+}
+
+/// Re-assert the tunnel's default route. `ip link set yutani0 down` makes
+/// the kernel delete `default dev yutani0 table 51820`, and bringing the
+/// link back up does *not* restore it — without this the table stays empty,
+/// marked packets fall through to the LAN route and the kill-switch drops
+/// them forever. `replace` is idempotent, so the worker can run it on every
+/// status tick; it simply fails while the link is down.
+pub fn ensure_route_command() -> Vec<String> {
+    argv(&[
+        "ip",
+        "route",
+        "replace",
+        "default",
+        "dev",
+        IFACE,
+        "table",
+        &TABLE.to_string(),
+    ])
 }
 
 /// Everything before loading the nft ruleset, in order. `wg_conf_path` is
@@ -135,6 +165,10 @@ mod tests {
              \x20       type nat hook output priority dstnat; policy accept;\n\
              \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" meta nfproto ipv4 meta l4proto { tcp, udp } th dport 53 dnat ip to 10.2.0.1\n\
              \x20   }\n\
+             \x20   chain postrouting {\n\
+             \x20       type nat hook postrouting priority srcnat; policy accept;\n\
+             \x20       oifname \"yutani0\" masquerade\n\
+             \x20   }\n\
              \x20   chain killswitch {\n\
              \x20       type filter hook output priority filter; policy accept;\n\
              \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" oifname \"lo\" accept\n\
@@ -145,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn nft_ruleset_without_dns_has_no_nat_chain_exact_text() {
+    fn nft_ruleset_without_dns_has_no_dns_chain_exact_text() {
         let r = nft_ruleset(1000, None);
         assert_eq!(
             r,
@@ -153,6 +187,10 @@ mod tests {
              \x20   chain setmark {\n\
              \x20       type route hook output priority mangle; policy accept;\n\
              \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" meta mark set 0x59\n\
+             \x20   }\n\
+             \x20   chain postrouting {\n\
+             \x20       type nat hook postrouting priority srcnat; policy accept;\n\
+             \x20       oifname \"yutani0\" masquerade\n\
              \x20   }\n\
              \x20   chain killswitch {\n\
              \x20       type filter hook output priority filter; policy accept;\n\
@@ -245,6 +283,18 @@ mod tests {
                 "ip route flush table 51820",
                 "ip link del yutani0",
             ]
+        );
+    }
+
+    /// `ip link set yutani0 down` makes the kernel drop
+    /// `default dev yutani0 table 51820`, and bringing the link back up does
+    /// not restore it — so the worker re-adds it every tick. `replace` is
+    /// idempotent: it is a no-op when the route is already there.
+    #[test]
+    fn ensure_route_command_replaces_the_default_route_in_our_table() {
+        assert_eq!(
+            ensure_route_command().join(" "),
+            "ip route replace default dev yutani0 table 51820"
         );
     }
 }

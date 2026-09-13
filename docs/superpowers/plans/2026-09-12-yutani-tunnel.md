@@ -1729,7 +1729,7 @@ resolvectl query whoami.akamai.net
 
 Expect the lookup to succeed and resolved to have queried over the *normal*
 route — that is the known gap, not a regression. Record what you observed.
-Kill-switch check: `yutani tunnel connect`, then `sudo ip link set yutani0 down` (simulating a dead tunnel) → the slice `curl` must time out (`curl -m 5 …` exit 28) while plain `curl` works; `sudo ip link set yutani0 up` restores. Then EVE: set the Steam launch option to `PROTON_ENABLE_WAYLAND=1 yutani launch -- %command%`, start EVE, log in; `yutani status` shows the client and `tx_bytes`/`rx_bytes` climbing; `journalctl -u yutani-tunnel -n 20` clean.
+Kill-switch check: `yutani tunnel connect`, then `sudo ip link set yutani0 down` (simulating a dead tunnel) → the slice `curl` must time out (`curl -m 5 …` exit 28) while plain `curl` works. `sudo ip link set yutani0 up` restores it: the kernel deletes `default dev yutani0 table 51820` when the link goes down and does *not* put it back when it comes up, so the worker's 1 s status tick re-adds it with `ip route replace` — give it a second, then re-run the slice `curl` (check with `ip route show table 51820`). If anything else was poked by hand, `yutani tunnel disconnect && yutani tunnel connect` is the clean reset. Then EVE: set the Steam launch option to `PROTON_ENABLE_WAYLAND=1 yutani launch -- %command%`, start EVE, log in; `yutani status` shows the client and `tx_bytes`/`rx_bytes` climbing; `journalctl -u yutani-tunnel -n 20` clean.
 
 - [ ] **Step 2: Spec status**
 

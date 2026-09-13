@@ -109,6 +109,20 @@ fn up(conf: &WgConf, uid: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Re-assert `default dev yutani0 table 51820`. The kernel deletes that
+/// route whenever the link goes down (`ip link set yutani0 down`) and never
+/// puts it back when the link comes up again; without it marked packets
+/// fall through to the LAN route and the kill-switch drops them for the
+/// rest of the session. `ip route replace` is idempotent, so the tick can
+/// run it unconditionally. While the link really is down the command fails
+/// — that is the expected state, not a reason to tear the tunnel down, so
+/// it is logged at debug and otherwise ignored.
+fn ensure_route() {
+    if let Err(e) = exec(&rules::ensure_route_command()) {
+        tracing::debug!("route: {e:#}");
+    }
+}
+
 fn write_status(conf: &WgConf, since: u64) -> anyhow::Result<()> {
     let dump = exec(&["wg".to_string(), "show".to_string(), IFACE.to_string(), "dump".to_string()])?;
     let (endpoint, handshake, rx, tx) = parse_wg_dump(&dump).unwrap_or((conf.endpoint.clone(), 0, 0, 0));
@@ -147,6 +161,7 @@ pub fn run() -> anyhow::Result<()> {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
+                    ensure_route();
                     if let Err(e) = write_status(&conf, since) {
                         tracing::warn!("status: {e:#}");
                     }

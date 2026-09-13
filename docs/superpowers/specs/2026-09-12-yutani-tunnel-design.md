@@ -123,6 +123,10 @@ table inet yutani {
         type nat hook output priority dstnat; policy accept;
         socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" meta nfproto ipv4 meta l4proto { tcp, udp } th dport 53 dnat ip to 10.2.0.1
     }
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "yutani0" masquerade
+    }
     chain killswitch {
         type filter hook output priority filter; policy accept;
         socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice" oifname "lo" accept
@@ -140,8 +144,19 @@ table inet yutani {
    UDP to the endpoint is emitted
    by the kernel's wg device, not from a cgroup socket, so it is unaffected.
 
-**Loop**: every second write `/run/yutani/tunnel.json` (0644, atomic
-rename) with
+   The `postrouting` chain is what makes the slice's traffic usable at all.
+   An application chooses its source address when the socket connects —
+   *before* `setmark` runs — so the kernel's first route lookup uses the
+   LAN route and binds the LAN address (`10.1.1.221`). Marking the packet
+   reroutes it out of `yutani0` but does not revisit that choice, so the
+   inner packet leaves with a source outside the peer's AllowedIPs
+   (`10.2.0.2/32`) and WireGuard cryptokey routing on the far side drops it:
+   every connection hangs in `SYN-SENT`. Masquerading on the way out of
+   `yutani0` rewrites the source to the interface's own address, and
+   conntrack un-NATs the replies.
+
+**Loop**: every second run `ip route replace default dev yutani0 table
+51820` and then write `/run/yutani/tunnel.json` (0644, atomic rename) with
 
 ```json
 { "up": true, "iface": "yutani0", "address": "10.2.0.2", "endpoint": "198.51.100.10:51820",
@@ -150,7 +165,14 @@ rename) with
 ```
 
 from `wg show yutani0 dump` (peer line; the private key column is never
-written anywhere). Missing handshake → `latest_handshake_unix: 0`.
+written anywhere). Missing handshake → `latest_handshake_unix: 0`. The
+`ip route replace` is there because the kernel deletes
+`default dev yutani0 table 51820` whenever the link goes down and does not
+restore it when the link comes back up; without the tick re-adding it,
+table 51820 stays empty after any `ip link set yutani0 down` and marked
+packets are dropped by the kill-switch for the rest of the session.
+`replace` is idempotent, and its failure while the link is genuinely down
+is expected: logged at debug, never a teardown.
 
 **Down** (on SIGTERM, and on any start failure): `nft delete table inet
 yutani`; both `ip rule del`; `ip route flush table 51820`; `ip link del
@@ -361,7 +383,13 @@ not a regression. Also inspect the live ruleset and policy routing with
 `yutani tunnel disconnect`
 → the slice `curl` prints the home IP again; with the unit up and the
 endpoint blocked (e.g. wrong endpoint in a scratch conf) the slice `curl`
-times out. Then EVE: launch through the wrapper, log in, check the applet
+times out. The same holds for `sudo ip link set yutani0 down`: the slice
+`curl` times out while plain `curl` keeps working. Bringing the link back
+up with `sudo ip link set yutani0 up` is enough — the kernel drops
+`default dev yutani0 table 51820` when the link goes down and does not
+restore it, but the worker's 1 s tick re-adds it, so the slice recovers
+within a second. `yutani tunnel disconnect && yutani tunnel connect` is the
+clean reset if anything else was disturbed by hand. Then EVE: launch through the wrapper, log in, check the applet
 counters move.
 
 ## 11. Out of scope for this spec
