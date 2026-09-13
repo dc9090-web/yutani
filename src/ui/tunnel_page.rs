@@ -24,6 +24,13 @@ use super::settings::Msg;
 
 pub const NO_FILE: &str = "Choose the WireGuard configuration file first.";
 pub const NOT_A_FILE: &str = "That path is not a readable file.";
+/// A dropped or browsed file whose name is not UTF-8: it reaches the field
+/// through `Path::display`, which swaps the bad bytes for U+FFFD, and no
+/// file is called that. (Carrying the `PathBuf` beside the text would let
+/// such a file be installed; that is the window's drop and chooser
+/// handlers' business, in `ui/mod.rs`.)
+pub const NOT_UTF8: &str =
+    "That file's name is not valid UTF-8, which this field cannot hold; rename the file and choose it again.";
 /// A drop that carried no `.conf` (a folder, a text file, or a payload the
 /// widget could not decode).
 pub const NOT_A_CONF_DROP: &str = "dropped, but that was not a .conf file";
@@ -166,11 +173,12 @@ pub fn install_blocker(state: &State) -> Option<&'static str> {
     if state.busy {
         return Some(BUSY);
     }
-    if state.conf_path.trim().is_empty() {
+    let text = state.conf_path.trim();
+    if text.is_empty() {
         return Some(NO_FILE);
     }
-    if !Path::new(state.conf_path.trim()).is_file() {
-        return Some(NOT_A_FILE);
+    if !Path::new(text).is_file() {
+        return Some(if text.contains('\u{FFFD}') { NOT_UTF8 } else { NOT_A_FILE });
     }
     None
 }
@@ -323,6 +331,26 @@ mod tests {
         // A field holding only spaces is an empty field, not a bad path.
         s.conf_path = "   ".to_string();
         assert_eq!(install_blocker(&s), Some(NO_FILE));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_path_the_field_could_not_hold_says_so_instead_of_not_a_file() {
+        // A dropped or browsed `caf\xe9.conf` reaches the field through
+        // `Path::display`, as `caf\u{FFFD}.conf` — a name no file has. Say
+        // what happened rather than "not a readable file".
+        let dir = std::env::temp_dir().join(format!("yutani-tunnel-utf8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = State::default();
+        s.conf_path = dir.join("caf\u{FFFD}.conf").display().to_string();
+        assert_eq!(install_blocker(&s), Some(NOT_UTF8));
+        // …unless a file really is called that, which is fine.
+        std::fs::write(dir.join("caf\u{FFFD}.conf"), "[Interface]\n").unwrap();
+        assert_eq!(install_blocker(&s), None);
+        // A missing file whose name is plain UTF-8 is still just missing.
+        s.conf_path = dir.join("cafe.conf").display().to_string();
+        assert_eq!(install_blocker(&s), Some(NOT_A_FILE));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
