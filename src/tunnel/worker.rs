@@ -51,12 +51,56 @@ fn uid_from_conf(text: &str) -> Option<u32> {
     text.lines().find_map(|l| l.trim().strip_prefix("# yutani: uid =")).and_then(|v| v.trim().parse().ok())
 }
 
-fn load(conf_path: &Path) -> anyhow::Result<(WgConf, u32)> {
+/// The value of one `# yutani: <key> = a b c` line, split on whitespace.
+fn conf_list<'a>(text: &'a str, key: &str) -> Option<Vec<&'a str>> {
+    let prefix = format!("# yutani: {key} =");
+    text.lines().find_map(|l| l.trim().strip_prefix(prefix.as_str())).map(|v| v.split_whitespace().collect())
+}
+
+/// The resolvers `systemd-resolved` is pointed at for EVE's domains, from
+/// `# yutani: dns_servers = 1.1.1.1 9.9.9.9`. Root never reads the user's
+/// `config.ron` (spec §9): `install-root` copies the values into the conf
+/// it owns. A conf written before this feature has no such line, and a line
+/// whose values are all unusable is no better than a missing one — both
+/// give the defaults, so an old install keeps working.
+fn dns_servers_from_conf(text: &str) -> Vec<std::net::Ipv4Addr> {
+    let parsed: Vec<std::net::Ipv4Addr> =
+        conf_list(text, "dns_servers").unwrap_or_default().iter().filter_map(|s| s.parse().ok()).collect();
+    if parsed.is_empty() { super::DEFAULT_DNS_SERVERS.to_vec() } else { parsed }
+}
+
+/// The domains routed to those resolvers, from `# yutani: dns_domains = …`.
+/// Re-validated here even though `install-root` validated them: this text
+/// is what root acts on, and a plain host name is all `resolvectl domain`
+/// may ever be handed.
+fn dns_domains_from_conf(text: &str) -> Vec<String> {
+    let parsed: Vec<String> = conf_list(text, "dns_domains")
+        .unwrap_or_default()
+        .iter()
+        .filter(|d| crate::model::config::valid_dns_domain(d))
+        .map(|d| (*d).to_string())
+        .collect();
+    if parsed.is_empty() {
+        super::DEFAULT_DNS_DOMAINS.iter().map(|d| (*d).to_string()).collect()
+    } else {
+        parsed
+    }
+}
+
+/// Everything the worker needs, all of it from the root-owned conf.
+struct Loaded {
+    conf: WgConf,
+    uid: u32,
+    dns_servers: Vec<std::net::Ipv4Addr>,
+    dns_domains: Vec<String>,
+}
+
+fn load(conf_path: &Path) -> anyhow::Result<Loaded> {
     let text = std::fs::read_to_string(conf_path).with_context(|| format!("read {}", conf_path.display()))?;
     let label = conf_path.file_stem().and_then(|s| s.to_str()).unwrap_or("tunnel");
     let conf = WgConf::parse(&text, label).map_err(|e| anyhow!("{}: {e}", conf_path.display()))?;
     let uid = uid_from_conf(&text).context("conf has no `# yutani: uid = N` line; re-run `yutani tunnel install`")?;
-    Ok((conf, uid))
+    Ok(Loaded { conf, uid, dns_servers: dns_servers_from_conf(&text), dns_domains: dns_domains_from_conf(&text) })
 }
 
 /// Every step is attempted even if an earlier one fails: teardown must leave
@@ -92,7 +136,7 @@ impl Drop for Teardown {
     }
 }
 
-fn up(conf: &WgConf, uid: u32) -> anyhow::Result<()> {
+fn up(conf: &WgConf, uid: u32, dns_servers: &[std::net::Ipv4Addr]) -> anyhow::Result<()> {
     std::fs::create_dir_all(RUN_DIR)?;
     write_with_mode(WG_CONF_TMP, &conf.wg_native(), 0o600)?;
     for argv in rules::up_commands(conf, WG_CONF_TMP) {
@@ -105,8 +149,22 @@ fn up(conf: &WgConf, uid: u32) -> anyhow::Result<()> {
         r?;
     }
     let _ = std::fs::remove_file(WG_CONF_TMP);
-    exec_stdin(&["nft".to_string(), "-f".to_string(), "-".to_string()], &rules::nft_ruleset(uid, conf.dns))?;
+    exec_stdin(&["nft".to_string(), "-f".to_string(), "-".to_string()], &rules::nft_ruleset(uid, conf.dns, dns_servers))?;
     Ok(())
+}
+
+/// Hand `systemd-resolved` the per-link DNS for `yutani0` once the tunnel
+/// is up. A failure here (resolved not running, an older `resolvectl`) is
+/// *not* a reason to tear the tunnel down: everything else works, and what
+/// is lost is only the DNS improvement — EVE's lookups then behave exactly
+/// as they did before this feature (the design doc's §2 gap). So: warn,
+/// loudly enough to be found in the journal, and carry on.
+fn resolved_up(servers: &[std::net::Ipv4Addr], domains: &[String]) {
+    for argv in rules::resolved_up_commands(servers, domains) {
+        if let Err(e) = exec(&argv) {
+            tracing::warn!("resolved: {e:#}; EVE's DNS lookups will not go through the tunnel");
+        }
+    }
 }
 
 /// Re-assert `default dev yutani0 table 51820`. The kernel deletes that
@@ -143,15 +201,19 @@ fn write_status(conf: &WgConf, since: u64) -> anyhow::Result<()> {
 }
 
 pub fn run() -> anyhow::Result<()> {
-    let (conf, uid) = load(Path::new(CONF_PATH))?;
+    let Loaded { conf, uid, dns_servers, dns_domains } = load(Path::new(CONF_PATH))?;
     tracing::info!("tunnel up: {} via {} for uid {uid}", conf.label, conf.endpoint);
     // From here on every exit tears the tunnel down: the guard is the only
     // caller of `down`, so it happens exactly once.
     let _teardown = Teardown::new(down);
-    if let Err(e) = up(&conf, uid) {
+    if let Err(e) = up(&conf, uid, &dns_servers) {
         tracing::error!("tunnel start failed: {e:#}; tearing down");
         return Err(e);
     }
+    // After `up`: the link must exist before resolved can be told anything
+    // about it, and the nft rule that puts these queries into the tunnel is
+    // loaded by `up` itself.
+    resolved_up(&dns_servers, &dns_domains);
     let since = now_unix();
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let result: anyhow::Result<()> = rt.block_on(async {
@@ -181,7 +243,12 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 /// Everything `run` would execute for `conf_path`, secrets redacted.
-pub fn dry_run(conf_path: &Path, uid: u32) -> anyhow::Result<String> {
+pub fn dry_run(
+    conf_path: &Path,
+    uid: u32,
+    dns_servers: &[std::net::Ipv4Addr],
+    dns_domains: &[String],
+) -> anyhow::Result<String> {
     let text = std::fs::read_to_string(conf_path).with_context(|| format!("read {}", conf_path.display()))?;
     let label = conf_path.file_stem().and_then(|s| s.to_str()).unwrap_or("tunnel");
     let conf = WgConf::parse(&text, label).map_err(|e| anyhow!("{}: {e}", conf_path.display()))?;
@@ -191,8 +258,13 @@ pub fn dry_run(conf_path: &Path, uid: u32) -> anyhow::Result<String> {
         out.push('\n');
     }
     out.push_str("nft -f - <<EOF\n");
-    out.push_str(&rules::nft_ruleset(uid, conf.dns));
-    out.push_str("EOF\n# down\n");
+    out.push_str(&rules::nft_ruleset(uid, conf.dns, dns_servers));
+    out.push_str("EOF\n");
+    for argv in rules::resolved_up_commands(dns_servers, dns_domains) {
+        out.push_str(&argv.join(" "));
+        out.push('\n');
+    }
+    out.push_str("# down\n");
     for argv in rules::down_commands() {
         out.push_str(&argv.join(" "));
         out.push('\n');
@@ -210,7 +282,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("t.conf");
         std::fs::write(&conf, "[Interface]\nPrivateKey = U0VDUkVU\nAddress = 10.2.0.2/32\nDNS = 10.2.0.1\n[Peer]\n# UK#1\nPublicKey = p=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n").unwrap();
-        let out = dry_run(&conf, 1000).unwrap();
+        let out = dry_run(&conf, 1000, &crate::tunnel::DEFAULT_DNS_SERVERS, &[]).unwrap();
         assert!(out.contains("ip link add yutani0 type wireguard"));
         assert!(out.contains("wg setconf yutani0 /run/yutani/wg.conf"));
         assert!(out.contains("table inet yutani {"));
@@ -247,5 +319,55 @@ mod tests {
     fn uid_comes_from_the_stored_conf_comment() {
         assert_eq!(uid_from_conf("# yutani: label = UK#1\n# yutani: uid = 1000\n[Interface]\n"), Some(1000));
         assert_eq!(uid_from_conf("[Interface]\nPrivateKey = k=\n"), None);
+    }
+
+    /// The DNS settings travel the same way the uid does: written into the
+    /// root-owned conf by `install-root`, never read from the user's
+    /// `config.ron` by root (spec §9). A conf written before this feature
+    /// has neither line, and must keep working — hence the defaults.
+    #[test]
+    fn the_dns_settings_come_from_the_stored_conf_comments() {
+        let text = "# yutani: label = UK#1\n# yutani: uid = 1000\n\
+                    # yutani: dns_servers = 8.8.8.8 8.8.4.4\n\
+                    # yutani: dns_domains = example.net example.org\n[Interface]\n";
+        assert_eq!(dns_servers_from_conf(text), vec![
+            "8.8.8.8".parse::<std::net::Ipv4Addr>().unwrap(),
+            "8.8.4.4".parse().unwrap()
+        ]);
+        assert_eq!(dns_domains_from_conf(text), vec!["example.net", "example.org"]);
+
+        let old = "# yutani: uid = 1000\n[Interface]\n";
+        assert_eq!(dns_servers_from_conf(old), crate::tunnel::DEFAULT_DNS_SERVERS.to_vec());
+        assert_eq!(dns_domains_from_conf(old), crate::tunnel::DEFAULT_DNS_DOMAINS.to_vec());
+
+        // Unparseable or empty values fall back rather than leaving the
+        // worker with an empty list (which would mean "no DNS in the tunnel"
+        // while every other part of the setup says there is).
+        let junk = "# yutani: dns_servers = nonsense\n# yutani: dns_domains =   \n";
+        assert_eq!(dns_servers_from_conf(junk), crate::tunnel::DEFAULT_DNS_SERVERS.to_vec());
+        assert_eq!(dns_domains_from_conf(junk), crate::tunnel::DEFAULT_DNS_DOMAINS.to_vec());
+
+        // A domain that is not a plain host name never reaches `resolvectl`.
+        assert_eq!(
+            dns_domains_from_conf("# yutani: dns_domains = eveonline.com bad~domain\n"),
+            vec!["eveonline.com"]
+        );
+    }
+
+    #[test]
+    fn dry_run_lists_the_resolved_commands_and_the_resolver_mark_rule() {
+        let dir = std::env::temp_dir().join(format!("yutani-dry-dns-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("t.conf");
+        std::fs::write(&conf, "[Interface]\nPrivateKey = U0VDUkVU\nAddress = 10.2.0.2/32\nDNS = 10.2.0.1\n[Peer]\nPublicKey = p=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n").unwrap();
+        let servers = crate::tunnel::DEFAULT_DNS_SERVERS.to_vec();
+        let domains: Vec<String> = crate::tunnel::DEFAULT_DNS_DOMAINS.iter().map(|d| (*d).to_string()).collect();
+        let out = dry_run(&conf, 1000, &servers, &domains).unwrap();
+        assert!(out.contains("ip daddr { 1.1.1.1, 9.9.9.9 } meta l4proto { tcp, udp } th dport 53 meta mark set 0x59"));
+        assert!(out.contains("resolvectl dns yutani0 1.1.1.1 9.9.9.9"));
+        assert!(out.contains("resolvectl domain yutani0 ~eveonline.com ~ccpgames.com ~evetech.net"));
+        assert!(out.contains("resolvectl default-route yutani0 false"));
+        assert!(out.contains("resolvectl revert yutani0"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -126,6 +126,14 @@ enum TunnelAction {
         user: String,
         #[arg(long)]
         exe: String,
+        /// Resolvers for EVE's domains inside the tunnel (comma-separated);
+        /// empty = the built-in defaults
+        #[arg(long, value_delimiter = ',')]
+        dns_servers: Vec<std::net::Ipv4Addr>,
+        /// Domains routed to those resolvers (comma-separated); empty = the
+        /// built-in defaults
+        #[arg(long, value_delimiter = ',')]
+        dns_domains: Vec<String>,
     },
     /// [root] called by `uninstall` through pkexec
     #[command(hide = true)]
@@ -181,12 +189,20 @@ fn main() -> ExitCode {
             TunnelAction::Install { conf, dry_run: true } => {
                 // The same uid/name pair and canonical exe path the real
                 // install passes to `install-root`.
+                let t = model::config::Config::load().tunnel;
                 tunnel::install::whoami().and_then(|(uid, user)| {
                     let exe = tunnel::install::current_exe().unwrap_or_default();
-                    let report =
-                        tunnel::install::install_root(&conf.canonicalize().unwrap_or(conf.clone()), uid, &user, &exe, true)?;
+                    let report = tunnel::install::install_root(
+                        &conf.canonicalize().unwrap_or(conf.clone()),
+                        uid,
+                        &user,
+                        &exe,
+                        &t.dns_servers,
+                        &t.dns_domains,
+                        true,
+                    )?;
                     print!("{report}");
-                    let plan = tunnel::worker::dry_run(&conf, uid)?;
+                    let plan = tunnel::worker::dry_run(&conf, uid, &t.dns_servers, &t.dns_domains)?;
                     print!("\n{plan}");
                     // The whole report is printed either way; the exit
                     // status is what lets a script tell "would install
@@ -194,7 +210,13 @@ fn main() -> ExitCode {
                     Ok(if tunnel::install::report_has_failure(&report) { ExitCode::from(1) } else { ExitCode::SUCCESS })
                 })
             }
-            TunnelAction::Install { conf, dry_run: false } => tunnel::install::install(&conf).map(|()| ExitCode::SUCCESS),
+            TunnelAction::Install { conf, dry_run: false } => {
+                // From the *validated* config: the root side re-checks these
+                // anyway, but a warning about a bad domain belongs here,
+                // before the password prompt.
+                let t = model::config::Config::load().tunnel;
+                tunnel::install::install(&conf, &t.dns_servers, &t.dns_domains).map(|()| ExitCode::SUCCESS)
+            }
             TunnelAction::Uninstall => tunnel::install::uninstall().map(|()| ExitCode::SUCCESS),
             TunnelAction::Connect => tunnel::control::connect().map(|()| ExitCode::SUCCESS),
             TunnelAction::Disconnect => tunnel::control::disconnect().map(|()| ExitCode::SUCCESS),
@@ -205,8 +227,8 @@ fn main() -> ExitCode {
                 Ok(ExitCode::SUCCESS)
             }
             TunnelAction::Run => tunnel::worker::run().map(|()| ExitCode::SUCCESS),
-            TunnelAction::InstallRoot { conf, uid, user, exe } => {
-                tunnel::install::install_root(&conf, uid, &user, &exe, false).map(|report| {
+            TunnelAction::InstallRoot { conf, uid, user, exe, dns_servers, dns_domains } => {
+                tunnel::install::install_root(&conf, uid, &user, &exe, &dns_servers, &dns_domains, false).map(|report| {
                     print!("{report}");
                     ExitCode::SUCCESS
                 })

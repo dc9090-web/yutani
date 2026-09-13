@@ -27,6 +27,20 @@ pub const FWMARK: u32 = 0x59;
 /// reason wg-quick sets a firewall mark on its interfaces.
 pub const WG_FWMARK: u32 = 0x5a;
 pub const TABLE: u32 = 51820;
+/// Resolvers EVE's name lookups are sent to *inside* the tunnel, and the
+/// domains that go to them. `systemd-resolved` is told about both as
+/// per-link settings on `yutani0` (`resolvectl dns|domain|default-route`)
+/// while the tunnel is up, which is what closes the NSS gap in the design
+/// doc's §2: `getaddrinfo` never emits a DNS packet from EVE's cgroup, so
+/// only resolved itself can route those lookups — a `~domain` on the link
+/// makes it do exactly that, and the `setmark` rule for these addresses
+/// puts the resulting query into the tunnel. Overridable per user in
+/// `config.ron` (`tunnel.dns_servers` / `tunnel.dns_domains`); the values
+/// reach root only through `yutani tunnel install`, which stores them in
+/// `/etc/yutani/tunnel.conf`.
+pub const DEFAULT_DNS_SERVERS: [std::net::Ipv4Addr; 2] =
+    [std::net::Ipv4Addr::new(1, 1, 1, 1), std::net::Ipv4Addr::new(9, 9, 9, 9)];
+pub const DEFAULT_DNS_DOMAINS: [&str; 3] = ["eveonline.com", "ccpgames.com", "evetech.net"];
 pub const SLICE: &str = "yutani-eve.slice";
 pub const CONF_PATH: &str = "/etc/yutani/tunnel.conf";
 pub const STATUS_PATH: &str = "/run/yutani/tunnel.json";

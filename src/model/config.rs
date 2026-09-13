@@ -1,6 +1,7 @@
 //! User configuration: `~/.config/yutani/config.ron`.
 
 use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +59,18 @@ pub struct TunnelConfig {
     pub auto_adopt: bool,
     /// Executable names (case-insensitive) that count as EVE.
     pub adopt_processes: Vec<String>,
+    /// Resolvers for EVE's domains while the tunnel is up, reached *inside*
+    /// the tunnel: `resolvectl dns yutani0 <these>`.
+    pub dns_servers: Vec<Ipv4Addr>,
+    /// Domains routed to those resolvers (`resolvectl domain yutani0
+    /// ~<each>`). Plain host names; a leading `~` or `.` is stripped by
+    /// [`Config::validate`].
+    ///
+    /// Both lists reach the root worker only through `yutani tunnel
+    /// install`, which copies them into `/etc/yutani/tunnel.conf` — root
+    /// never reads this file (spec §9). Changing them therefore requires
+    /// re-running `yutani tunnel install`.
+    pub dns_domains: Vec<String>,
 }
 
 impl Default for TunnelConfig {
@@ -66,6 +79,8 @@ impl Default for TunnelConfig {
             location: "London".into(),
             auto_adopt: true,
             adopt_processes: vec!["exefile.exe".into(), "eve-online.exe".into(), "evelauncher.exe".into()],
+            dns_servers: crate::tunnel::DEFAULT_DNS_SERVERS.to_vec(),
+            dns_domains: crate::tunnel::DEFAULT_DNS_DOMAINS.iter().map(|d| (*d).to_string()).collect(),
         }
     }
 }
@@ -232,6 +247,36 @@ impl Config {
             }
         }
         {
+            // These two end up in a root-owned file and in `resolvectl`
+            // argv, so what survives here must be a plain host name and
+            // nothing else: a value with a newline in it would otherwise
+            // forge a second `# yutani: …` line in /etc/yutani/tunnel.conf.
+            // `~eveonline.com` / `.eveonline.com` are what a user copying
+            // from `resolvectl status` writes, and the `~` is ours to add,
+            // so those two prefixes are stripped rather than refused.
+            let before = self.tunnel.dns_domains.len();
+            self.tunnel.dns_domains = self
+                .tunnel
+                .dns_domains
+                .iter()
+                .map(|d| d.trim().trim_start_matches(['~', '.']).trim().to_string())
+                .filter(|d| valid_dns_domain(d))
+                .collect();
+            if self.tunnel.dns_domains.len() != before {
+                tracing::warn!(
+                    "config: tunnel.dns_domains had empty entries or entries that are not plain host names; dropping them"
+                );
+            }
+            if self.tunnel.dns_domains.is_empty() {
+                tracing::warn!("config: tunnel.dns_domains is empty; using defaults");
+                self.tunnel.dns_domains = d.tunnel.dns_domains.clone();
+            }
+            if self.tunnel.dns_servers.is_empty() {
+                tracing::warn!("config: tunnel.dns_servers is empty; using defaults");
+                self.tunnel.dns_servers = d.tunnel.dns_servers.clone();
+            }
+        }
+        {
             // Trimmed, because what is left here is what gets written to the
             // shortcuts file verbatim, and " Right " is no keysym name.
             let (next, prev) = (self.shortcuts.next.trim().to_string(), self.shortcuts.prev.trim().to_string());
@@ -266,6 +311,15 @@ impl Config {
         }
         self
     }
+}
+
+/// A plain DNS host name: ASCII letters, digits, `-` and `.`, non-empty.
+/// Deliberately strict — the value is written into root's
+/// `/etc/yutani/tunnel.conf` and passed to `resolvectl`, so anything that
+/// could forge a conf line (a newline) or confuse resolved (a space, `~`,
+/// a quote, non-ASCII) is refused rather than escaped.
+pub fn valid_dns_domain(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
 }
 
 /// Resolve an xkb keysym name the way cosmic-comp does: the exact name
@@ -522,6 +576,61 @@ mod tests {
         let mut c = Config::default();
         c.tunnel.adopt_processes = vec!["".into(), "   ".into()];
         assert_eq!(c.validate().tunnel.adopt_processes, Config::default().tunnel.adopt_processes);
+    }
+
+    #[test]
+    fn tunnel_dns_defaults_and_parse() {
+        let c = Config::default();
+        assert_eq!(c.tunnel.dns_servers, vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(9, 9, 9, 9)]);
+        assert_eq!(c.tunnel.dns_domains, vec!["eveonline.com", "ccpgames.com", "evetech.net"]);
+        // An older config.ron without the keys still parses (serde(default)).
+        let c: Config = ron::from_str("(tunnel: (location: \"Amsterdam\"))").unwrap();
+        assert_eq!(c.tunnel.dns_servers, Config::default().tunnel.dns_servers);
+        let c: Config =
+            ron::from_str("(tunnel: (dns_servers: [\"8.8.8.8\"], dns_domains: [\"example.net\"]))").unwrap();
+        assert_eq!(c.tunnel.dns_servers, vec![Ipv4Addr::new(8, 8, 8, 8)]);
+        assert_eq!(c.tunnel.dns_domains, vec!["example.net"]);
+    }
+
+    #[test]
+    fn validate_cleans_dns_domains_and_falls_back_when_a_list_is_empty() {
+        // resolved's own syntax (`~eveonline.com`) and a leading dot are what
+        // a user copying from `resolvectl status` would write; the `~` is
+        // ours to add, so strip it rather than send `~~eveonline.com`.
+        let mut c = Config::default();
+        c.tunnel.dns_domains = vec!["~eveonline.com".into(), " .ccpgames.com ".into(), "  ".into()];
+        assert_eq!(c.validate().tunnel.dns_domains, vec!["eveonline.com", "ccpgames.com"]);
+
+        // Not a plain hostname: dropped, never pasted into a resolvectl argv
+        // or into the root-owned conf.
+        let mut c = Config::default();
+        c.tunnel.dns_domains = vec!["eve online.com".into(), "eveonline.com".into(), "a\nb".into()];
+        assert_eq!(c.validate().tunnel.dns_domains, vec!["eveonline.com"]);
+
+        // Nothing usable left → the defaults, not an empty list (an empty
+        // list would mean "no EVE domains resolve inside the tunnel").
+        let mut c = Config::default();
+        c.tunnel.dns_domains = vec!["~".into(), "".into()];
+        assert_eq!(c.validate().tunnel.dns_domains, Config::default().tunnel.dns_domains);
+
+        let mut c = Config::default();
+        c.tunnel.dns_servers = vec![];
+        assert_eq!(c.validate().tunnel.dns_servers, Config::default().tunnel.dns_servers);
+
+        // Good values survive untouched.
+        let c = Config::default();
+        assert_eq!(c.clone().validate(), c);
+    }
+
+    #[test]
+    fn valid_dns_domain_accepts_plain_hostnames_only() {
+        assert!(valid_dns_domain("eveonline.com"));
+        assert!(valid_dns_domain("a-b.evetech.net"));
+        assert!(!valid_dns_domain(""));
+        assert!(!valid_dns_domain("eve online.com"));
+        assert!(!valid_dns_domain("eveonline.com\n# yutani: uid = 0"));
+        assert!(!valid_dns_domain("~eveonline.com"));
+        assert!(!valid_dns_domain("eve\"online.com"));
     }
 
     #[test]

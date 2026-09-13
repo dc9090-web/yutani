@@ -123,8 +123,16 @@ pub fn whoami() -> anyhow::Result<(u32, String)> {
     Ok((uid, name))
 }
 
+/// A comma-separated `--dns-servers`/`--dns-domains` value.
+fn joined<T: ToString>(items: &[T]) -> String {
+    items.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+}
+
 /// User side: `pkexec <self> tunnel install-root …` (one password prompt).
-pub fn install(conf: &Path) -> anyhow::Result<()> {
+/// `dns_servers`/`dns_domains` come from the user's validated `Config`; the
+/// root side re-validates them and stores them in the conf it owns, because
+/// root must never read `config.ron` itself (spec §9).
+pub fn install(conf: &Path, dns_servers: &[std::net::Ipv4Addr], dns_domains: &[String]) -> anyhow::Result<()> {
     let conf = conf.canonicalize().with_context(|| format!("{}", conf.display()))?;
     let exe = current_exe()?;
     // Check before the prompt, not after: the root side refuses this anyway,
@@ -133,12 +141,20 @@ pub fn install(conf: &Path) -> anyhow::Result<()> {
         bail!("{}", untrusted_exe_message(&exe, &conf, &why));
     }
     let (uid, user) = whoami()?;
-    let status = Command::new("pkexec")
-        .args([&exe, "tunnel", "install-root", "--conf"])
+    let mut cmd = Command::new("pkexec");
+    cmd.args([&exe, "tunnel", "install-root", "--conf"])
         .arg(&conf)
-        .args(["--uid", &uid.to_string(), "--user", &user, "--exe", &exe])
-        .status()
-        .context("pkexec")?;
+        .args(["--uid", &uid.to_string(), "--user", &user, "--exe", &exe]);
+    // Omitted rather than passed empty: `--dns-servers ""` is a parse error,
+    // and an absent flag is exactly what "use the defaults" means on the
+    // root side. `Config::validate` never produces an empty list anyway.
+    if !dns_servers.is_empty() {
+        cmd.args(["--dns-servers", &joined(dns_servers)]);
+    }
+    if !dns_domains.is_empty() {
+        cmd.args(["--dns-domains", &joined(dns_domains)]);
+    }
+    let status = cmd.status().context("pkexec")?;
     ensure!(status.success(), "install cancelled or failed (pkexec exit {status})");
     println!("{}", success_message(&conf));
     Ok(())
@@ -248,15 +264,50 @@ pub fn report_has_failure(report: &str) -> bool {
     report.contains(CHECK_FAILED_MARKER)
 }
 
+/// The DNS settings as the two conf lines the worker parses, with the
+/// defaults filled in for an empty list (an `install-root` run by hand, or
+/// a `config.ron` whose lists validation emptied). Every domain is checked
+/// here, on the root side: these strings arrive from a user-side process
+/// and are about to be written into a file only root may write, where a
+/// newline would forge a second `# yutani: …` line.
+fn dns_conf_lines(servers: &[std::net::Ipv4Addr], domains: &[String]) -> anyhow::Result<String> {
+    for d in domains {
+        ensure!(
+            crate::model::config::valid_dns_domain(d),
+            "{d:?} is not a plain DNS host name (letters, digits, `-`, `.`)"
+        );
+    }
+    let servers: Vec<String> = if servers.is_empty() {
+        super::DEFAULT_DNS_SERVERS.iter().map(|s| s.to_string()).collect()
+    } else {
+        servers.iter().map(|s| s.to_string()).collect()
+    };
+    let domains: Vec<String> = if domains.is_empty() {
+        super::DEFAULT_DNS_DOMAINS.iter().map(|d| (*d).to_string()).collect()
+    } else {
+        domains.to_vec()
+    };
+    Ok(format!("# yutani: dns_servers = {}\n# yutani: dns_domains = {}\n", servers.join(" "), domains.join(" ")))
+}
+
 /// Root side. With `dry_run`, returns what would be written instead of writing.
-pub fn install_root(conf: &Path, uid: u32, username: &str, exe: &str, dry_run: bool) -> anyhow::Result<String> {
+pub fn install_root(
+    conf: &Path,
+    uid: u32,
+    username: &str,
+    exe: &str,
+    dns_servers: &[std::net::Ipv4Addr],
+    dns_domains: &[String],
+    dry_run: bool,
+) -> anyhow::Result<String> {
     ensure!(conf.is_absolute() && Path::new(exe).is_absolute(), "paths must be absolute");
     ensure!(valid_username(username), "{username:?} is not a POSIX portable user name ([a-z_][a-z0-9_-]*$)");
     check_pkexec_uid(std::env::var("PKEXEC_UID").ok().as_deref(), uid)?;
     let text = std::fs::read_to_string(conf).with_context(|| format!("read {}", conf.display()))?;
     let label = conf.file_stem().and_then(|s| s.to_str()).unwrap_or("tunnel");
     let parsed = WgConf::parse(&text, label).map_err(|e| anyhow!("{}: {e}", conf.display()))?;
-    let stored = format!("# yutani: label = {}\n# yutani: uid = {uid}\n{text}", parsed.label);
+    let dns_lines = dns_conf_lines(dns_servers, dns_domains)?;
+    let stored = format!("# yutani: label = {}\n# yutani: uid = {uid}\n{dns_lines}{text}", parsed.label);
     // Resolve once, up front: `unit_text` and the trust check must agree on
     // the same path (see `resolved_exe`). When resolution itself fails, fall
     // back to the raw `--exe` string for display purposes only — the check
@@ -388,6 +439,55 @@ mod tests {
         assert!(unit_text("/home/me/My Apps/yutani").contains("ExecStart=\"/home/me/My Apps/yutani\" tunnel run\n"));
     }
 
+    fn servers() -> Vec<std::net::Ipv4Addr> {
+        crate::tunnel::DEFAULT_DNS_SERVERS.to_vec()
+    }
+
+    fn domains() -> Vec<String> {
+        crate::tunnel::DEFAULT_DNS_DOMAINS.iter().map(|d| (*d).to_string()).collect()
+    }
+
+    /// The user's `config.ron` is never read by root (spec §9), so the DNS
+    /// settings make the trip inside the conf root owns — as comment lines
+    /// next to `# yutani: uid`, in the shape `worker::dns_*_from_conf`
+    /// parses.
+    #[test]
+    fn the_stored_conf_carries_the_dns_settings_for_the_worker() {
+        let dir = std::env::temp_dir().join(format!("yutani-inst-dns-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("EVE.conf");
+        std::fs::write(&conf, "[Interface]\nPrivateKey = U0VDUkVU\nAddress = 10.2.0.2/32\n[Peer]\nPublicKey = p=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n").unwrap();
+        let report = install_root(&conf, 1000, "daniel", "/opt/yutani/yutani", &servers(), &domains(), true).unwrap();
+        assert!(report.contains("# yutani: dns_servers = 1.1.1.1 9.9.9.9"), "{report}");
+        assert!(report.contains("# yutani: dns_domains = eveonline.com ccpgames.com evetech.net"), "{report}");
+
+        // Empty lists (an `install-root` run by hand) get the defaults, not
+        // a conf that says "no DNS in the tunnel".
+        let report = install_root(&conf, 1000, "daniel", "/opt/yutani/yutani", &[], &[], true).unwrap();
+        assert!(report.contains("# yutani: dns_servers = 1.1.1.1 9.9.9.9"), "{report}");
+        assert!(report.contains("# yutani: dns_domains = eveonline.com ccpgames.com evetech.net"), "{report}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// These arrive as `--dns-domains` from a user-side process and end up
+    /// in a root-owned file: a value with a newline in it would forge a
+    /// second `# yutani: …` line (`# yutani: uid = 0`), so the root side
+    /// refuses anything that is not a plain host name instead of trusting
+    /// the user side to have validated it.
+    #[test]
+    fn install_root_refuses_dns_domains_that_could_forge_a_conf_line() {
+        let dir = std::env::temp_dir().join(format!("yutani-inst-dnsbad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("EVE.conf");
+        std::fs::write(&conf, "[Interface]\nPrivateKey = U0VDUkVU\nAddress = 10.2.0.2/32\n[Peer]\nPublicKey = p=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n").unwrap();
+        let forged = vec!["eveonline.com\n# yutani: uid = 0".to_string()];
+        let e = install_root(&conf, 1000, "daniel", "/opt/y", &servers(), &forged, true).unwrap_err().to_string();
+        assert!(e.contains("host name"), "expected a clear message, got {e}");
+        let spaced = vec!["eve online.com".to_string()];
+        assert!(install_root(&conf, 1000, "daniel", "/opt/y", &servers(), &spaced, true).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn install_root_dry_run_writes_nothing_and_hides_the_key() {
         let existed = Path::new(CONF_PATH).exists();
@@ -395,7 +495,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("EVE-UK-455.conf");
         std::fs::write(&conf, "[Interface]\nPrivateKey = U0VDUkVU\nAddress = 10.2.0.2/32\nDNS = 10.2.0.1\n[Peer]\n# UK#455\nPublicKey = p=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n").unwrap();
-        let report = install_root(&conf, 1000, "daniel", "/opt/yutani/yutani", true).unwrap();
+        let report = install_root(&conf, 1000, "daniel", "/opt/yutani/yutani", &servers(), &domains(), true).unwrap();
         assert!(report.contains("# yutani: label = UK#455"));
         assert!(report.contains("# yutani: uid = 1000"));
         assert!(report.contains("PrivateKey = <redacted>"));
@@ -408,12 +508,12 @@ mod tests {
 
     #[test]
     fn install_root_rejects_relative_paths_and_bad_confs() {
-        assert!(install_root(Path::new("rel.conf"), 1000, "d", "/opt/y", true).unwrap_err().to_string().contains("absolute"));
+        assert!(install_root(Path::new("rel.conf"), 1000, "d", "/opt/y", &servers(), &domains(), true).unwrap_err().to_string().contains("absolute"));
         let dir = std::env::temp_dir().join(format!("yutani-inst-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("bad.conf");
         std::fs::write(&conf, "[Interface]\nAddress = 10.2.0.2/32\n[Peer]\nPublicKey = p=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n").unwrap();
-        assert!(install_root(&conf, 1000, "d", "/opt/y", true).unwrap_err().to_string().contains("PrivateKey"));
+        assert!(install_root(&conf, 1000, "d", "/opt/y", &servers(), &domains(), true).unwrap_err().to_string().contains("PrivateKey"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -425,7 +525,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("EVE.conf");
         std::fs::write(&conf, "[Interface]\nprivatekey = U0VDUkVU\nAddress = 10.2.0.2/32\nDNS = 10.2.0.1\n[Peer]\n# UK#455\nPublicKey = p=\nPRESHAREDKEY = UFNLU0VDUkVU\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n").unwrap();
-        let report = install_root(&conf, 1000, "daniel", "/opt/yutani/yutani", true).unwrap();
+        let report = install_root(&conf, 1000, "daniel", "/opt/yutani/yutani", &servers(), &domains(), true).unwrap();
         assert!(!report.contains("U0VDUkVU"), "the private key leaked into the report: {report}");
         assert!(!report.contains("UFNLU0VDUkVU"), "the preshared key leaked into the report");
         assert!(report.contains("privatekey = <redacted>"));
@@ -439,9 +539,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("EVE.conf");
         std::fs::write(&conf, "[Interface]\nPrivateKey = U0VDUkVU\nAddress = 10.2.0.2/32\n[Peer]\nPublicKey = p=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n").unwrap();
-        let e = install_root(&conf, 1000, "a\"b", "/opt/y", true).unwrap_err().to_string();
+        let e = install_root(&conf, 1000, "a\"b", "/opt/y", &servers(), &domains(), true).unwrap_err().to_string();
         assert!(e.contains("user name"), "expected a clear message, got {e}");
-        assert!(install_root(&conf, 1000, "daniel_2-x", "/opt/y", true).is_ok());
+        assert!(install_root(&conf, 1000, "daniel_2-x", "/opt/y", &servers(), &domains(), true).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -529,7 +629,7 @@ mod tests {
         std::fs::write(&conf, GOOD_CONF).unwrap();
         let exe = dir.join("yutani");
         std::fs::write(&exe, "#!/bin/true\n").unwrap();
-        let e = install_root(&conf, 1000, "daniel", exe.to_str().unwrap(), false).unwrap_err().to_string();
+        let e = install_root(&conf, 1000, "daniel", exe.to_str().unwrap(), &servers(), &domains(), false).unwrap_err().to_string();
         assert!(e.contains("refusing"), "got {e}");
         assert!(e.contains("sudo install -o root -g root -m 0755"), "got {e}");
         std::fs::remove_dir_all(&dir).unwrap();
@@ -542,7 +642,7 @@ mod tests {
         std::fs::write(&conf, GOOD_CONF).unwrap();
         let exe = dir.join("yutani");
         std::fs::write(&exe, "#!/bin/true\n").unwrap();
-        let r = install_root(&conf, 1000, "daniel", exe.to_str().unwrap(), true).unwrap();
+        let r = install_root(&conf, 1000, "daniel", exe.to_str().unwrap(), &servers(), &domains(), true).unwrap();
         assert!(r.contains("refusing"), "the dry run must report the refusal: {r}");
         assert!(r.contains("sudo install -o root -g root -m 0755"));
         assert!(r.contains("ExecStart="), "the dry run must still print the rest: {r}");
@@ -597,7 +697,7 @@ mod tests {
         // The temp dir is owned by the test user, so the real install would
         // still refuse this — but the dry run must report the *resolved*
         // path, not the symlink path it was handed.
-        let r = install_root(&conf, 1000, "daniel", link.to_str().unwrap(), true).unwrap();
+        let r = install_root(&conf, 1000, "daniel", link.to_str().unwrap(), &servers(), &domains(), true).unwrap();
         assert!(r.contains("refusing"), "a user-owned exe must still be refused: {r}");
         assert!(
             r.contains(&format!("ExecStart={} tunnel run", resolved_target.display())),

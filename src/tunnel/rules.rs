@@ -24,7 +24,10 @@ fn cgroup_match(uid: u32) -> String {
     format!(r#"socket cgroupv2 level 5 "{}""#, cgroup_path(uid))
 }
 
-pub fn nft_ruleset(uid: u32, dns: Option<Ipv4Addr>) -> String {
+/// `dns_servers` are the resolvers `systemd-resolved` is pointed at for
+/// EVE's domains (see [`resolved_up_commands`]): their DNS traffic is
+/// marked for the tunnel by `setmark`, whoever sends it.
+pub fn nft_ruleset(uid: u32, dns: Option<Ipv4Addr>, dns_servers: &[Ipv4Addr]) -> String {
     let m = cgroup_match(uid);
     let mut s = String::from("table inet yutani {\n");
     s.push_str(
@@ -36,6 +39,21 @@ pub fn nft_ruleset(uid: u32, dns: Option<Ipv4Addr>) -> String {
     // encrypted again — a loop that overflows the staged queue. WireGuard
     // stamps `WG_FWMARK` on them; `return` leaves that mark alone.
     s.push_str(&format!("        meta mark {WG_FWMARK:#x} return\n"));
+    // Then, still ahead of the cgroup match: the queries `systemd-resolved`
+    // sends to the tunnel's own resolvers. EVE's `getaddrinfo` never puts a
+    // DNS packet on the wire itself (glibc's `resolve` NSS module talks to
+    // resolved over a unix socket — the design doc's §2), so the packet that
+    // must go through the tunnel is resolved's, and resolved runs in its own
+    // cgroup: no `socket cgroupv2` rule of ours can match it. Keying on the
+    // destination instead is what `resolvectl dns yutani0 …` makes safe —
+    // only the EVE domains are routed to these addresses. The masquerade in
+    // `postrouting` fixes up the source, exactly as for the game's traffic.
+    if !dns_servers.is_empty() {
+        let set = dns_servers.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
+        s.push_str(&format!(
+            "        ip daddr {{ {set} }} meta l4proto {{ tcp, udp }} th dport 53 meta mark set {FWMARK:#x}\n"
+        ));
+    }
     s.push_str(&format!("        {m} meta mark set {FWMARK:#x}\n    }}\n"));
     if let Some(dns) = dns {
         s.push_str(
@@ -53,8 +71,10 @@ pub fn nft_ruleset(uid: u32, dns: Option<Ipv4Addr>) -> String {
         // (`__mkroute_output` returns EINVAL), so it would be silently
         // dropped instead of reaching the tunnel. Excluding it here lets
         // that query fall through unmodified to systemd-resolved over
-        // loopback, answered outside the tunnel — see the design doc's
-        // "Known gap".
+        // loopback — where, since `resolved_up_commands` gives `yutani0` a
+        // per-link DNS, the EVE domains among those queries are forwarded
+        // to the tunnel's resolvers and do go through the tunnel after
+        // all; see §2 of the design doc.
         s.push_str(&format!(
             "        {m} ip daddr != 127.0.0.0/8 meta l4proto {{ tcp, udp }} th dport 53 dnat ip to {dns}\n    }}\n"
         ));
@@ -94,6 +114,37 @@ pub fn nft_ruleset(uid: u32, dns: Option<Ipv4Addr>) -> String {
     ));
     s.push_str("}\n");
     s
+}
+
+/// Point `systemd-resolved` at the tunnel's resolvers for EVE's domains,
+/// as per-link settings on `yutani0`:
+///
+/// - `resolvectl dns yutani0 <servers>` — the resolvers to use for this link;
+/// - `resolvectl domain yutani0 ~<domain>…` — a *routing-only* domain (the
+///   `~`), so resolved sends lookups for those names (and only those) to
+///   this link's servers; it is not a search domain, so nothing is appended
+///   to unqualified names;
+/// - `resolvectl default-route yutani0 false` — and everything else keeps
+///   going to the machine's normal resolver.
+///
+/// This is what closes the NSS gap in the design doc's §2: the lookup EVE
+/// makes through `getaddrinfo` never leaves its cgroup as a packet, so the
+/// only way to get it into the tunnel is to have resolved itself send it to
+/// an address that `nft_ruleset` marks for the tunnel.
+pub fn resolved_up_commands(servers: &[Ipv4Addr], domains: &[String]) -> Vec<Vec<String>> {
+    let mut dns = argv(&["resolvectl", "dns", IFACE]);
+    dns.extend(servers.iter().map(|s| s.to_string()));
+    let mut domain = argv(&["resolvectl", "domain", IFACE]);
+    domain.extend(domains.iter().map(|d| format!("~{d}")));
+    vec![dns, domain, argv(&["resolvectl", "default-route", IFACE, "false"])]
+}
+
+/// Drop those per-link settings again. The kernel already forgets them when
+/// the interface goes away, so this is belt and braces for the window
+/// before `ip link del` — and for a resolved that outlives a link name it
+/// has cached. Its failure (resolved not running at all) is ignored.
+pub fn resolved_down_command() -> Vec<String> {
+    argv(&["resolvectl", "revert", IFACE])
 }
 
 /// Re-assert the tunnel's default route. `ip link set yutani0 down` makes
@@ -155,6 +206,8 @@ pub fn down_commands() -> Vec<Vec<String>> {
     let table = TABLE.to_string();
     let mark = format!("{FWMARK:#x}");
     vec![
+        // First, while `yutani0` still exists for resolved to be asked about.
+        resolved_down_command(),
         argv(&["nft", "delete", "table", "inet", "yutani"]),
         argv(&[
             "ip", "rule", "del", "fwmark", &mark, "lookup", &table, "priority", "1000",
@@ -186,15 +239,24 @@ mod tests {
         );
     }
 
+    fn servers() -> Vec<Ipv4Addr> {
+        crate::tunnel::DEFAULT_DNS_SERVERS.to_vec()
+    }
+
+    fn domains() -> Vec<String> {
+        crate::tunnel::DEFAULT_DNS_DOMAINS.iter().map(|d| (*d).to_string()).collect()
+    }
+
     #[test]
     fn nft_ruleset_marks_dnats_dns_and_kill_switches_exact_text_with_dns() {
-        let r = nft_ruleset(1000, Some("10.2.0.1".parse().unwrap()));
+        let r = nft_ruleset(1000, Some("10.2.0.1".parse().unwrap()), &servers());
         assert_eq!(
             r,
             "table inet yutani {\n\
              \x20   chain setmark {\n\
              \x20       type route hook output priority mangle; policy accept;\n\
              \x20       meta mark 0x5a return\n\
+             \x20       ip daddr { 1.1.1.1, 9.9.9.9 } meta l4proto { tcp, udp } th dport 53 meta mark set 0x59\n\
              \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" meta mark set 0x59\n\
              \x20   }\n\
              \x20   chain dns {\n\
@@ -216,13 +278,14 @@ mod tests {
 
     #[test]
     fn nft_ruleset_without_dns_has_no_dns_chain_exact_text() {
-        let r = nft_ruleset(1000, None);
+        let r = nft_ruleset(1000, None, &servers());
         assert_eq!(
             r,
             "table inet yutani {\n\
              \x20   chain setmark {\n\
              \x20       type route hook output priority mangle; policy accept;\n\
              \x20       meta mark 0x5a return\n\
+             \x20       ip daddr { 1.1.1.1, 9.9.9.9 } meta l4proto { tcp, udp } th dport 53 meta mark set 0x59\n\
              \x20       socket cgroupv2 level 5 \"user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice\" meta mark set 0x59\n\
              \x20   }\n\
              \x20   chain postrouting {\n\
@@ -257,8 +320,8 @@ mod tests {
     #[test]
     fn the_wireguard_fwmark_is_exempt_before_any_cgroup_rule() {
         for r in [
-            nft_ruleset(1000, Some("10.2.0.1".parse().unwrap())),
-            nft_ruleset(1000, None),
+            nft_ruleset(1000, Some("10.2.0.1".parse().unwrap()), &servers()),
+            nft_ruleset(1000, None, &servers()),
         ] {
             assert_eq!(chain_rules(&r, "setmark")[0], "meta mark 0x5a return");
         }
@@ -278,8 +341,8 @@ mod tests {
     #[test]
     fn the_kill_switch_hooks_postrouting_and_keys_on_the_mark() {
         for r in [
-            nft_ruleset(1000, Some("10.2.0.1".parse().unwrap())),
-            nft_ruleset(1000, None),
+            nft_ruleset(1000, Some("10.2.0.1".parse().unwrap()), &servers()),
+            nft_ruleset(1000, None, &servers()),
         ] {
             assert!(
                 r.contains(
@@ -330,7 +393,7 @@ mod tests {
             .stdin
             .take()
             .unwrap()
-            .write_all(nft_ruleset(1000, Some("10.2.0.1".parse().unwrap())).as_bytes())
+            .write_all(nft_ruleset(1000, Some("10.2.0.1".parse().unwrap()), &servers()).as_bytes())
             .unwrap();
         let out = child.wait_with_output().unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -371,12 +434,70 @@ mod tests {
         );
     }
 
+    /// The tunnel's resolvers are marked for the tunnel wherever the query
+    /// comes from: `systemd-resolved` sends it from *its own* cgroup, which
+    /// no `socket cgroupv2` rule of ours matches, so this rule must not be
+    /// behind the cgroup match — and it must sit after the `WG_FWMARK`
+    /// return like everything else in the chain.
+    #[test]
+    fn the_resolver_addresses_are_marked_for_the_tunnel_after_the_wireguard_exemption() {
+        let r = nft_ruleset(1000, Some("10.2.0.1".parse().unwrap()), &servers());
+        assert_eq!(
+            chain_rules(&r, "setmark")[..2],
+            [
+                "meta mark 0x5a return".to_string(),
+                "ip daddr { 1.1.1.1, 9.9.9.9 } meta l4proto { tcp, udp } th dport 53 meta mark set 0x59".to_string(),
+            ]
+        );
+    }
+
+    /// A one-element nft set is still a set: `{ 1.1.1.1 }` is valid.
+    /// No servers at all means no rule (an empty `{ }` is a syntax error).
+    #[test]
+    fn the_resolver_rule_follows_the_server_list() {
+        let one = nft_ruleset(1000, None, &["8.8.8.8".parse().unwrap()]);
+        assert!(
+            one.contains("ip daddr { 8.8.8.8 } meta l4proto { tcp, udp } th dport 53 meta mark set 0x59"),
+            "{one}"
+        );
+        let none = nft_ruleset(1000, None, &[]);
+        assert!(!none.contains("th dport 53 meta mark set"), "{none}");
+    }
+
+    /// The three per-link settings, in the order the worker runs them.
+    /// Domains are routing-only (`~`) so resolved sends *those* names to
+    /// these servers and nothing else changes; `default-route false` keeps
+    /// every other lookup on the machine's normal resolver.
+    #[test]
+    fn resolved_up_commands_set_the_link_dns_the_routing_domains_and_the_default_route() {
+        let joined: Vec<String> =
+            resolved_up_commands(&servers(), &domains()).iter().map(|c| c.join(" ")).collect();
+        assert_eq!(
+            joined,
+            vec![
+                "resolvectl dns yutani0 1.1.1.1 9.9.9.9",
+                "resolvectl domain yutani0 ~eveonline.com ~ccpgames.com ~evetech.net",
+                "resolvectl default-route yutani0 false",
+            ]
+        );
+    }
+
+    /// Per-link settings die with the interface, so this is belt and
+    /// braces — but it must run before `ip link del yutani0`, while the
+    /// link resolved is asked about still exists.
+    #[test]
+    fn resolved_down_command_reverts_the_link_and_runs_first() {
+        assert_eq!(resolved_down_command().join(" "), "resolvectl revert yutani0");
+        assert_eq!(down_commands()[0], resolved_down_command());
+    }
+
     #[test]
     fn down_commands_reverse_everything_and_are_idempotent_shaped() {
         let joined: Vec<String> = down_commands().iter().map(|c| c.join(" ")).collect();
         assert_eq!(
             joined,
             vec![
+                "resolvectl revert yutani0",
                 "nft delete table inet yutani",
                 "ip rule del fwmark 0x59 lookup 51820 priority 1000",
                 "ip rule del lookup 51820 priority 1001",
