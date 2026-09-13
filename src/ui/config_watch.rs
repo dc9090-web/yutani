@@ -7,11 +7,24 @@ use std::time::Duration;
 
 use crate::model::config::{Config, config_path};
 
-pub fn subscription() -> Subscription<Config> {
+/// One item per change on disk: `Ok` is the config to apply, `Err` says
+/// why the file could not be, and the live config stays as it is.
+pub fn subscription() -> Subscription<Result<Config, String>> {
     Subscription::run(run)
 }
 
-fn run() -> impl iced::futures::Stream<Item = Config> {
+/// What a re-read of `config.ron` means for the live config. A file that
+/// parsed replaces it; no file at all means the defaults are in force; a
+/// file that exists but cannot be read or parsed — a typo saved while
+/// hand-editing, an editor that truncates before it writes — is `Err`,
+/// and must leave the live config alone rather than swap every setting
+/// for its default until the next save (`save_config` already refuses to
+/// touch such a file; applying it live deserves the same respect).
+pub fn reload_outcome(loaded: Result<Option<Config>, String>) -> Result<Config, String> {
+    loaded.map(Option::unwrap_or_default)
+}
+
+fn run() -> impl iced::futures::Stream<Item = Result<Config, String>> {
     let (tx, rx) = mpsc::channel::<()>(8);
     let path = config_path();
     let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
@@ -44,6 +57,23 @@ fn run() -> impl iced::futures::Stream<Item = Config> {
         // Debounce bursts (editors write several events per save).
         futures_timer::Delay::new(Duration::from_millis(200)).await;
         while rx.try_recv().is_ok() {}
-        Some((Config::load(), (rx, watcher)))
+        Some((reload_outcome(Config::try_load()), (rx, watcher)))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [I3] A `config.ron` that momentarily fails to parse must not be
+    /// applied live as the defaults: that switches mode, visibility, sizes
+    /// and `app_ids` under the user, destroys every surface, and can drop
+    /// clients matched by a custom app id — twice, once the file is fixed.
+    #[test]
+    fn a_broken_file_is_an_error_not_the_defaults() {
+        let custom = Config { thumb_width: 400, ..Config::default() };
+        assert_eq!(reload_outcome(Ok(Some(custom.clone()))), Ok(custom));
+        assert_eq!(reload_outcome(Ok(None)), Ok(Config::default()), "no file: defaults are in force");
+        assert_eq!(reload_outcome(Err("cannot parse".into())), Err("cannot parse".to_string()));
+    }
 }

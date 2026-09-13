@@ -150,6 +150,9 @@ pub enum Msg {
     Backend(Event),
     Pointer(SurfaceId, mouse::Event),
     ConfigChanged(Config),
+    /// `config.ron` changed on disk but cannot be read or parsed: the live
+    /// config stays, and the settings window (if open) shows the reason.
+    ConfigBroken(String),
     Ipc(ipc::IpcEvent),
     /// The answer to an IPC request that could not be produced on the update
     /// thread (see [`Reply::Later`]). Carries the request's one-shot reply
@@ -1885,6 +1888,13 @@ impl Application for App {
                 }
                 task
             }
+            Msg::ConfigBroken(error) => {
+                tracing::warn!("{error}; keeping the current config");
+                if let Some(state) = self.settings.as_mut() {
+                    state.config_error = Some(error);
+                }
+                Task::none()
+            }
             // The X11/XWayland route only (see `subscription`); the drop
             // the settings window itself receives comes through
             // `settings::Msg::FilesDropped`. Both end in the same handler.
@@ -1946,7 +1956,10 @@ impl Application for App {
         });
         let mut subs = vec![
             events,
-            config_watch::subscription().map(Msg::ConfigChanged),
+            config_watch::subscription().map(|loaded| match loaded {
+                Ok(config) => Msg::ConfigChanged(config),
+                Err(error) => Msg::ConfigBroken(error),
+            }),
             ipc::subscription().map(Msg::Ipc),
         ];
         if let Some(conn) = self.conn.clone() {
@@ -2134,6 +2147,20 @@ mod tests {
         let (how, _task) = app.handle_request(&crate::ipc::Request::Status, &reply);
         assert!(matches!(how, Reply::Later), "answered on the update thread");
         assert!(rx.try_recv().is_err(), "the reply must come from the task, not from this call");
+    }
+
+    /// [I3] The watcher's answer to a `config.ron` that does not parse:
+    /// nothing changes live, and an open settings window shows why (the
+    /// same field `save_config` uses, so the Display/Behavior pages give
+    /// way to the reason and nothing is written over the file).
+    #[test]
+    fn a_broken_config_on_disk_leaves_the_live_config_alone_and_says_why() {
+        let custom = Config { thumb_width: 400, ..Config::default() };
+        let mut app = app(custom.clone());
+        app.settings = Some(settings::State::new(SurfaceId::unique(), &custom));
+        let _ = app.update(Msg::ConfigBroken("cannot parse config.ron: 3:1".into()));
+        assert_eq!(app.config, custom);
+        assert_eq!(app.settings.as_ref().unwrap().config_error.as_deref(), Some("cannot parse config.ron: 3:1"));
     }
 
     /// [M5] `quit` with nothing to wind down used to answer `ok` and return
