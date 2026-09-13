@@ -112,6 +112,7 @@ impl AppData {
 
     /// gbm dmabuf if the compositor advertises one for ABGR8888, else shm.
     pub fn create_buffer(&mut self, formats: &Formats) -> anyhow::Result<Buffer> {
+        ensure_nonzero_size(formats.buffer_size)?;
         let format = wl_shm::Format::Abgr8888;
         if let Some((_, modifiers)) = formats.dmabuf_formats.iter().find(|(f, _)| *f == u32::from(format)) {
             match self.create_gbm_buffer(u32::from(format), modifiers, formats.buffer_size, formats.dmabuf_device) {
@@ -123,6 +124,15 @@ impl AppData {
         anyhow::ensure!(formats.shm_formats.contains(&format), "compositor offers neither dmabuf nor shm ABGR8888");
         self.create_shm_buffer(format, formats.buffer_size)
     }
+}
+
+/// A 0×0 size would reach `wl_shm.create_pool(size = 0)` (the gbm path
+/// already rejects it and falls through to shm), a fatal protocol error
+/// that takes the whole backend down; the caller turns this `Err` into
+/// `CaptureUnavailable` instead.
+fn ensure_nonzero_size((width, height): (u32, u32)) -> anyhow::Result<()> {
+    anyhow::ensure!(width > 0 && height > 0, "zero-sized capture ({width}x{height})");
+    Ok(())
 }
 
 fn memfd(len: usize) -> anyhow::Result<std::os::fd::OwnedFd> {
@@ -149,4 +159,17 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for AppData {
 
 impl Dispatch<wl_shm_pool::WlShmPool, ()> for AppData {
     fn event(_: &mut Self, _: &wl_shm_pool::WlShmPool, _: wl_shm_pool::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_zero_sized_capture_is_refused_before_any_pool_is_created() {
+        assert!(ensure_nonzero_size((0, 0)).is_err());
+        assert!(ensure_nonzero_size((640, 0)).is_err());
+        assert!(ensure_nonzero_size((0, 480)).is_err());
+        assert!(ensure_nonzero_size((640, 480)).is_ok());
+    }
 }
