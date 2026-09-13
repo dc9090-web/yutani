@@ -17,8 +17,8 @@ use yutani::applet::client::{self, IpcError};
 use yutani::applet::display::{Display, degrade, display};
 use yutani::applet::rate::{Rates, Sampler};
 use yutani::applet::{
-    Action, PENDING_S, Poll, note_visible, pending_done, poll_interval, start_command, still_pending,
-    waiting_note,
+    Action, PENDING_S, Poll, clip_note, note_visible, pending_done, poll_interval, start_command,
+    still_pending, waiting_note,
 };
 use yutani::tunnel::status::Status;
 
@@ -188,7 +188,7 @@ impl Applet {
 
     fn note(&mut self, text: String, action: Option<Action>) {
         let at_ms = self.now_ms();
-        self.note = Some(Note { text, at_ms, action, progress: false });
+        self.note = Some(Note { text: clip_note(&text), at_ms, action, progress: false });
     }
 
     /// Say what `action` is doing while its reply is awaited, if it is one
@@ -438,7 +438,7 @@ pub fn close_popup_message(id: Id) -> Msg {
 mod tests {
     use super::*;
     use cosmic::Application as _;
-    use yutani::applet::NOTE_MS;
+    use yutani::applet::{NOTE_MAX_CHARS, NOTE_MS};
 
     /// How many of this process's children `/proc` currently lists as
     /// zombies (state `Z`) — i.e. exited but not yet `wait`ed on.
@@ -548,6 +548,18 @@ mod tests {
 
     fn applet() -> Applet {
         Applet::init(Core::default(), ()).0
+    }
+
+    /// M2: whatever a poll or an action says, the note under the row is
+    /// clipped to one readable line.
+    #[test]
+    fn a_long_error_is_clipped_in_the_note() {
+        let mut applet = applet();
+        let long = "malformed reply ".to_string() + &"x".repeat(2_000);
+        let _ = applet.update(Msg::Status(Err(IpcError::Failed(long.clone()))));
+        assert_eq!(applet.note.as_ref().unwrap().text.chars().count(), NOTE_MAX_CHARS + 1);
+        let _ = applet.update(Msg::Done(Action::Connect, Err(long)));
+        assert_eq!(applet.note.as_ref().unwrap().text.chars().count(), NOTE_MAX_CHARS + 1);
     }
 
     /// I2: a connect/disconnect can take up to 15 s to be answered, so the

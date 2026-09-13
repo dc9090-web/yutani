@@ -23,6 +23,21 @@ pub const PENDING_S: u64 = 10;
 /// How long an `err …` note stays under the menu (spec §7).
 pub const NOTE_MS: u64 = 3_000;
 
+/// The most of an `err …` a note shows. `malformed reply {line:?}` quotes
+/// the whole line (up to 64 KiB) and an action error carries systemctl's
+/// stderr; unclipped, either wraps into many lines in the 360 px popup and
+/// pushes Quit toward `popup_container`'s 1000 px clip.
+pub const NOTE_MAX_CHARS: usize = 160;
+
+/// `text` as a note: whole if it fits [`NOTE_MAX_CHARS`], else its first
+/// `NOTE_MAX_CHARS` chars and an ellipsis.
+pub fn clip_note(text: &str) -> String {
+    match text.char_indices().nth(NOTE_MAX_CHARS) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
+    }
+}
+
 /// A menu press. `request()` is `None` for the one action the applet
 /// performs itself instead of asking the daemon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -290,6 +305,21 @@ mod tests {
         assert!(!poll.replied());
         assert!(!poll.in_flight());
         assert!(poll.request(), "and the guard is still usable");
+    }
+
+    /// M2: a note is one aside under a row, not a paragraph. `malformed
+    /// reply {line:?}` quotes up to 64 KiB and an action error carries
+    /// systemctl's whole stderr; either would wrap into many lines and push
+    /// Quit toward `popup_container`'s clip.
+    #[test]
+    fn a_note_is_clipped_to_one_readable_line() {
+        assert_eq!(clip_note("short"), "short");
+        let exact = "a".repeat(NOTE_MAX_CHARS);
+        assert_eq!(clip_note(&exact), exact, "at the limit is kept whole");
+        // Clipped on a char boundary, with an ellipsis that says so.
+        let clipped = clip_note(&"é".repeat(NOTE_MAX_CHARS + 40));
+        assert_eq!(clipped.chars().count(), NOTE_MAX_CHARS + 1);
+        assert!(clipped.ends_with('…'), "{clipped}");
     }
 
     #[test]
