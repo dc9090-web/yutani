@@ -207,14 +207,23 @@ fn response_of(result: Result<Option<String>, String>) -> crate::ipc::Response {
 }
 
 impl App {
-    fn send(&self, cmd: Cmd) {
+    /// Hand a command to the backend. `false` when it could not be sent —
+    /// before the backend has handed over its channel (the first moments
+    /// after start), or after it closed — so a caller that answers someone
+    /// can say so instead of reporting success for nothing.
+    fn send(&self, cmd: Cmd) -> bool {
         match &self.cmd {
-            Some(sender) => {
-                if let Err(err) = sender.send(cmd) {
+            Some(sender) => match sender.send(cmd) {
+                Ok(()) => true,
+                Err(err) => {
                     tracing::error!("backend command channel closed: {err}");
+                    false
                 }
+            },
+            None => {
+                tracing::warn!("backend not ready; dropping command");
+                false
             }
-            None => tracing::warn!("backend not ready; dropping command"),
         }
     }
 
@@ -456,10 +465,7 @@ impl App {
             Request::Focus(n) => {
                 let order = self.focus_order();
                 match n.checked_sub(1).and_then(|i| order.get(i)) {
-                    Some(h) => {
-                        self.send(Cmd::Activate(h.clone()));
-                        (Reply::Now(Ok(None)), Task::none())
-                    }
+                    Some(h) => (Reply::Now(self.activate(h.clone())), Task::none()),
                     None => (Reply::Now(Err(format!("no client {n} ({} known)", order.len()))), Task::none()),
                 }
             }
@@ -467,10 +473,7 @@ impl App {
                 let order = self.focus_order();
                 let active = self.active_client();
                 match rules::step(&order, active.as_ref(), matches!(request, Request::Next)) {
-                    Some(h) => {
-                        self.send(Cmd::Activate(h));
-                        (Reply::Now(Ok(None)), Task::none())
-                    }
+                    Some(h) => (Reply::Now(self.activate(h)), Task::none()),
                     None => (Reply::Now(Err("no clients".into())), Task::none()),
                 }
             }
@@ -558,6 +561,12 @@ impl App {
                 (Reply::Later, task)
             }
         }
+    }
+
+    /// `focus`/`next`/`prev`: the activation, as an IPC answer. A hotkey
+    /// pressed before the backend is ready does nothing, and must say so.
+    fn activate(&self, handle: Handle) -> Result<Option<String>, String> {
+        if self.send(Cmd::Activate(handle)) { Ok(None) } else { Err("backend not ready".into()) }
     }
 
     /// IPC `quit`, once the plan is known.
@@ -2275,6 +2284,26 @@ mod tests {
         assert_eq!(client.output, "DP-2", "the thumbnail belongs on the saved output");
         assert_eq!(client.position, (100, 100));
         assert!(client.surface.is_some_and(|id| id != before), "recreated, not margin-moved");
+    }
+
+    /// [M3] Before the backend has handed over its command channel, a
+    /// `focus`/`next`/`prev` cannot be carried out; answering `ok` then
+    /// told the hotkey user nothing happened for no reason.
+    #[test]
+    fn focus_requests_fail_honestly_while_the_backend_is_not_ready() {
+        let fake = Fake::new();
+        let mut app = app(Config::default());
+        let a = fake.handle();
+        let _ = app.on_backend(Event::ClientAdded(a.clone(), info(false, Vec::new())));
+        assert!(app.cmd.is_none());
+        for request in [crate::ipc::Request::Focus(1), crate::ipc::Request::Next, crate::ipc::Request::Prev] {
+            let (reply, _) = ipc::Responder::detached();
+            let (how, _task) = app.handle_request(&request, &reply);
+            assert!(matches!(how, Reply::Now(Err(ref m)) if m.contains("not ready")), "{request:?}: {}", match how {
+                Reply::Now(r) => format!("{r:?}"),
+                Reply::Later => "later".into(),
+            });
+        }
     }
 
     /// [I3] The watcher's answer to a `config.ron` that does not parse:
