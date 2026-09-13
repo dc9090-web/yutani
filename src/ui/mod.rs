@@ -483,8 +483,13 @@ impl App {
             // it, so the stop runs on the blocking pool and the exit itself
             // waits for `Msg::QuitAfterTunnel`.
             Request::Quit => {
-                let tunnel = crate::tunnel::control::current_tunnel_status(&self.config.tunnel.location);
-                match crate::tunnel::control::quit_plan(tunnel.installed, tunnel.connected) {
+                // Two `stat`s decide the plan, not the full status: that
+                // one can spawn `systemctl`, which has no place here.
+                let plan = crate::tunnel::control::quit_plan(
+                    crate::tunnel::control::installed(),
+                    crate::tunnel::control::iface_present(),
+                );
+                match plan {
                     crate::tunnel::control::QuitPlan::ExitNow => {
                         ipc::remove_socket();
                         (Reply::Now(Ok(None)), cosmic::iced::exit())
@@ -503,22 +508,34 @@ impl App {
                     }
                 }
             }
+            // The applet polls this every 5 s (1 s with its popup open),
+            // and the tunnel half can spawn `systemctl is-failed` (unit
+            // installed, link down — the ordinary state): a fork/exec and a
+            // D-Bus round trip, up to a second when systemd is slow. The
+            // client list is taken here; the rest runs on the blocking pool
+            // and the answer comes back as `IpcReplyLater`.
             Request::Status => {
                 let order = self.focus_order();
-                let clients = order
+                let clients: Vec<crate::tunnel::status::ClientStatus> = order
                     .iter()
                     .filter_map(|h| self.clients.get(h))
                     .map(|c| crate::tunnel::status::ClientStatus { name: c.info.login.label().to_string(), active: c.info.activated })
                     .collect();
-                let status = crate::tunnel::status::Status {
-                    clients,
-                    hidden: self.hidden,
-                    tunnel: crate::tunnel::control::current_tunnel_status(&self.config.tunnel.location),
-                };
-                match serde_json::to_string(&status) {
-                    Ok(json) => (Reply::Now(Ok(Some(json))), Task::none()),
-                    Err(e) => (Reply::Now(Err(format!("status: {e}"))), Task::none()),
-                }
+                let hidden = self.hidden;
+                let location = self.config.tunnel.location.clone();
+                let reply = reply.clone();
+                let task = cosmic::iced::Task::perform(
+                    async move {
+                        let tunnel =
+                            tokio::task::spawn_blocking(move || crate::tunnel::control::current_tunnel_status(&location))
+                                .await
+                                .map_err(|e| format!("status task failed: {e}"))?;
+                        let status = crate::tunnel::status::Status { clients, hidden, tunnel };
+                        serde_json::to_string(&status).map(Some).map_err(|e| format!("status: {e}"))
+                    },
+                    move |result| cosmic::Action::App(Msg::IpcReplyLater(reply, result)),
+                );
+                (Reply::Later, task)
             }
             // `systemctl start|stop` is a synchronous subprocess that can
             // take up to the unit's TimeoutStopSec (10 s). Running it here
@@ -2082,6 +2099,21 @@ mod tests {
 
     fn surface_of(app: &App, h: &Handle) -> Option<SurfaceId> {
         app.clients[h].surface
+    }
+
+    /// [I2] `status` is what the applet polls every 5 s (1 s with its popup
+    /// open), and the tunnel half of it can spawn `systemctl is-failed`
+    /// (installed unit, link down — the ordinary state). That must never
+    /// run on the thread that drives every thumbnail frame, so the request
+    /// is answered later, from a task, and nothing reaches the client from
+    /// this call.
+    #[test]
+    fn status_is_answered_off_the_update_thread() {
+        let mut app = app(Config::default());
+        let (reply, mut rx) = ipc::Responder::detached();
+        let (how, _task) = app.handle_request(&crate::ipc::Request::Status, &reply);
+        assert!(matches!(how, Reply::Later), "answered on the update thread");
+        assert!(rx.try_recv().is_err(), "the reply must come from the task, not from this call");
     }
 
     /// [I1] Play in client A for a minute (no toplevel events), then click

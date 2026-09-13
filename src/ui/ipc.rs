@@ -26,6 +26,17 @@ impl Responder {
     }
 }
 
+#[cfg(test)]
+impl Responder {
+    /// A reply handle together with the receiver a connection task would
+    /// be waiting on, so a test can see whether (and what) `handle_request`
+    /// answered from the update thread.
+    pub fn detached() -> (Responder, oneshot::Receiver<Response>) {
+        let (tx, rx) = oneshot::channel();
+        (Responder(Arc::new(Mutex::new(Some(tx)))), rx)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct IpcEvent {
     pub request: Request,
