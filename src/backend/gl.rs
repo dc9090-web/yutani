@@ -498,13 +498,37 @@ impl Gl {
         // The fds keep the memory alive; the bo handle itself is not needed.
         drop(bo);
         let dma = Dmabuf { width: width as i32, height: height as i32, planes, format: ABGR8888, modifier };
-        let image = self.create_image(&dma)?;
+        // Both GL names first, before anything that would need undoing: a
+        // failed `create_framebuffer` after the import used to leak the
+        // renderbuffer and the EGLImage, on exactly the out-of-memory path
+        // that counts toward `GL_MAX_FAILURES`.
+        // SAFETY: GL calls on the current context.
+        let (rb, fb) = unsafe {
+            let rb = self.gl.create_renderbuffer().map_err(|e| anyhow!(e))?;
+            let fb = match self.gl.create_framebuffer() {
+                Ok(fb) => fb,
+                Err(e) => {
+                    self.gl.delete_renderbuffer(rb);
+                    return Err(anyhow!(e));
+                }
+            };
+            (rb, fb)
+        };
+        let image = match self.create_image(&dma) {
+            Ok(image) => image,
+            Err(err) => {
+                // SAFETY: deleting the names just created, on the context's thread.
+                unsafe {
+                    self.gl.delete_framebuffer(fb);
+                    self.gl.delete_renderbuffer(rb);
+                }
+                return Err(err);
+            }
+        };
         // SAFETY: GL calls on the current context.
         let (framebuffer, renderbuffer) = unsafe {
-            let rb = self.gl.create_renderbuffer().map_err(|e| anyhow!(e))?;
             self.gl.bind_renderbuffer(glow::RENDERBUFFER, Some(rb));
             (self.image_target_renderbuffer)(glow::RENDERBUFFER, image.as_ptr());
-            let fb = self.gl.create_framebuffer().map_err(|e| anyhow!(e))?;
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fb));
             self.gl.framebuffer_renderbuffer(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::RENDERBUFFER, Some(rb));
             let status = self.gl.check_framebuffer_status(glow::FRAMEBUFFER);
