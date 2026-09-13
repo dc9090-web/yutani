@@ -56,6 +56,10 @@ pub struct Layout {
     pub new_client_anchor: Anchor,
 }
 
+/// The drag snap grid, in logical px (spec §"Interaction": halved from 32
+/// on 2026-09-13 at Daniel's request — 32 made the top edge feel far away).
+pub const SNAP_GRID: i32 = 16;
+
 fn round_to(v: i32, grid: i32) -> i32 {
     ((v as f64 / grid as f64).round() as i32) * grid
 }
@@ -459,6 +463,15 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_snap_grid_is_sixteen_px_and_reaches_the_top_edge() {
+        assert_eq!(SNAP_GRID, 16);
+        let r = |y| Rect { x: 0, y, w: 100, h: 60 };
+        assert_eq!(snap(r(7), &[], Some(SNAP_GRID), None), (0, 0));
+        assert_eq!(snap(r(9), &[], Some(SNAP_GRID), None), (0, 16));
+        assert_eq!(snap(r(40), &[], Some(SNAP_GRID), None), (0, 48));
+    }
 
     fn r(x: i32, y: i32) -> Rect {
         Rect { x, y, w: 100, h: 60 }

@@ -499,7 +499,7 @@ fn behavior_page<'a>(state: &'a State, config: &'a Config) -> Element<'a, Msg> {
         widget::toggler(config.hide_active).on_toggle(Msg::HideActive),
     );
     let snap_grid = widget::settings::item(
-        "Snap to a 32 px grid while dragging",
+        "Snap to a 16 px grid while dragging",
         widget::toggler(config.snap_grid).on_toggle(Msg::SnapGrid),
     );
     let snap_edges = widget::settings::item(

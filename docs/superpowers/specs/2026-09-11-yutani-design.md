@@ -290,7 +290,7 @@ no pins, positions are not persisted; clicks still activate/minimise.
 | Input | Action |
 | --- | --- |
 | Left click, no drag | `Command::Activate(client)` |
-| Left or right drag > 4 px | Move (floating, unpinned only). Snap to 32 px grid if `snap_grid`; snap to other thumbnails' edges within 12 px if `snap_edges`. Save `current` layout on release. |
+| Left or right drag > 4 px | Move (floating, unpinned only). Snap to 16 px grid (`layout::SNAP_GRID`; was 32 until 2026-09-13) if `snap_grid`; snap to other thumbnails' edges within 12 px if `snap_edges`. Save `current` layout on release. |
 | Right click (no drag) | `Command::Minimize(client)` — layer surfaces never receive modifier state, so Ctrl-click is not possible |
 | Middle click | Toggle pin (floating mode; ignored in dock mode) |
 | Hover enter / leave | resize immediately (no animation) to `thumb_width × zoom_factor` and back (no-op at the default `zoom_factor: 1.0`), growing away from the anchored corner so the thumbnail stays on screen. Applies in both modes; in dock mode the row/column is re-laid out so neighbours move aside. |

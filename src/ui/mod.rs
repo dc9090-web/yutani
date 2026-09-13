@@ -904,7 +904,7 @@ impl App {
                                 .filter(|(h, c)| *h != &handle && c.surface.is_some())
                                 .map(|(_, c)| self.rect_of(c))
                                 .collect();
-                            let grid = self.config.snap_grid.then_some(32);
+                            let grid = self.config.snap_grid.then_some(layout::SNAP_GRID);
                             let edges = self.config.snap_edges.then_some(12);
                             let (x, y) = layout::snap(Rect { x: raw.0, y: raw.1, ..me }, &others, grid, edges);
                             // Keep the thumbnail fully inside the canvas (== the output).

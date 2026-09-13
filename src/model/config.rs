@@ -126,7 +126,7 @@ pub struct Config {
     pub visibility: Visibility,
     /// Hide the thumbnail of the client that currently has focus.
     pub hide_active: bool,
-    /// Snap to a 32 px grid while dragging.
+    /// Snap to a 16 px grid (`layout::SNAP_GRID`) while dragging.
     pub snap_grid: bool,
     /// Snap flush against other thumbnails while dragging.
     pub snap_edges: bool,
