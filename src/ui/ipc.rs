@@ -38,13 +38,13 @@ pub fn subscription() -> Subscription<IpcEvent> {
 
 /// Delete the socket file (on quit). Safe to call when it doesn't exist.
 pub fn remove_socket() {
-    let _ = std::fs::remove_file(socket_path());
+    let _ = socket_path().and_then(std::fs::remove_file);
 }
 
 /// Bind the listener, replacing a stale socket left by a crashed instance
 /// but never one that still answers.
 fn bind() -> std::io::Result<UnixListener> {
-    let path = socket_path();
+    let path = socket_path()?;
     if path.exists() {
         if StdUnixStream::connect(&path).is_ok() {
             return Err(std::io::Error::new(
