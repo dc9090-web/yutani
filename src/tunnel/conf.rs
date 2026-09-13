@@ -49,11 +49,13 @@ fn sections(text: &str) -> Result<Vec<Section>, String> {
             out.push(Section { name: line[1..line.len() - 1].trim().to_string(), ..Default::default() });
             continue;
         }
+        // Where, never what: this message is printed to the terminal of
+        // whoever ran `install-root`, and the file was read as root.
         let Some((k, v)) = line.split_once('=') else {
-            return Err(format!("line {}: expected `Key = value`, got {line:?}", i + 1));
+            return Err(format!("line {}: expected `Key = value` but the line has no `=`", i + 1));
         };
         let Some(s) = out.last_mut() else {
-            return Err(format!("line {}: `{}` before any [section]", i + 1, k.trim()));
+            return Err(format!("line {}: a `Key = value` before any [section]", i + 1));
         };
         s.entries.push((k.trim().to_string(), v.trim().to_string()));
     }
@@ -171,6 +173,20 @@ mod tests {
         assert_eq!(c.address.to_string(), "10.9.8.7");
         assert_eq!(c.prefix_len, 24);
         assert_eq!(c.mtu, Some(1380));
+    }
+
+    /// Root reads whatever `--conf` names and `main` prints the parse error
+    /// to the caller's terminal, so the message says *where* the problem is
+    /// and never what the line holds — a root-only file handed to
+    /// `install-root` must not have its first line echoed back.
+    #[test]
+    fn a_parse_error_names_the_line_but_never_quotes_it() {
+        let e = WgConf::parse("[Interface]\nroot:$6$hashed-secret:19000\n", "x").unwrap_err();
+        assert!(e.contains("line 2"), "got {e}");
+        assert!(!e.contains("secret"), "the line's content leaked: {e}");
+        let e = WgConf::parse("TOKEN_SECRET = hunter2\n[Interface]\n", "x").unwrap_err();
+        assert!(e.contains("line 1") && e.contains("[section]"), "got {e}");
+        assert!(!e.contains("SECRET") && !e.contains("hunter2"), "the line's content leaked: {e}");
     }
 
     #[test]

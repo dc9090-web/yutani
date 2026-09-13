@@ -322,6 +322,41 @@ fn dns_conf_lines(servers: &[std::net::Ipv4Addr], domains: &[String]) -> anyhow:
     Ok(format!("# yutani: dns_servers = {}\n# yutani: dns_domains = {}\n", servers.join(" "), domains.join(" ")))
 }
 
+/// The most `install-root` will read from `--conf`. A WireGuard conf is a
+/// few hundred bytes; 64 KiB is a generous ceiling that still keeps a root
+/// process from reading something unbounded.
+const CONF_MAX_LEN: u64 = 64 * 1024;
+
+/// Whether root may read `--conf` at all, decided on what the path *is*
+/// before a byte of it is read: a regular file (not a symlink, which
+/// `install` would have resolved; not a FIFO, which would hang the
+/// pkexec'd root process forever; not a device — `/dev/zero` is unbounded
+/// memory), no larger than [`CONF_MAX_LEN`], and owned by the user it is
+/// being installed for, by root, or by `self` — the uid running the check,
+/// which is root on the real install and `uid` on a dry run, so that last
+/// case changes nothing outside the test-suite, where `uid` is a fixture.
+/// Spec §9 calls the conf the one deliberate crossing of the root/user
+/// boundary; this is its guard.
+fn conf_guard(conf: &Path, uid: u32) -> anyhow::Result<()> {
+    let md = std::fs::symlink_metadata(conf).with_context(|| format!("stat {}", conf.display()))?;
+    ensure!(!md.file_type().is_symlink(), "{} is a symlink; pass the file it points to", conf.display());
+    conf_readable(md.is_file(), md.uid(), md.len(), uid, crate::ipc::uid()).map_err(|why| anyhow!("{}: {why}", conf.display()))
+}
+
+/// The verdict behind [`conf_guard`], on the facts alone.
+fn conf_readable(regular: bool, owner: u32, len: u64, uid: u32, this: u32) -> Result<(), String> {
+    if !regular {
+        return Err("not a regular file".to_string());
+    }
+    if len > CONF_MAX_LEN {
+        return Err(format!("{len} bytes is larger than a WireGuard conf can be (at most {} KiB)", CONF_MAX_LEN / 1024));
+    }
+    if owner != uid && owner != 0 && owner != this {
+        return Err(format!("owned by uid {owner}, not by uid {uid} or root"));
+    }
+    Ok(())
+}
+
 /// Root side. With `dry_run`, returns what would be written instead of writing.
 pub fn install_root(
     conf: &Path,
@@ -335,6 +370,7 @@ pub fn install_root(
     ensure!(conf.is_absolute() && Path::new(exe).is_absolute(), "paths must be absolute");
     ensure!(valid_username(username), "{username:?} is not a POSIX portable user name ([a-z_][a-z0-9_-]*$)");
     check_pkexec_uid(std::env::var("PKEXEC_UID").ok().as_deref(), uid)?;
+    conf_guard(conf, uid)?;
     let text = std::fs::read_to_string(conf).with_context(|| format!("read {}", conf.display()))?;
     let label = conf.file_stem().and_then(|s| s.to_str()).unwrap_or("tunnel");
     let parsed = WgConf::parse(&text, label).map_err(|e| anyhow!("{}: {e}", conf.display()))?;
@@ -571,6 +607,46 @@ mod tests {
         }
         assert!(install_root(&conf, 1000, "daniel", "/opt/y", &["8.8.8.8".parse().unwrap()], &domains(), true).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Root reads whatever `--conf` names. A symlink, a device (`/dev/zero`
+    /// would be unbounded memory in a root process; a FIFO would hang it
+    /// forever) or an oversized file is refused before the read, by what
+    /// the path *is*, never by what it holds. `install` canonicalises the
+    /// path and a WireGuard conf is a few hundred bytes, so none of this
+    /// touches a real install.
+    #[test]
+    fn install_root_reads_only_a_small_regular_file_that_is_not_a_symlink() {
+        let dir = temp_dir("inst-guard");
+        let real = dir.join("EVE.conf");
+        std::fs::write(&real, GOOD_CONF).unwrap();
+        let link = dir.join("link.conf");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let e = install_root(&link, 1000, "daniel", "/opt/y", &servers(), &domains(), true).unwrap_err().to_string();
+        assert!(e.contains("symlink"), "got {e}");
+        let e = install_root(Path::new("/dev/null"), 1000, "daniel", "/opt/y", &servers(), &domains(), true).unwrap_err().to_string();
+        assert!(e.contains("regular file"), "got {e}");
+        let big = dir.join("big.conf");
+        std::fs::write(&big, format!("{GOOD_CONF}# {}\n", "x".repeat(CONF_MAX_LEN as usize))).unwrap();
+        let e = install_root(&big, 1000, "daniel", "/opt/y", &servers(), &domains(), true).unwrap_err().to_string();
+        assert!(e.contains("KiB"), "got {e}");
+        assert!(install_root(&real, 1000, "daniel", "/opt/y", &servers(), &domains(), true).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The owner rule: the user's own file, or root's; a file some third
+    /// user owns is not root's to read on this user's behalf. `this` is
+    /// the uid running the check, root or `uid` outside the tests.
+    #[test]
+    fn the_conf_must_be_a_small_regular_file_of_the_user_or_root() {
+        assert!(conf_readable(true, 1000, 300, 1000, 1000).is_ok());
+        assert!(conf_readable(true, 0, 300, 1000, 0).is_ok(), "an admin may stage the conf as root");
+        assert!(conf_readable(true, 1000, 300, 1000, 0).is_ok(), "the real install: root checking the user's file");
+        let e = conf_readable(true, 1001, 300, 1000, 0).unwrap_err();
+        assert!(e.contains("uid 1001") && e.contains("uid 1000"), "got {e}");
+        assert!(conf_readable(false, 1000, 0, 1000, 0).unwrap_err().contains("regular file"));
+        assert!(conf_readable(true, 1000, CONF_MAX_LEN, 1000, 0).is_ok(), "exactly the ceiling is fine");
+        assert!(conf_readable(true, 1000, CONF_MAX_LEN + 1, 1000, 0).unwrap_err().contains("KiB"));
     }
 
     #[test]
