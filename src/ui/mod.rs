@@ -135,6 +135,16 @@ pub struct App {
     pub last_eve_focus: Option<Instant>,
     /// The settings window while it is open (spec §6).
     pub settings: Option<settings::State>,
+    /// A permanent 1×1 `Layer::Background` surface, created on the first
+    /// output before any thumbnail and never destroyed by us. libcosmic
+    /// binds its one clipboard to the first layer surface it creates and
+    /// drops it (worker thread, display connection, every `WlOutput`
+    /// binding) when that surface is destroyed, reconnecting on the next
+    /// create; with a thumbnail as that first surface, every hide of it
+    /// (EveFocusedOnly, hide_active, logout) was a reconnect — the churn
+    /// behind the SCTK-thread use-after-free. Its id is never a client's,
+    /// so `client_for_surface` and the pointer path ignore it.
+    pub keepalive: Option<SurfaceId>,
     /// The `.conf` a tunnel install/uninstall/connect/disconnect started
     /// from, while that action runs on the blocking pool. It lives here and
     /// not in the window's state because the window can be closed and
@@ -696,6 +706,34 @@ impl App {
             ..Default::default()
         });
         create
+    }
+
+    /// Put up the keepalive surface (see `App::keepalive`) if it is not up
+    /// and there is an output to put it on. Batched *ahead of* the reconcile
+    /// that follows an output event, so its `get_layer_surface` reaches
+    /// libcosmic before any thumbnail's and the clipboard binds to it once:
+    /// `Task::batch` hands immediately-ready actions on in push order.
+    /// 1×1 on the background layer, top-left, no keyboard: the compositor
+    /// never shows it and the pointer never finds it.
+    fn ensure_keepalive(&mut self) -> Task<cosmic::Action<Msg>> {
+        if self.keepalive.is_some() || self.outputs.is_empty() {
+            return Task::none();
+        }
+        let id = SurfaceId::unique();
+        self.keepalive = Some(id);
+        tracing::info!(?id, "keepalive surface");
+        get_layer_surface(SctkLayerSurfaceSettings {
+            id,
+            layer: Layer::Background,
+            keyboard_interactivity: KeyboardInteractivity::None,
+            anchor: Anchor::TOP | Anchor::LEFT,
+            output: IcedOutput::Active,
+            namespace: "yutani-keepalive".into(),
+            size: Some((Some(1), Some(1))),
+            exclusive_zone: -1,
+            size_limits: Limits::NONE,
+            ..Default::default()
+        })
     }
 
     fn destroy_surface(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {
@@ -1864,6 +1902,7 @@ impl Application for App {
             last_eve_focus: None,
             tunnel_in_flight: None,
             settings: None,
+            keepalive: None,
         };
         (app, Task::none())
     }
@@ -1878,10 +1917,18 @@ impl Application for App {
                 // moves the dock layout. `reconcile_surfaces` covers all.
                 self.on_output(event, output);
                 // A scale change is picked up at the next size send.
-                self.reconcile_surfaces()
+                let keepalive = self.ensure_keepalive();
+                Task::batch([keepalive, self.reconcile_surfaces()])
             }
             Msg::Wayland(WaylandEvent::Layer(LayerEvent::Done, _, id)) => {
                 // The compositor closed this surface (its output went away).
+                if self.keepalive == Some(id) {
+                    // Only on output loss; a new one goes up on whatever is
+                    // left (or with the next output), still ahead of any
+                    // thumbnail that is recreated for it.
+                    self.keepalive = None;
+                    return self.ensure_keepalive();
+                }
                 if let Some(handle) = self.client_for_surface(id) {
                     tracing::info!("layer surface closed by compositor; recreating");
                     self.forget_surface(&handle);
@@ -2064,6 +2111,7 @@ impl Application for App {
 mod tests {
     use super::*;
     use cosmic::cctk::wayland_client::protocol::wl_registry::WlRegistry;
+    use cosmic::cctk::wayland_client::protocol::wl_surface::WlSurface;
     use cosmic::cctk::wayland_client::{EventQueue, QueueHandle, backend::Backend, delegate_noop};
     use std::os::unix::net::UnixStream;
 
@@ -2085,6 +2133,7 @@ mod tests {
     delegate_noop!(Nop: ignore WlRegistry);
     delegate_noop!(Nop: ignore WlOutput);
     delegate_noop!(Nop: ignore Handle);
+    delegate_noop!(Nop: ignore WlSurface);
 
     impl Fake {
         fn new() -> Fake {
@@ -2106,6 +2155,11 @@ mod tests {
         fn handle(&self) -> Handle {
             self.registry.bind::<Handle, _, _>(1, 1, &self.qh, ())
         }
+
+        /// A `wl_surface` proxy, for the layer events that carry one.
+        fn wl_surface(&self) -> WlSurface {
+            self.registry.bind::<WlSurface, _, _>(1, 1, &self.qh, ())
+        }
     }
 
     fn app(config: Config) -> App {
@@ -2124,6 +2178,7 @@ mod tests {
             last_eve_focus: None,
             settings: None,
             tunnel_in_flight: None,
+            keepalive: None,
         }
     }
 
@@ -2134,9 +2189,8 @@ mod tests {
     /// the same reconcile the event handler runs.
     fn add_output(app: &mut App, fake: &Fake, name: &str) -> WlOutput {
         let output = fake.output();
-        let _ = app.update(Msg::Wayland(WaylandEvent::Output(OutputEvent::Created(None), output.clone())));
         app.outputs.push(Output { handle: output.clone(), name: name.to_string(), logical_size: (2560, 1440), scale: 1 });
-        let _ = app.reconcile_surfaces();
+        let _ = app.update(Msg::Wayland(WaylandEvent::Output(OutputEvent::Created(None), output.clone())));
         output
     }
 
@@ -2161,6 +2215,40 @@ mod tests {
         let (how, _task) = app.handle_request(&crate::ipc::Request::Status, &reply);
         assert!(matches!(how, Reply::Later), "answered on the update thread");
         assert!(rx.try_recv().is_err(), "the reply must come from the task, not from this call");
+    }
+
+    /// [I6] The first layer surface we create is the permanent keepalive,
+    /// never a thumbnail: libcosmic binds its clipboard to that first
+    /// surface and reconnects (a new worker thread, display connection and
+    /// output bindings, dropping the old ones) whenever it is destroyed.
+    /// So it exists before any client can have a surface, no client
+    /// lookup ever resolves to it, hiding a thumbnail leaves it alone, and
+    /// a `Done` from the compositor (its output went away) puts a new one
+    /// up without touching any client.
+    #[test]
+    fn the_first_surface_is_the_permanent_keepalive_and_never_a_thumbnail() {
+        let fake = Fake::new();
+        let mut app = app(Config { visibility: Visibility::Always, ..Config::default() });
+        assert_eq!(app.keepalive, None, "nothing before the first output");
+        add_output(&mut app, &fake, "DP-1");
+        let keepalive = app.keepalive.expect("created with the first output");
+        assert!(app.clients.is_empty());
+
+        let a = fake.handle();
+        let _ = app.on_backend(Event::ClientAdded(a.clone(), info(true, Vec::new())));
+        let thumb = surface_of(&app, &a).expect("shown");
+        assert!(keepalive < thumb, "the keepalive was minted first");
+        assert_eq!(app.client_for_surface(keepalive), None, "no client lookup resolves to it");
+
+        let _ = app.set_hidden(true);
+        assert_eq!(surface_of(&app, &a), None);
+        assert_eq!(app.keepalive, Some(keepalive), "hiding every thumbnail leaves it alone");
+
+        let _ = app.set_hidden(false);
+        let shown = surface_of(&app, &a).expect("shown again");
+        let _ = app.update(Msg::Wayland(WaylandEvent::Layer(LayerEvent::Done, fake.wl_surface(), keepalive)));
+        assert!(app.keepalive.is_some_and(|k| k != keepalive), "replaced after the compositor closed it");
+        assert_eq!(surface_of(&app, &a), Some(shown), "and no client was touched");
     }
 
     /// [I4] A character logs in on DP-1 (its thumbnail is created there,
