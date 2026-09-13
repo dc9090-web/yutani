@@ -316,6 +316,10 @@ libcosmic window, opened from the applet or `yutani settings`. Pages:
   *Uninstall shortcuts* buttons.
 - **Layouts** — list of saved layouts; *Save current as…*, *Apply*, *Rename*,
   *Delete*.
+- **Characters** — copy one EVE character's interface settings (overview,
+  window positions, chat, UI layout) over every other character in the
+  profile, with a backup first and a *Restore last backup* button;
+  specified in full in `2026-09-13-yutani-character-copy-design.md`.
 - **Steam** — the launch options EVE Online needs in its Steam *Properties
   → Launch Options*, as a read-only monospace line with a *Copy* button
   (`yutani::STEAM_LAUNCH_ARGS`), plus the absolute-path variant for a Steam
@@ -323,7 +327,10 @@ libcosmic window, opened from the applet or `yutani settings`. Pages:
   nothing is written, so — like Layouts — it still works while `config.ron`
   does not parse.
 
-All changes apply live and write `config.ron`.
+Five pages in that order. Display and Behavior apply live and write
+`config.ron`; Layouts writes its own files under `~/.config/yutani/layouts`,
+Characters writes EVE's files (never `config.ron`), and Steam writes
+nothing at all.
 
 ### Panel applet
 
@@ -398,6 +405,7 @@ if the socket is absent it prints "yutani is not running" and exits 1.
   snap_grid: true,
   snap_edges: true,
   shortcuts: ( focus_prefix: [Ctrl, Alt], next: "Right", prev: "Left" ),
+  eve_settings_dir: None,    // absolute path to EVE's profile dir when Steam's library list cannot find it
 )
 ```
 

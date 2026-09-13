@@ -62,15 +62,35 @@ log out together), so the account copy needs its own source picker.
   over every other `core_char_<digits>.dat`; with "Also copy account
   settings" on, the chosen `core_user` file over every other
   `core_user_<digits>.dat`. Each overwrite is a write-to-temp-and-rename in
-  the same directory. The source files are never modified.
+  the same directory. The source files are never modified. The copy runs in
+  two phases: *every* target is first copied into the backup directory, and
+  only when all of them are safely there is *any* target overwritten.
+  Interleaving the two would mean a backup that fails on the fourth target
+  leaves the first three already replaced with no way back.
 - **Safety.** The button is disabled while any EVE client toplevel exists
   (login screen included): the client rewrites these files on logout and
-  would clobber the copy. Before anything is overwritten, every target file
-  is copied to `~/.local/share/yutani/backups/<UTC timestamp>/` under its
-  own name; "Restore last backup" copies them back. Fewer than two
+  would clobber the copy. EVE writes these files *as it exits*, so wait a
+  moment after closing the last client before pressing Copy — otherwise the
+  copy is of a file the client is still finishing. Before anything is
+  overwritten, every target file is copied to
+  `~/.local/share/yutani/backups/<UTC timestamp>/` under its own name; the
+  directory must not already exist, so two presses inside one second are
+  refused rather than letting the second run overwrite the first run's
+  originals. "Restore last backup" copies them back — and, because a
+  restore is otherwise the one step with no way back, it first backs up the
+  live files it is about to replace into a new timestamped directory, and
+  skips any backup entry whose file is no longer in the profile (a restore
+  reverts files; it does not resurrect deleted ones). Fewer than two
   characters → nothing to copy, button disabled with the reason.
 - **Feedback.** The note line says what happened: `copied KestrelVance to 6
-  characters and 2 accounts; backup in …/backups/20260913T024100Z`.
+  characters and 2 accounts; backup in …/backups/20260913T024100Z`, or
+  `restored 6 files from …/20260913T024100Z; the files it replaced are in
+  …/20260913T031500Z`. A failure says how far it got, honestly: nothing was
+  touched during the backup phase, so that note is `copy not started: …`,
+  while a failure while overwriting is `copy failed after replacing 3 of 7
+  files: …; the originals are in …`. Reasons a button is disabled are shown
+  as captions under it, and repeated in the note line (lowercased) when the
+  press is refused after the fact.
 
 ## 4. Out of scope
 
