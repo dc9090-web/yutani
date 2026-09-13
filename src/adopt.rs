@@ -59,26 +59,34 @@ pub fn busctl_adopt_argv(pid: u32) -> Vec<String> {
     .collect()
 }
 
-/// EVE processes owned by `uid` that are not yet in the slice.
-pub fn scan(patterns: &[String], uid: u32) -> Vec<Candidate> {
+/// EVE processes owned by `uid` that are not yet in the slice, and every
+/// pid that was alive during the walk (all users: it feeds
+/// [`Tracker::retain_live`], and a second `/proc` walk per tick just for
+/// that would double the syscalls).
+pub fn scan(patterns: &[String], uid: u32) -> (Vec<Candidate>, HashSet<u32>) {
     use std::os::unix::fs::MetadataExt;
-    let Ok(dir) = std::fs::read_dir("/proc") else { return Vec::new() };
+    let Ok(dir) = std::fs::read_dir("/proc") else { return (Vec::new(), HashSet::new()) };
     let mut out = Vec::new();
+    let mut live = HashSet::new();
     for entry in dir.flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
+        live.insert(pid);
         let Ok(meta) = entry.metadata() else { continue };
         if meta.uid() != uid {
             continue;
         }
         let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
-        let cmdline = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
-        let argv0 = cmdline.split(|b| *b == 0).next().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
         let name = if is_eve_process(comm.trim(), patterns) {
             comm.trim().to_string()
-        } else if is_eve_process(&argv0, patterns) {
-            argv0.rsplit(['/', '\\']).next().unwrap_or(&argv0).to_string()
         } else {
-            continue;
+            // `comm` is truncated to 15 bytes; only then is argv[0] worth
+            // the extra read (a few hundred processes per tick otherwise).
+            let cmdline = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+            let argv0 = cmdline.split(|b| *b == 0).next().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
+            if !is_eve_process(&argv0, patterns) {
+                continue;
+            }
+            argv0.rsplit(['/', '\\']).next().unwrap_or(&argv0).to_string()
         };
         let cgroup = std::fs::read_to_string(entry.path().join("cgroup")).unwrap_or_default();
         if in_slice(&cgroup) {
@@ -86,7 +94,7 @@ pub fn scan(patterns: &[String], uid: u32) -> Vec<Candidate> {
         }
         out.push(Candidate { pid, name });
     }
-    out
+    (out, live)
 }
 
 /// Wall-clock bound on one adoption call. A timeout is a failure like any
@@ -179,10 +187,6 @@ impl Tracker {
     }
 }
 
-fn live_pids() -> HashSet<u32> {
-    let Ok(dir) = std::fs::read_dir("/proc") else { return HashSet::new() };
-    dir.flatten().filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok()).collect()
-}
 
 /// Scan every 2 s; adopt what's new; report each pid's outcome once
 /// (successes always, failures only until warned — see [`Tracker`]).
@@ -207,7 +211,7 @@ fn run(patterns: &Vec<String>) -> iced::futures::stream::BoxStream<'static, Adop
         let mut tracker = Tracker::new();
         loop {
             let p = patterns.clone();
-            let candidates = off_thread(move || scan(&p, uid)).await.unwrap_or_default();
+            let (candidates, live) = off_thread(move || scan(&p, uid)).await.unwrap_or_default();
             for c in candidates {
                 if !tracker.should_attempt(c.pid) {
                     continue;
@@ -220,7 +224,7 @@ fn run(patterns: &Vec<String>) -> iced::futures::stream::BoxStream<'static, Adop
                 }
             }
             // Forget pids that are gone so a reused pid can be adopted again.
-            tracker.retain_live(&off_thread(live_pids).await.unwrap_or_default());
+            tracker.retain_live(&live);
             futures_timer::Delay::new(Duration::from_secs(2)).await;
         }
     };
@@ -285,6 +289,13 @@ mod tests {
                 "0",
             ]
         );
+    }
+
+    #[test]
+    fn scan_reports_every_live_pid_in_the_same_walk() {
+        let (_, live) = scan(&pats(), crate::ipc::uid());
+        assert!(live.contains(&std::process::id()), "the live set must cover the caller itself");
+        assert!(live.contains(&1), "and pids of other users (init), for retain_live");
     }
 
     #[test]
