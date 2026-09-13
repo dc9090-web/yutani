@@ -157,7 +157,15 @@ pub fn backup_files(files: &[PathBuf], backup: &Path) -> std::io::Result<usize> 
 pub fn execute(plan: &Plan, backup: &Path) -> Result<Report, Failure> {
     let planned = plan.targets.len();
     let files: Vec<PathBuf> = plan.targets.iter().map(|t| t.to.clone()).collect();
-    backup_files(&files, backup).map_err(|error| Failure { error, replaced: 0, planned })?;
+    backup_files(&files, backup).map_err(|error| {
+        // A half-filled backup directory would become the "last backup"
+        // Restore offers, hiding the real one. It is ours to remove only
+        // when this call created it: an AlreadyExists belongs to someone.
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            let _ = std::fs::remove_dir_all(backup);
+        }
+        Failure { error, replaced: 0, planned }
+    })?;
     let mut report = Report { characters: 0, accounts: 0, backup: backup.to_path_buf() };
     for target in &plan.targets {
         if let Err(error) = replace_via_tmp(&target.from, &target.to) {
@@ -396,15 +404,17 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("core_char_2.dat")).unwrap(), b"BBBB", "not overwritten");
         assert_eq!(std::fs::read(dir.join("core_char_1.dat")).unwrap(), b"AAAA", "source untouched");
         assert!(!dir.join("core_char_404.dat").exists());
-        // No temporary survives the failure, in the profile or the backup.
-        for parent in [&dir, &backup] {
-            let leftovers: Vec<_> = std::fs::read_dir(parent)
-                .unwrap()
-                .map(|e| e.unwrap().file_name().into_string().unwrap())
-                .filter(|n| n.ends_with(".tmp"))
-                .collect();
-            assert!(leftovers.is_empty(), "{} has {leftovers:?}", parent.display());
-        }
+        // No temporary survives the failure in the profile, and the
+        // half-filled backup directory is gone: it must not become the
+        // "last backup" Restore points at.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{} has {leftovers:?}", dir.display());
+        assert!(!backup.exists(), "partial backup directory left behind");
+        assert_eq!(latest_backup(&dir.join("backups")), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
