@@ -388,7 +388,15 @@ impl cosmic::Application for Applet {
                 self.accounts_open = !self.accounts_open;
                 Task::none()
             }
-            Msg::Surface(action) => cosmic::task::message(cosmic::Action::Surface(action)),
+            // Opening the popup polls at once: the timer's first tick after
+            // its 5 s → 1 s switch is a full second away, and what it would
+            // show meanwhile is up to 5 s old. (`popup` is set by the open
+            // action's own closure, later, so it is still `None` here; on
+            // close it is `Some`.)
+            Msg::Surface(action) => {
+                let surface = cosmic::task::message(cosmic::Action::Surface(action));
+                if self.popup.is_none() { Task::batch([surface, self.poll()]) } else { surface }
+            }
             Msg::PopupClosed(id) => {
                 if self.popup == Some(id) {
                     self.popup = None;
@@ -566,6 +574,26 @@ mod tests {
 
     fn applet() -> Applet {
         Applet::init(Core::default(), ()).0
+    }
+
+    /// M3: the timer's first tick after the 5 s → 1 s switch is a full
+    /// second away, so opening the popup polls at once rather than showing
+    /// up to 5 s old data for that second. Closing it polls nothing.
+    #[test]
+    fn opening_the_popup_polls_at_once_and_closing_it_does_not() {
+        let mut applet = applet();
+        let _ = applet.update(Msg::Status(Ok(connected())));
+        assert!(!applet.poll.in_flight(), "init's poll has been answered");
+
+        let bounds = Rectangle { x: 0.0, y: 0.0, width: 10.0, height: 10.0 };
+        let _ = applet.update(open_popup_message(bounds, cosmic::iced::Vector::default()));
+        assert!(applet.poll.in_flight(), "a poll goes out with the open");
+
+        let _ = applet.update(Msg::Status(Ok(connected())));
+        let id = Id::unique();
+        applet.popup = Some(id);
+        let _ = applet.update(close_popup_message(id));
+        assert!(!applet.poll.in_flight(), "closing polls nothing");
     }
 
     fn connected() -> Status {
