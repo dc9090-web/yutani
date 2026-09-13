@@ -455,3 +455,18 @@ counters move.
 
 IPv6 via the tunnel; enabling the unit at boot; multiple exits/switching
 location (needs several confs + a selector); per-character routing.
+
+*Status after plan A (2026-09-13): implemented and accepted on the target
+machine.* Three defects surfaced only under live traffic and are fixed on
+`master` (`c8c0843`, `c9743cc`, `fa834b1`): slice sockets bind the LAN
+source before the mark (masquerade on `yutani0`); WireGuard's outer packet
+inherits the inner socket's cgroup and was re-marked into a loop
+(interface fwmark `0x5a`); and chains later in the OUTPUT hook see the
+pre-reroute `oif` (kill-switch moved to POSTROUTING, keyed on the mark).
+Observed: home exit `203.0.113.7`, slice exit `203.0.113.42` (UK#455);
+with `yutani0` down the slice times out (exit 28) while home traffic
+works, and the route is back within 2 s of `ip link set yutani0 up`;
+`getent hosts whoami.akamai.net` from the slice answers with the *home*
+address, confirming the §2 DNS gap (queries go out via systemd-resolved,
+here Tailscale MagicDNS `100.100.100.100`); the kill-switch counter shows
+exactly the packets dropped during the link-down test.
