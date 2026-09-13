@@ -20,7 +20,6 @@
     DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ yutani_uid }}/bus"
   ansible.builtin.command: "{{ yutani_prefix }}/yutani service install"
   when: yutani_install_service | bool
-  register: yutani_service
   changed_when: false
 
 - name: Start Yutani at login
@@ -43,5 +42,4 @@
     DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ yutani_uid }}/bus"
   ansible.builtin.command: "{{ yutani_prefix }}/yutani shortcuts install"
   when: yutani_install_shortcuts | bool
-  register: yutani_shortcuts
   changed_when: false

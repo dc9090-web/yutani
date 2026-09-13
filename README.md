@@ -10,7 +10,7 @@ window (layouts, characters, tunnel, Steam).
 
 ## Requirements
 
-- COSMIC 1.7 or newer on a Wayland session. `yutani doctor` prints every
+- COSMIC 1.8 or newer on a Wayland session. `yutani doctor` prints every
   Wayland protocol it needs and whether cosmic-comp advertises it.
 - Arch/CachyOS packages: `nftables`, `wireguard-tools`, `curl`, `polkit`,
   `gtk-update-icon-cache`, `rustup`, `git`, `base-devel`.
