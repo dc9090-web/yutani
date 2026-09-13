@@ -86,6 +86,16 @@ pub enum Request {
 }
 
 impl Request {
+    /// `Request::Layout`, refusing a name that could not survive the wire:
+    /// the server reads one line, so a name with a line break in it would
+    /// silently become a request for whatever precedes the break.
+    pub fn layout(name: String) -> Result<Request, String> {
+        if name.contains(['\n', '\r']) {
+            return Err("layout names cannot contain a line break".into());
+        }
+        Ok(Request::Layout(name))
+    }
+
     /// Parse one request line (trailing newline optional). Errors are the
     /// text the server sends back after `err `.
     pub fn parse(line: &str) -> Result<Request, String> {
@@ -254,6 +264,13 @@ mod tests {
         let p = socket_path().unwrap();
         assert!(p.to_string_lossy().ends_with(".sock"));
         assert!(p.is_absolute());
+    }
+
+    #[test]
+    fn a_layout_name_with_a_line_break_is_refused_before_it_reaches_the_wire() {
+        assert!(Request::layout("pvp\nfleet".into()).is_err(), "would be sent as `layout pvp`");
+        assert!(Request::layout("pvp\rfleet".into()).is_err());
+        assert_eq!(Request::layout("pvp fleet".into()), Ok(Request::Layout("pvp fleet".into())));
     }
 
     /// A fresh path under the test temp dir, removed when dropped.
