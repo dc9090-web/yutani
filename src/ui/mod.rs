@@ -1477,7 +1477,12 @@ impl App {
             S::BrowseTunnelConf => return self.browse_tunnel_conf(),
             // Re-checked here and not only on the button: the file behind
             // the enabled state can have been moved since the last redraw.
+            // The redraw's answer is cached per text (`conf_check`), so it
+            // is dropped first or this would be the same look, not a new one.
             S::InstallTunnel => {
+                if let Some(s) = self.settings.as_mut() {
+                    *s.tunnel.conf_check.borrow_mut() = None;
+                }
                 let blocked =
                     self.settings.as_ref().and_then(|s| tunnel_page::install_blocker(&s.tunnel));
                 if let Some(reason) = blocked {
@@ -2448,6 +2453,30 @@ mod tests {
         let characters = &app.settings.as_ref().unwrap().characters;
         assert!(characters.listing.is_none() && characters.error.is_none(), "read synchronously");
         assert!(characters.last_backup.is_none());
+    }
+
+    /// [M1] The Install press re-checks the `.conf` path because the file
+    /// can have been moved since the last redraw — but the redraw's answer
+    /// is cached per text, so the press has to drop it or it looks at
+    /// nothing and raises the polkit prompt for a file root cannot read.
+    #[test]
+    fn the_install_press_re_stats_the_conf_file_instead_of_trusting_the_redraw() {
+        let dir = std::env::temp_dir().join(format!("yutani-install-press-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("wg0.conf");
+        std::fs::write(&conf, "[Interface]\n").unwrap();
+        let mut app = app(Config::default());
+        app.settings = Some(settings::State::new(SurfaceId::unique(), &app.config));
+        app.settings.as_mut().unwrap().tunnel.conf_path = conf.display().to_string();
+        // The redraw: enabled, and the answer cached for that text.
+        assert_eq!(tunnel_page::install_blocker(&app.settings.as_ref().unwrap().tunnel), None);
+        std::fs::remove_file(&conf).unwrap();
+        let _ = app.update(Msg::Settings(settings::Msg::InstallTunnel));
+        let state = app.settings.as_ref().unwrap();
+        assert_eq!(state.note.as_deref(), Some(tunnel_page::NOT_A_FILE), "the press must see the file is gone");
+        assert!(!state.tunnel.busy && app.tunnel_in_flight.is_none(), "no action started");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// [I3] The watcher's answer to a `config.ron` that does not parse:
