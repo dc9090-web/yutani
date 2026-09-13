@@ -1,0 +1,13 @@
+---
+- name: Install the binaries (root-owned — the tunnel unit refuses anything else)
+  become: true
+  ansible.builtin.copy:
+    src: "{{ yutani_src_dir }}/target/release/{{ item }}"
+    dest: "{{ yutani_prefix }}/{{ item }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - yutani
+    - yutani-applet

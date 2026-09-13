@@ -1,0 +1,26 @@
+---
+# The desktop user Yutani runs as (required).
+yutani_user: ""
+yutani_repo: "https://github.com/dc9090-web/yutani.git"
+yutani_version: "master"
+yutani_src_dir: "/home/{{ yutani_user }}/.local/src/yutani"
+yutani_prefix: "/usr/local/bin"
+yutani_manage_packages: true
+yutani_install_shortcuts: true
+yutani_install_service: true
+yutani_enable_service_at_login: false
+# Local (controller-side) path to a wg-quick WireGuard .conf; empty = no tunnel.
+yutani_wg_conf: ""
+# Empty lists = the daemon's built-in defaults (1.1.1.1, 9.9.9.9 / eveonline.com …).
+yutani_dns_servers: []
+yutani_dns_domains: []
+yutani_packages:
+  pacman:
+    - nftables
+    - wireguard-tools
+    - curl
+    - polkit
+    - gtk-update-icon-cache
+    - rustup
+    - git
+    - base-devel

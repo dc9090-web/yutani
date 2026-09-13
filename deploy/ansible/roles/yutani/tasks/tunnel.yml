@@ -1,0 +1,32 @@
+---
+- name: Install the EVE-only tunnel
+  block:
+    - name: Copy the WireGuard configuration (root-only, temporary)
+      become: true
+      ansible.builtin.copy:
+        src: "{{ yutani_wg_conf }}"
+        dest: /root/yutani-wg.conf
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Write the tunnel unit, conf and polkit rule
+      become: true
+      ansible.builtin.command:
+        argv: >-
+          {{ [yutani_prefix ~ '/yutani', 'tunnel', 'install-root',
+              '--conf', '/root/yutani-wg.conf',
+              '--uid', yutani_uid | string,
+              '--user', yutani_user,
+              '--exe', yutani_prefix ~ '/yutani']
+             + (['--dns-servers', yutani_dns_servers | join(',')] if yutani_dns_servers | length > 0 else [])
+             + (['--dns-domains', yutani_dns_domains | join(',')] if yutani_dns_domains | length > 0 else []) }}
+      register: yutani_tunnel
+      changed_when: true
+  always:
+    - name: Remove the temporary configuration
+      become: true
+      ansible.builtin.file:
+        path: /root/yutani-wg.conf
+        state: absent

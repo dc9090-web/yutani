@@ -1,0 +1,5 @@
+---
+- name: Deploy Yutani
+  hosts: yutani_hosts
+  roles:
+    - yutani

@@ -1,0 +1,31 @@
+---
+- name: Require a user
+  ansible.builtin.assert:
+    that: yutani_user | length > 0
+    fail_msg: "set yutani_user to the desktop user"
+
+- name: Look the user up
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ yutani_user }}"
+
+- name: Remember the uid
+  ansible.builtin.set_fact:
+    yutani_uid: "{{ ansible_facts.getent_passwd[yutani_user][1] }}"
+
+- name: Packages and the Rust toolchain
+  ansible.builtin.import_tasks: packages.yml
+  when: yutani_manage_packages | bool
+
+- name: Source and release build
+  ansible.builtin.import_tasks: build.yml
+
+- name: Binaries into the prefix
+  ansible.builtin.import_tasks: install.yml
+
+- name: Applet, service and shortcuts
+  ansible.builtin.import_tasks: user.yml
+
+- name: EVE-only WireGuard tunnel
+  ansible.builtin.import_tasks: tunnel.yml
+  when: yutani_wg_conf | length > 0

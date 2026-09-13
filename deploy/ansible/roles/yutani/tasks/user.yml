@@ -1,0 +1,47 @@
+---
+# Every step here runs as the desktop user and talks to their running session:
+# `yutani service install` reloads the user manager, and the applet and
+# shortcut writers look at the user's XDG directories.
+- name: Applet, icons and the Applications launcher
+  become: true
+  become_user: "{{ yutani_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ yutani_uid }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ yutani_uid }}/bus"
+  ansible.builtin.command: "{{ yutani_prefix }}/yutani applet install"
+  register: yutani_applet
+  changed_when: false
+
+- name: Systemd user unit (restart on crash)
+  become: true
+  become_user: "{{ yutani_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ yutani_uid }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ yutani_uid }}/bus"
+  ansible.builtin.command: "{{ yutani_prefix }}/yutani service install"
+  when: yutani_install_service | bool
+  register: yutani_service
+  changed_when: false
+
+- name: Start Yutani at login
+  become: true
+  become_user: "{{ yutani_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ yutani_uid }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ yutani_uid }}/bus"
+  ansible.builtin.systemd:
+    scope: user
+    name: yutani.service
+    enabled: true
+  when: yutani_install_service | bool and yutani_enable_service_at_login | bool
+
+- name: COSMIC keyboard shortcuts
+  become: true
+  become_user: "{{ yutani_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ yutani_uid }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ yutani_uid }}/bus"
+  ansible.builtin.command: "{{ yutani_prefix }}/yutani shortcuts install"
+  when: yutani_install_shortcuts | bool
+  register: yutani_shortcuts
+  changed_when: false

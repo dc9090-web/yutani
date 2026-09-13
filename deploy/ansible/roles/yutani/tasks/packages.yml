@@ -1,0 +1,27 @@
+---
+- name: Only pacman is mapped so far
+  ansible.builtin.assert:
+    that: ansible_facts.pkg_mgr in yutani_packages
+    fail_msg: "no package list for {{ ansible_facts.pkg_mgr }}; add one to yutani_packages or set yutani_manage_packages: false"
+
+- name: Install build and runtime packages
+  become: true
+  ansible.builtin.package:
+    name: "{{ yutani_packages[ansible_facts.pkg_mgr] }}"
+    state: present
+
+- name: Check for a Rust toolchain
+  become: true
+  become_user: "{{ yutani_user }}"
+  ansible.builtin.command: rustup show active-toolchain
+  register: yutani_toolchain
+  changed_when: false
+  failed_when: false
+
+- name: Select stable Rust
+  become: true
+  become_user: "{{ yutani_user }}"
+  ansible.builtin.command: rustup default stable
+  when: yutani_toolchain.rc != 0
+  register: yutani_rustup_default
+  changed_when: yutani_rustup_default.rc == 0

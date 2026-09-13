@@ -1,0 +1,24 @@
+---
+- name: Clone or update the source
+  become: true
+  become_user: "{{ yutani_user }}"
+  ansible.builtin.git:
+    repo: "{{ yutani_repo }}"
+    dest: "{{ yutani_src_dir }}"
+    version: "{{ yutani_version }}"
+  register: yutani_git
+
+- name: Build the release binaries
+  become: true
+  become_user: "{{ yutani_user }}"
+  ansible.builtin.command:
+    cmd: cargo build --release --locked
+    chdir: "{{ yutani_src_dir }}"
+  environment:
+    PATH: "/home/{{ yutani_user }}/.cargo/bin:{{ ansible_facts.env.PATH }}"
+  register: yutani_build
+  changed_when: "'Compiling' in yutani_build.stderr"
+  # `command` skips itself in check mode, but its `chdir` is validated first
+  # and a check run has no checkout to change into; skip the whole task so a
+  # dry run reports instead of failing.
+  when: not ansible_check_mode
