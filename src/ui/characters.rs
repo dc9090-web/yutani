@@ -7,7 +7,8 @@
 //! (`settings_copy_characters`), which is the only place that knows
 //! whether an EVE client is running.
 
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use cosmic::Element;
@@ -23,6 +24,11 @@ use super::settings::Msg;
 pub const RUNNING_CLIENT: &str = "Close every EVE client first: the client rewrites these files when it logs out.";
 pub const ONE_CHARACTER: &str = "Only one character has settings here; there is nothing to copy to.";
 pub const NO_PROFILE: &str = "No EVE profile directory was found.";
+pub const NO_SELECTION: &str = "Pick a character to copy from.";
+pub const NO_ACCOUNT_SELECTION: &str = "Pick an account to copy from.";
+/// ESI answered, but not about every id we asked for; the caption has to
+/// explain the bare numbers left in the dropdown.
+pub const SOME_UNNAMED: &str = "some characters could not be named";
 
 #[derive(Debug, Default)]
 pub struct State {
@@ -37,6 +43,9 @@ pub struct State {
     pub names_error: Option<String>,
     /// A names fetch is in flight.
     pub fetching: bool,
+    /// Ids already sent to ESI. An id ESI has no name for stays here so
+    /// that every refresh does not ask for it again.
+    pub asked: BTreeSet<u64>,
     /// Dropdown indices into `listing.characters` / `listing.accounts`.
     pub source_character: usize,
     pub source_account: usize,
@@ -83,12 +92,38 @@ impl State {
         self.selected_account()
     }
 
-    /// Character ids with no name yet — what a names fetch asks ESI for.
+    /// Character ids with no name yet and not already asked about — what a
+    /// names fetch asks ESI for.
     pub fn unnamed(&self) -> Vec<u64> {
         self.listing
             .as_ref()
-            .map(|l| l.characters.iter().map(|e| e.id).filter(|id| !self.names.contains_key(id)).collect())
+            .map(|l| {
+                l.characters
+                    .iter()
+                    .map(|e| e.id)
+                    .filter(|id| !self.names.contains_key(id) && !self.asked.contains(id))
+                    .collect()
+            })
             .unwrap_or_default()
+    }
+
+    /// Remember the ids a fetch was started for, so a reply that leaves
+    /// some of them nameless does not start the same fetch again.
+    pub fn asking(&mut self, ids: &[u64]) {
+        self.asked.extend(ids.iter().copied());
+        self.fetching = true;
+    }
+
+    /// A names reply landed. When ESI reported no error but some id we
+    /// asked about is still nameless, say so: the dropdown shows numbers
+    /// and the caption is the only place that can explain them.
+    pub fn names_arrived(&mut self, names: Names, error: Option<String>) {
+        self.names.extend(names);
+        self.fetching = false;
+        let unanswered = self.listing.as_ref().is_some_and(|l| {
+            l.characters.iter().any(|e| self.asked.contains(&e.id) && !self.names.contains_key(&e.id))
+        });
+        self.names_error = error.or_else(|| unanswered.then(|| SOME_UNNAMED.to_string()));
     }
 
     /// The selected character's label for the note line (name, else id).
@@ -115,6 +150,12 @@ pub fn copy_blocker(state: &State, clients_running: bool) -> Option<&'static str
     if listing.characters.len() < 2 {
         return Some(ONE_CHARACTER);
     }
+    // A dropdown index past the end of the listing (libcosmic publishes one
+    // on ctrl+scroll, and a refresh can shrink the list under a queued
+    // message): without this the copy would be a silent no-op.
+    if state.selected_character().is_none() {
+        return Some(NO_SELECTION);
+    }
     if clients_running {
         return Some(RUNNING_CLIENT);
     }
@@ -129,6 +170,18 @@ pub fn copy_note(source: &str, report: &Report) -> String {
     }
     note.push_str(&format!("; backup in {}", report.backup.display()));
     note
+}
+
+/// The note for a failed `copy::execute`. The refusal to reuse a backup
+/// directory (two presses inside one second) and a failure to make that
+/// directory both happen before any file is touched, so the "already
+/// replaced" half of the usual note would be a lie.
+pub fn copy_failure_note(error: &std::io::Error, backup: &Path) -> String {
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        format!("copy not started: {error} — wait a second and press again")
+    } else {
+        format!("copy failed: {error}; the files already replaced are in {}", backup.display())
+    }
 }
 
 pub fn view(state: &State, clients_running: bool) -> Element<'_, Msg> {
@@ -268,6 +321,27 @@ mod tests {
         assert_eq!(copy_blocker(&s, false), Some(NO_PROFILE));
     }
 
+    /// An index past the end of the listing used to pass the blocker and
+    /// then fall out of the copy with no note at all.
+    #[test]
+    fn a_stale_dropdown_index_blocks_the_copy_instead_of_doing_nothing() {
+        let mut s = state_with(&[1, 2], &[10]);
+        s.source_character = 5;
+        assert_eq!(s.selected_character(), None);
+        assert_eq!(copy_blocker(&s, false), Some(NO_SELECTION));
+    }
+
+    /// Index 0 into an empty listing is still nothing: no panic, no
+    /// selection, and the copy is blocked by the character count.
+    #[test]
+    fn an_empty_listing_selects_nothing() {
+        let s = state_with(&[], &[]);
+        assert_eq!(s.selected_character(), None);
+        assert_eq!(s.selected_account(), None);
+        assert_eq!(s.unnamed(), Vec::<u64>::new());
+        assert_eq!(copy_blocker(&s, false), Some(ONE_CHARACTER));
+    }
+
     #[test]
     fn the_account_copy_is_off_until_asked_and_needs_a_second_account() {
         let mut s = state_with(&[1, 2], &[10]);
@@ -277,6 +351,10 @@ mod tests {
         let mut s = state_with(&[1, 2], &[10, 20]);
         s.copy_account = true;
         assert_eq!(s.account_to_copy(), Some(10));
+        // The guard behind the clamp: an index past the end names no
+        // account, and the copy asks for one rather than skipping it.
+        s.source_account = 7;
+        assert_eq!(s.account_to_copy(), None, "out of range: no account");
     }
 
     #[test]
@@ -285,6 +363,25 @@ mod tests {
         assert_eq!(copy_note("KestrelVance", &report), "copied KestrelVance to 6 characters and 2 accounts; backup in /b/20260913T024100Z");
         let report = Report { characters: 1, accounts: 0, backup: PathBuf::from("/b/x") };
         assert_eq!(copy_note("KestrelVance", &report), "copied KestrelVance to 1 character; backup in /b/x");
+        let report = Report { characters: 3, accounts: 1, backup: PathBuf::from("/b/x") };
+        assert_eq!(copy_note("KestrelVance", &report), "copied KestrelVance to 3 characters and 1 account; backup in /b/x");
+    }
+
+    /// The refusal to reuse a backup directory happens before any file is
+    /// touched, so the note must not claim files were replaced.
+    #[test]
+    fn a_refused_copy_does_not_claim_files_were_replaced() {
+        let backup = PathBuf::from("/b/20260913T024100Z");
+        let refused = std::io::Error::new(std::io::ErrorKind::AlreadyExists, "backup /b/20260913T024100Z exists");
+        assert_eq!(
+            copy_failure_note(&refused, &backup),
+            "copy not started: backup /b/20260913T024100Z exists — wait a second and press again"
+        );
+        let broke = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "read-only");
+        assert_eq!(
+            copy_failure_note(&broke, &backup),
+            "copy failed: read-only; the files already replaced are in /b/20260913T024100Z"
+        );
     }
 
     #[test]
@@ -292,5 +389,14 @@ mod tests {
         let mut s = state_with(&[1, 2, 3], &[]);
         s.names.insert(2, "Two".to_string());
         assert_eq!(s.unnamed(), vec![1, 3]);
+        // ESI had no name for 1: asking again every refresh would be a
+        // request per redraw, forever.
+        s.asking(&[1, 3]);
+        assert_eq!(s.unnamed(), Vec::<u64>::new());
+        s.names_arrived(Names::from([(3, "Three".to_string())]), None);
+        assert_eq!(s.names_error.as_deref(), Some(SOME_UNNAMED), "1 came back nameless");
+        assert!(!s.fetching);
+        s.names_arrived(Names::from([(1, "One".to_string())]), None);
+        assert_eq!(s.names_error, None, "every asked id has a name now");
     }
 }

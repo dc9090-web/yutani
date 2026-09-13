@@ -740,7 +740,7 @@ mod tests {
     /// page missing from it has no tab, and a tab with no page cannot be
     /// rendered.
     #[test]
-    fn every_page_has_a_tab_and_steam_comes_after_layouts() {
+    fn every_page_has_a_tab_in_the_documented_order() {
         assert_eq!(labels(&PAGES), vec!["Display", "Behavior", "Layouts", "Characters", "Steam"]);
         for page in [Page::Display, Page::Behavior, Page::Layouts, Page::Characters, Page::Steam] {
             assert!(index_of(&PAGES, &page).is_some(), "{page:?}");
@@ -756,6 +756,15 @@ mod tests {
     fn copying_the_steam_arguments_is_not_a_config_field_and_keeps_its_note() {
         let mut c = Config::default();
         assert_eq!(apply_config_field(&mut c, &Msg::CopySteamArgs), Ok(false));
+        // The Characters page works on EVE's files, not on `config.ron`:
+        // none of its messages may report a config change either.
+        assert_eq!(apply_config_field(&mut c, &Msg::SourceCharacter(1)), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::SourceAccount(1)), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::CopyAccount(true)), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::CopyCharacters), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::RestoreBackup), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::RefreshCharacters), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::Names(Names::new(), None)), Ok(false));
         assert_eq!(c, Config::default());
         assert!(!clears_note(&Msg::CopySteamArgs));
         assert!(!is_live_only(&Msg::CopySteamArgs));

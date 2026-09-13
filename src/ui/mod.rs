@@ -1172,12 +1172,19 @@ impl App {
                     state.name_field = text.clone();
                     return Task::none();
                 }
+                // Clamped to the listing the window is showing: libcosmic
+                // publishes an index past the end on ctrl+scroll, and a
+                // refresh can shrink the list under a queued message.
                 S::SourceCharacter(i) => {
-                    state.characters.source_character = *i;
+                    if state.characters.listing.as_ref().is_some_and(|l| *i < l.characters.len()) {
+                        state.characters.source_character = *i;
+                    }
                     return Task::none();
                 }
                 S::SourceAccount(i) => {
-                    state.characters.source_account = *i;
+                    if state.characters.listing.as_ref().is_some_and(|l| *i < l.accounts.len()) {
+                        state.characters.source_account = *i;
+                    }
                     return Task::none();
                 }
                 S::CopyAccount(on) => {
@@ -1185,9 +1192,7 @@ impl App {
                     return Task::none();
                 }
                 S::Names(names, error) => {
-                    state.characters.names.extend(names.clone());
-                    state.characters.names_error = error.clone();
-                    state.characters.fetching = false;
+                    state.characters.names_arrived(names.clone(), error.clone());
                     return Task::none();
                 }
                 _ => {}
@@ -1368,6 +1373,11 @@ impl App {
     /// Characters page: re-read the profile listing, the newest backup and
     /// the name cache, then ask ESI for any id still unnamed (blocking pool).
     fn refresh_characters(&mut self) -> Task<cosmic::Action<Msg>> {
+        // No window, nothing to refresh: the listing walk and the cache
+        // read would be thrown away.
+        if self.settings.is_none() {
+            return Task::none();
+        }
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let override_dir = self.config.eve_settings_dir.clone();
         let listing = yutani::eve_settings::discover(override_dir.as_deref().map(Path::new), &home)
@@ -1385,7 +1395,7 @@ impl App {
         if missing.is_empty() || state.characters.fetching {
             return Task::none();
         }
-        state.characters.fetching = true;
+        state.characters.asking(&missing);
         cosmic::iced::Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || yutani::eve_settings::names::resolve(missing, cache))
@@ -1406,8 +1416,16 @@ impl App {
             return self.settings_note(reason.to_string());
         }
         let Some(listing) = state.characters.listing.as_ref() else { return };
-        let Some(character) = state.characters.selected_character() else { return };
+        let Some(character) = state.characters.selected_character() else {
+            return self.settings_note(characters::NO_SELECTION.to_string());
+        };
         let account = state.characters.account_to_copy();
+        // Asked for an account copy, there is one to copy to, and yet no
+        // account is named: copying without it would silently do half the
+        // job the toggle promised.
+        if state.characters.copy_account && account.is_none() && listing.accounts.len() >= 2 {
+            return self.settings_note(characters::NO_ACCOUNT_SELECTION.to_string());
+        }
         let source = state.characters.source_label();
         let backups = yutani::eve_settings::copy::backups_dir(&dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")));
         let backup = backups.join(yutani::eve_settings::copy::backup_name(SystemTime::now()));
@@ -1415,7 +1433,7 @@ impl App {
             Err(e) => e,
             Ok(plan) => match yutani::eve_settings::copy::execute(&plan, &backup) {
                 Ok(report) => characters::copy_note(&source, &report),
-                Err(e) => format!("copy failed: {e}; the files already replaced are in {}", backup.display()),
+                Err(e) => characters::copy_failure_note(&e, &backup),
             },
         };
         self.settings_note(note);
