@@ -311,6 +311,11 @@ impl cosmic::Application for Applet {
                 self.rates = Rates::default();
                 self.pending = None;
                 self.quitting = None;
+                // The rows a wait sits under are gone with the daemon; its
+                // reply still comes, and finds nothing to clear.
+                if self.note.as_ref().is_some_and(|n| n.progress) {
+                    self.note = None;
+                }
                 after_reply
             }
             Msg::Status(Err(IpcError::Failed(msg))) => {
@@ -703,5 +708,18 @@ mod tests {
         let _ = applet.update(Msg::Status(Err(IpcError::Failed("timeout after 3000ms".into()))));
         let note = applet.note.as_ref().expect("a poll error with nothing in flight is shown");
         assert!(!note.progress && note.action.is_none(), "{}", note.text);
+    }
+
+    /// Quit pressed while a connect is still running: the daemon goes, the
+    /// polls go Offline and the menu collapses to "Start Yutani" — which
+    /// must not keep "connecting…" at its foot with no row to belong to.
+    #[test]
+    fn going_offline_clears_a_progress_note() {
+        let mut applet = applet();
+        let _ = applet.update(Msg::Status(Ok(connected())));
+        let _ = applet.update(Msg::Press(Action::Connect));
+        assert!(applet.note.as_ref().is_some_and(|n| n.progress));
+        let _ = applet.update(Msg::Status(Err(IpcError::Offline)));
+        assert!(applet.note.is_none(), "no row owns the wait once the daemon is gone");
     }
 }
