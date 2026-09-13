@@ -128,9 +128,16 @@ Vertical order and copy exactly as the handoff; data sources:
      exists, then `settings` over IPC.
    - Thumbnails row (addition to the handoff, needed to replace the old
      tray): `Hide thumbnails` / `Show thumbnails` → `hide`/`show`.
-5. **Quit** (`#FF8A7E`, hover `#FF6B5C1F`) → IPC `quit`; the applet stays
-   in the panel and switches to the daemon-offline state, whose menu has a
-   single `Start Yutani` item (spawns `yutani` detached).
+5. **Quit** (`#FF8A7E`, hover `#FF6B5C1F`) → IPC `quit`: the daemon
+   disconnects the tunnel if it is up, then exits; the applet stays in the
+   panel and switches to the daemon-offline state, whose menu has a single
+   `Start Yutani` item (spawns `yutani` detached). Quit means "shut
+   everything down" — leaving the tunnel up with nothing left to manage it
+   would be a surprise, so the daemon runs `systemctl stop` first. It
+   answers `ok` before doing so (the stop can take the unit's 10 s
+   TimeoutStopSec and nothing may block on it), and the applet degrades its
+   shown tunnel state to disconnected the moment the press succeeds rather
+   than claiming a live link for those 10 s.
 
 Typography — **decided**: the handoff asks for Space Grotesk and JetBrains
 Mono and allows substituting the codebase's own fonts; we substitute, and

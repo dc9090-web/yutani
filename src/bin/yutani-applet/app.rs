@@ -248,6 +248,21 @@ impl cosmic::Application for Applet {
                     Msg::Done(action, result)
                 })
             }
+            // The daemon acknowledges `quit` immediately but may spend up
+            // to ~10 s stopping the tunnel before it goes away, so `status`
+            // keeps answering — and keeps saying "Connected" — the whole
+            // time. The tunnel is on its way down, so say so now rather
+            // than showing a live link that no longer has an owner; the
+            // polls that follow report whatever is actually true, and end
+            // in the offline state once the socket is gone.
+            Msg::Done(Action::Quit, Ok(())) => {
+                if let Some(status) = self.status.as_mut() {
+                    degrade(status);
+                }
+                self.sampler.reset();
+                self.rates = Rates::default();
+                self.poll()
+            }
             Msg::Done(_, Ok(())) => self.poll(),
             Msg::Done(action, Err(msg)) => {
                 if matches!(action, Action::Connect | Action::Disconnect) {

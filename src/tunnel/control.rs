@@ -36,6 +36,25 @@ pub fn disconnect() -> anyhow::Result<()> {
     systemctl("stop")
 }
 
+/// What `quit` has to do before the daemon may exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuitPlan {
+    /// The tunnel is up: stop the unit first, then exit. Leaving it running
+    /// would strand EVE's traffic in a tunnel with nothing left to manage
+    /// it — and the next launch would find a link it never brought up.
+    DisconnectThenExit,
+    /// Nothing to wind down.
+    ExitNow,
+}
+
+/// Pure decision for IPC `quit`. Only a tunnel that is both installed and
+/// connected is worth a `systemctl stop`: an uninstalled unit has nothing
+/// to stop, and a disconnected one is already where we want it — and each
+/// avoided call is ~10 s the daemon does not linger for.
+pub fn quit_plan(installed: bool, connected: bool) -> QuitPlan {
+    if installed && connected { QuitPlan::DisconnectThenExit } else { QuitPlan::ExitNow }
+}
+
 pub fn read_tunnel_file() -> Option<TunnelFile> {
     serde_json::from_slice(&std::fs::read(STATUS_PATH).ok()?).ok()
 }
@@ -111,6 +130,16 @@ mod tests {
         assert!(failed_from(zero.as_ref()), "exit 0 is the failed state");
         assert!(!failed_from(nonzero.as_ref()), "any non-zero exit is not");
         assert!(!failed_from(None), "a timeout is not evidence of failure");
+    }
+
+    #[test]
+    fn quit_stops_the_tunnel_only_when_there_is_a_live_one_to_stop() {
+        assert_eq!(quit_plan(true, true), QuitPlan::DisconnectThenExit);
+        assert_eq!(quit_plan(true, false), QuitPlan::ExitNow);
+        assert_eq!(quit_plan(false, false), QuitPlan::ExitNow);
+        // Nonsense in practice, but "not installed" wins: there is no unit
+        // to hand `systemctl stop`, so waiting on one would just fail slowly.
+        assert_eq!(quit_plan(false, true), QuitPlan::ExitNow);
     }
 
     /// Read-only and unprivileged, so the real command may run here. With

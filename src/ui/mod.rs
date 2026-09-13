@@ -139,6 +139,11 @@ pub enum Msg {
     /// thread (see [`Reply::Later`]). Carries the request's one-shot reply
     /// handle, so the answer still reaches exactly the client that asked.
     IpcReplyLater(ipc::Responder, Result<Option<String>, String>),
+    /// A `quit` that had a live tunnel to wind down first: the
+    /// `systemctl stop` has finished (or failed), and the daemon may now
+    /// drop its socket and exit. The client that asked was answered `ok`
+    /// the moment the request arrived — it is not waiting on this.
+    QuitAfterTunnel(Result<(), String>),
     Adopt(adopt::AdoptEvent),
     Settings(settings::Msg),
 }
@@ -415,9 +420,32 @@ impl App {
                 Err(e) => (Reply::Now(Err(format!("layouts: {e}"))), Task::none()),
             },
             Request::Settings => (Reply::Now(Ok(None)), self.open_settings()),
+            // Quitting takes the tunnel with it (applet spec §4.5). The
+            // client is answered `ok` straight away either way: a
+            // `systemctl stop` can take the unit's whole TimeoutStopSec
+            // (10 s), and neither the caller nor the thumbnails may hang on
+            // it, so the stop runs on the blocking pool and the exit itself
+            // waits for `Msg::QuitAfterTunnel`.
             Request::Quit => {
-                ipc::remove_socket();
-                (Reply::Now(Ok(None)), cosmic::iced::exit())
+                let tunnel = crate::tunnel::control::current_tunnel_status(&self.config.tunnel.location);
+                match crate::tunnel::control::quit_plan(tunnel.installed, tunnel.connected) {
+                    crate::tunnel::control::QuitPlan::ExitNow => {
+                        ipc::remove_socket();
+                        (Reply::Now(Ok(None)), cosmic::iced::exit())
+                    }
+                    crate::tunnel::control::QuitPlan::DisconnectThenExit => {
+                        let task = cosmic::iced::Task::perform(
+                            async move {
+                                tokio::task::spawn_blocking(crate::tunnel::control::disconnect)
+                                    .await
+                                    .map_err(|e| format!("tunnel task failed: {e}"))
+                                    .and_then(|r| r.map_err(|e| format!("{e:#}")))
+                            },
+                            |result| cosmic::Action::App(Msg::QuitAfterTunnel(result)),
+                        );
+                        (Reply::Now(Ok(None)), task)
+                    }
+                }
             }
             Request::Status => {
                 let order = self.focus_order();
@@ -1409,6 +1437,18 @@ impl Application for App {
             Msg::IpcReplyLater(reply, result) => {
                 reply.respond(response_of(result));
                 Task::none()
+            }
+            // A failed stop is logged, not fatal: the user asked to quit,
+            // and refusing to would leave them with a daemon they cannot
+            // close. `yutani tunnel disconnect` still works afterwards.
+            Msg::QuitAfterTunnel(result) => {
+                if let Err(err) = result {
+                    tracing::warn!("stopping the tunnel before quitting failed: {err}");
+                } else {
+                    tracing::info!("tunnel stopped; quitting");
+                }
+                ipc::remove_socket();
+                cosmic::iced::exit()
             }
             Msg::Adopt(ev) => {
                 match ev.result {

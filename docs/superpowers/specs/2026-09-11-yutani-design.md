@@ -360,7 +360,9 @@ Newline-delimited text; one command per connection.
 
 Commands: `focus <n>`, `next`, `prev`, `show`, `hide`, `toggle` (show if hidden,
 hide if shown),
-`layout <name>`, `settings`, `quit`.
+`layout <name>`, `settings`, `quit` (stops the tunnel first if it is up,
+then removes the socket and exits — the reply is `ok` immediately, not when
+the stop finishes).
 Reply: `ok\n` or `err <message>\n`. The CLI prints the error and exits 1;
 if the socket is absent it prints "yutani is not running" and exits 1.
 
