@@ -20,6 +20,8 @@ use cosmic::iced::window::Id as SurfaceId;
 use cosmic::iced::{self, Length, Point, Subscription};
 use cosmic::{Application, Element, Task, widget};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::adopt;
 use crate::backend::{self, CaptureImage, ClientInfo, Cmd, Event, Handle};
@@ -27,6 +29,7 @@ use crate::model::client::Login;
 use crate::model::config::{Config, Mode};
 use crate::model::layout::{self, Layout, Rect, ThumbPos};
 
+pub mod characters;
 pub mod config_watch;
 pub mod dock;
 pub mod ipc;
@@ -1134,11 +1137,17 @@ impl App {
                 if let Some(state) = self.settings.as_mut() {
                     state.refresh();
                 }
+                // …and EVE's files with it: the Characters page is as stale
+                // as the rest after the window has been sitting open.
+                let characters = self.refresh_characters();
                 // Un-minimize first, then activate: a window the compositor
                 // minimised stays minimised if it is only activated. The
                 // same chain libcosmic's own `Action::Activate` does.
-                return cosmic::iced::window::minimize(window, false)
-                    .chain(activation::activate(window, token.clone()));
+                return Task::batch([
+                    characters,
+                    cosmic::iced::window::minimize(window, false)
+                        .chain(activation::activate(window, token.clone())),
+                ]);
             }
             _ => {}
         }
@@ -1151,7 +1160,9 @@ impl App {
                         state.note = None;
                     }
                     state.refresh();
-                    return Task::none();
+                    // EVE's files are outside `State::refresh` (they are not
+                    // ours, and the names lookup is a task).
+                    return self.refresh_characters();
                 }
                 S::ActiveBorder(text) => state.active_border_field = text.clone(),
                 S::InactiveBorder(text) => state.inactive_border_field = text.clone(),
@@ -1159,6 +1170,29 @@ impl App {
                 S::PrevKey(text) => state.prev_field = text.clone(),
                 S::Name(text) => {
                     state.name_field = text.clone();
+                    return Task::none();
+                }
+                // Clamped to the listing the window is showing: libcosmic
+                // publishes an index past the end on ctrl+scroll, and a
+                // refresh can shrink the list under a queued message.
+                S::SourceCharacter(i) => {
+                    if state.characters.listing.as_ref().is_some_and(|l| *i < l.characters.len()) {
+                        state.characters.source_character = *i;
+                    }
+                    return Task::none();
+                }
+                S::SourceAccount(i) => {
+                    if state.characters.listing.as_ref().is_some_and(|l| *i < l.accounts.len()) {
+                        state.characters.source_account = *i;
+                    }
+                    return Task::none();
+                }
+                S::CopyAccount(on) => {
+                    state.characters.copy_account = *on;
+                    return Task::none();
+                }
+                S::Names(names, error) => {
+                    state.characters.names_arrived(names.clone(), error.clone());
                     return Task::none();
                 }
                 _ => {}
@@ -1204,6 +1238,17 @@ impl App {
             S::CopySteamArgs => {
                 self.settings_note("copied".to_string());
                 return cosmic::iced::clipboard::write(yutani::STEAM_LAUNCH_ARGS.to_string());
+            }
+            S::RefreshCharacters => return self.refresh_characters(),
+            // Both set the note themselves, then the listing (and the
+            // newest backup) are re-read: the files on disk just changed.
+            S::CopyCharacters => {
+                self.settings_copy_characters();
+                return self.refresh_characters();
+            }
+            S::RestoreBackup => {
+                self.settings_restore_backup();
+                return self.refresh_characters();
             }
             _ => {}
         }
@@ -1321,6 +1366,113 @@ impl App {
                 Ok(n) => format!("removed {n} shortcuts"),
                 Err(e) => format!("{e:#}"),
             }
+        };
+        self.settings_note(note);
+    }
+
+    /// Characters page: re-read the profile listing, the newest backup and
+    /// the name cache, then ask ESI for any id still unnamed (blocking pool).
+    fn refresh_characters(&mut self) -> Task<cosmic::Action<Msg>> {
+        // No window, nothing to refresh: the listing walk and the cache
+        // read would be thrown away.
+        if self.settings.is_none() {
+            return Task::none();
+        }
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let override_dir = self.config.eve_settings_dir.clone();
+        let listing = yutani::eve_settings::discover(override_dir.as_deref().map(Path::new), &home)
+            .and_then(|dir| yutani::eve_settings::list(&dir).map_err(|e| format!("cannot read {}: {e}", dir.display())));
+        let backups = yutani::eve_settings::copy::backups_dir(&dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")));
+        let cache = yutani::eve_settings::names::cache_path(&dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")));
+        let cached = yutani::eve_settings::names::load_cache(&cache);
+        let Some(state) = self.settings.as_mut() else { return Task::none() };
+        state.characters.set_listing(listing);
+        state.characters.last_backup = yutani::eve_settings::copy::latest_backup(&backups);
+        state.characters.names.extend(cached);
+        let missing = state.characters.unnamed();
+        // Nothing to ask for, or an answer is already on its way: asking
+        // twice would hit ESI twice for the same ids.
+        if missing.is_empty() || state.characters.fetching {
+            return Task::none();
+        }
+        state.characters.asking(&missing);
+        cosmic::iced::Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || yutani::eve_settings::names::resolve(missing, cache))
+                    .await
+                    .unwrap_or_else(|e| (Default::default(), Some(format!("names task failed: {e}"))))
+            },
+            |(names, error)| cosmic::Action::App(Msg::Settings(settings::Msg::Names(names, error))),
+        )
+    }
+
+    /// Characters page: the copy itself. Refused while any EVE toplevel
+    /// exists — the client writes these files on logout.
+    fn settings_copy_characters(&mut self) {
+        let Some(state) = self.settings.as_ref() else { return };
+        // Re-checked here and not only on the button: the listing behind
+        // the disabled state can be a redraw old.
+        if let Some(reason) = characters::copy_blocker(&state.characters, !self.clients.is_empty()) {
+            return self.settings_note(characters::blocker_note(reason));
+        }
+        let Some(listing) = state.characters.listing.as_ref() else { return };
+        let Some(character) = state.characters.selected_character() else {
+            return self.settings_note(characters::blocker_note(characters::NO_SELECTION));
+        };
+        let account = state.characters.account_to_copy();
+        // Asked for an account copy, there is one to copy to, and yet no
+        // account is named: copying without it would silently do half the
+        // job the toggle promised.
+        if state.characters.copy_account && account.is_none() && listing.accounts.len() >= 2 {
+            return self.settings_note(characters::blocker_note(characters::NO_ACCOUNT_SELECTION));
+        }
+        let source = state.characters.source_label();
+        let backups = yutani::eve_settings::copy::backups_dir(&dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")));
+        let backup = backups.join(yutani::eve_settings::copy::backup_name(SystemTime::now()));
+        let note = match yutani::eve_settings::copy::plan(listing, character, account) {
+            Err(e) => e,
+            Ok(plan) => match yutani::eve_settings::copy::execute(&plan, &backup) {
+                Ok(report) => characters::copy_note(&source, &report),
+                Err(e) => characters::copy_failure_note(&e, &backup),
+            },
+        };
+        self.settings_note(note);
+    }
+
+    /// Characters page: put the newest backup back over the profile —
+    /// after backing up the live files it is about to replace. Without
+    /// that, a restore is the one operation here with no way back: the
+    /// settings written since the backup would be gone unrecorded.
+    fn settings_restore_backup(&mut self) {
+        use yutani::eve_settings::copy;
+        let Some(state) = self.settings.as_ref() else { return };
+        if !self.clients.is_empty() {
+            return self.settings_note(characters::blocker_note(characters::RUNNING_CLIENT));
+        }
+        let (Some(backup), Some(listing)) = (state.characters.last_backup.clone(), state.characters.listing.as_ref())
+        else {
+            return self.settings_note("nothing to restore".to_string());
+        };
+        let dir = listing.dir.clone();
+        let backups = copy::backups_dir(&dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")));
+        let saved = backups.join(copy::backup_name(SystemTime::now()));
+        let note = match copy::restore_plan(&backup, &dir) {
+            Err(e) => format!("restore failed: {e}"),
+            // Nothing in the backup matches a file in the profile. Making
+            // an empty backup directory here would hide the real newest
+            // backup behind it, so do nothing at all.
+            Ok(targets) if targets.is_empty() => {
+                format!("nothing to restore: no file in {} is in {}", backup.display(), dir.display())
+            }
+            Ok(targets) => match copy::backup_files(&targets, &saved).and_then(|_| copy::restore(&backup, &dir)) {
+                Ok(n) => format!(
+                    "restored {n} file{} from {}; the files it replaced are in {}",
+                    if n == 1 { "" } else { "s" },
+                    backup.display(),
+                    saved.display()
+                ),
+                Err(e) => format!("restore failed: {e}"),
+            },
         };
         self.settings_note(note);
     }
@@ -1541,7 +1693,7 @@ impl Application for App {
     fn view_window(&self, id: SurfaceId) -> Element<'_, Msg> {
         if let Some(state) = self.settings.as_ref().filter(|s| s.window == id) {
             let focused = self.core.focused_window() == Some(id);
-            return settings::view(state, &self.config, focused);
+            return settings::view(state, &self.config, focused, !self.clients.is_empty());
         }
         let Some((_, client)) = self.clients.iter().find(|(_, c)| c.surface == Some(id)) else {
             return widget::text("").into();

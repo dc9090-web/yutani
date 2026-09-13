@@ -15,6 +15,8 @@ use cosmic::iced::window::Id as SurfaceId;
 use cosmic::widget;
 use cosmic::widget::segmented_button;
 
+use yutani::eve_settings::names::Names;
+
 use crate::model::config::{Config, Edge, Mode, Modifier, Visibility, config_path, parse_color, resolve_keysym};
 use crate::model::layout;
 
@@ -25,15 +27,17 @@ pub enum Page {
     Display,
     Behavior,
     Layouts,
+    Characters,
     Steam,
 }
 
 /// The tab strip, in order. `State::new` builds the segmented control from
 /// this, so the list *is* the window: a page missing here has no tab.
-pub const PAGES: [(&str, Page); 4] = [
+pub const PAGES: [(&str, Page); 5] = [
     ("Display", Page::Display),
     ("Behavior", Page::Behavior),
     ("Layouts", Page::Layouts),
+    ("Characters", Page::Characters),
     ("Steam", Page::Steam),
 ];
 
@@ -130,6 +134,9 @@ pub struct State {
     /// suspended until it does (spec §10), so every page says so and the
     /// Layouts page shows the reason.
     pub layout_error: Option<String>,
+    /// The Characters page's own state (`super::characters`): EVE's files,
+    /// not ours, so it is refreshed by `App::refresh_characters`.
+    pub characters: super::characters::State,
 }
 
 impl State {
@@ -151,6 +158,7 @@ impl State {
             prev_field: config.shortcuts.prev.clone(),
             note: None,
             layout_error: None,
+            characters: Default::default(),
         };
         state.refresh();
         state
@@ -219,6 +227,20 @@ pub enum Msg {
     UninstallShortcuts,
     /// Put [`yutani::STEAM_LAUNCH_ARGS`] on the clipboard.
     CopySteamArgs,
+    /// Characters page: dropdown index of the character to copy from.
+    SourceCharacter(usize),
+    /// Characters page: also copy the account-wide file.
+    CopyAccount(bool),
+    /// Characters page: dropdown index of the account to copy from.
+    SourceAccount(usize),
+    /// Characters page: do the copy (refused while a client is running).
+    CopyCharacters,
+    /// Characters page: put the newest backup back.
+    RestoreBackup,
+    /// Characters page: re-read the profile, the backups and the names.
+    RefreshCharacters,
+    /// A names lookup finished: what is known, and the error if any id is still unnamed.
+    Names(Names, Option<String>),
     /// The Save-as / Rename name field.
     Name(String),
     SaveAs,
@@ -325,7 +347,12 @@ pub fn apply_config_field(config: &mut Config, msg: &Msg) -> Result<bool, String
 
 /// The whole window: header bar, the page (or the broken-config notice),
 /// and the note line.
-pub fn view<'a>(state: &'a State, config: &'a Config, focused: bool) -> Element<'a, super::Msg> {
+pub fn view<'a>(
+    state: &'a State,
+    config: &'a Config,
+    focused: bool,
+    clients_running: bool,
+) -> Element<'a, super::Msg> {
     let page = state.pages.active_data::<Page>().copied().unwrap_or(Page::Display);
     let body: Element<'a, Msg> = match (page, &state.config_error) {
         // Layout files are not `config.ron`; this page works either way.
@@ -334,6 +361,9 @@ pub fn view<'a>(state: &'a State, config: &'a Config, focused: bool) -> Element<
         // string and a Copy button, and it is exactly the page someone
         // whose config is broken may still need.
         (Page::Steam, _) => steam_page(),
+        // Nor is EVE's profile directory `config.ron`: this page copies
+        // CCP's files and is just as usable while ours does not parse.
+        (Page::Characters, _) => super::characters::view(&state.characters, clients_running),
         (_, Some(error)) => broken_config(error),
         (Page::Display, None) => display_page(state, config),
         (Page::Behavior, None) => behavior_page(state, config),
@@ -361,7 +391,7 @@ pub fn view<'a>(state: &'a State, config: &'a Config, focused: bool) -> Element<
         .into(),
     });
     let note: Element<'a, Msg> = widget::column::with_children(notes).spacing(4).into();
-    // Three pages now, the longest of which does not fit 700 px.
+    // Five pages now, the longest of which does not fit 700 px.
     let scrolled: Element<'a, Msg> = widget::scrollable(body).height(Length::Fill).into();
     let tabs: Element<'a, Msg> =
         widget::segmented_control::horizontal(&state.pages).on_activate(Msg::Page).into();
@@ -612,6 +642,7 @@ mod tests {
             prev_field: String::new(),
             note: None,
             layout_error: None,
+            characters: Default::default(),
         }
     }
 
@@ -709,12 +740,13 @@ mod tests {
     /// page missing from it has no tab, and a tab with no page cannot be
     /// rendered.
     #[test]
-    fn every_page_has_a_tab_and_steam_comes_after_layouts() {
-        assert_eq!(labels(&PAGES), vec!["Display", "Behavior", "Layouts", "Steam"]);
-        for page in [Page::Display, Page::Behavior, Page::Layouts, Page::Steam] {
+    fn every_page_has_a_tab_in_the_documented_order() {
+        assert_eq!(labels(&PAGES), vec!["Display", "Behavior", "Layouts", "Characters", "Steam"]);
+        for page in [Page::Display, Page::Behavior, Page::Layouts, Page::Characters, Page::Steam] {
             assert!(index_of(&PAGES, &page).is_some(), "{page:?}");
         }
-        assert_eq!(index_of(&PAGES, &Page::Steam), Some(index_of(&PAGES, &Page::Layouts).unwrap() + 1));
+        assert_eq!(index_of(&PAGES, &Page::Characters), Some(index_of(&PAGES, &Page::Layouts).unwrap() + 1));
+        assert_eq!(index_of(&PAGES, &Page::Steam), Some(PAGES.len() - 1), "Steam stays last");
     }
 
     /// Copying writes the clipboard and leaves "copied" behind; it is not a
@@ -724,6 +756,15 @@ mod tests {
     fn copying_the_steam_arguments_is_not_a_config_field_and_keeps_its_note() {
         let mut c = Config::default();
         assert_eq!(apply_config_field(&mut c, &Msg::CopySteamArgs), Ok(false));
+        // The Characters page works on EVE's files, not on `config.ron`:
+        // none of its messages may report a config change either.
+        assert_eq!(apply_config_field(&mut c, &Msg::SourceCharacter(1)), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::SourceAccount(1)), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::CopyAccount(true)), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::CopyCharacters), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::RestoreBackup), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::RefreshCharacters), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::Names(Names::new(), None)), Ok(false));
         assert_eq!(c, Config::default());
         assert!(!clears_note(&Msg::CopySteamArgs));
         assert!(!is_live_only(&Msg::CopySteamArgs));

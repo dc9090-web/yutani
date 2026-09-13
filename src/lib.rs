@@ -6,6 +6,7 @@
 
 pub mod applet;
 pub mod assets;
+pub mod eve_settings;
 pub mod ipc;
 pub mod model;
 /// Bounded subprocess execution. In the lib because `tunnel::control` — a
