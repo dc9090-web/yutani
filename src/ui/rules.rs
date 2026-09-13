@@ -21,6 +21,27 @@ pub fn eve_focused(any_activated: bool, since_last_activation: Option<Duration>,
     any_activated || since_last_activation.is_some_and(|since| since < grace)
 }
 
+/// What the focus grace needs after a client update, given whether any
+/// client is activated now, whether one was before the update, and
+/// whether EVE still counts as focused (`eve_focused`): (stamp the last
+/// focus now?, schedule a grace timer?). Focus *leaving* EVE is the moment
+/// the grace starts — the last stamp dates from the last event that
+/// arrived while EVE was focused, which after a quiet stretch of play is
+/// minutes old — so that transition stamps and schedules; while focus is
+/// still away inside the grace only the timer is (re)scheduled, so the
+/// grace can never extend itself. Visibility is deliberately not an input:
+/// one timer per focus loss costs nothing, and a switch to
+/// `EveFocusedOnly` inside the grace needs that second look too.
+pub fn grace_after_update(any_activated: bool, was_activated: bool, within_grace: bool) -> (bool, bool) {
+    if any_activated {
+        return (true, false);
+    }
+    if was_activated {
+        return (true, true);
+    }
+    (false, within_grace)
+}
+
 /// Whether a client's thumbnail should be on screen right now.
 pub fn should_show(
     visibility: Visibility,
@@ -53,6 +74,16 @@ pub fn choose_position(
         return ((s.x, s.y), s.pinned);
     }
     (next, false)
+}
+
+/// The connector a dragged thumbnail's position is saved under: the output
+/// its surface was created on (`surface_output`, empty when it has none),
+/// else the one the layout resolves for the character. The two differ when
+/// the surface went up on a fallback output before its saved connector was
+/// plugged in; recording the resolved one would file DP-1 coordinates
+/// under DP-2.
+pub fn recorded_output(surface_output: &str, resolved: Option<String>) -> Option<String> {
+    if surface_output.is_empty() { resolved } else { Some(surface_output.to_string()) }
 }
 
 /// Which capture command (if any) brings the backend in line with `show`:
@@ -125,6 +156,36 @@ mod tests {
         assert!(eve_focused(false, Some(Duration::from_millis(100)), g), "inside the grace");
         assert!(!eve_focused(false, Some(g), g), "the grace is exclusive");
         assert!(!eve_focused(false, Some(Duration::from_secs(5)), g));
+    }
+
+    /// [I1]/[M1] Focus leaving EVE is what starts the grace: the stamp is
+    /// refreshed on that transition (the last one may be minutes old) and
+    /// the timer scheduled — whatever the visibility setting, so a switch
+    /// to `EveFocusedOnly` inside the grace still gets its second look.
+    #[test]
+    fn the_grace_starts_when_focus_leaves_eve() {
+        // Focused now: stamp, no timer.
+        assert_eq!(grace_after_update(true, true, true), (true, false));
+        assert_eq!(grace_after_update(true, false, false), (true, false));
+        // Focus just left: stamp now and arrange the second look.
+        assert_eq!(grace_after_update(false, true, false), (true, true), "stale stamp must not matter");
+        assert_eq!(grace_after_update(false, true, true), (true, true));
+        // Still away inside the grace: another look, but no fresh stamp
+        // (the grace must not extend itself).
+        assert_eq!(grace_after_update(false, false, true), (false, true));
+        // Long gone.
+        assert_eq!(grace_after_update(false, false, false), (false, false));
+    }
+
+    /// [I4] A drag is saved under the output the surface is actually on,
+    /// not the one the layout would resolve for the character now (the two
+    /// differ when a connector appeared after the surface was created);
+    /// only a surface with no recorded output falls back to the layout's.
+    #[test]
+    fn a_position_is_recorded_under_the_output_the_surface_is_on() {
+        assert_eq!(recorded_output("DP-1", Some("DP-2".into())), Some("DP-1".to_string()));
+        assert_eq!(recorded_output("", Some("DP-2".into())), Some("DP-2".to_string()));
+        assert_eq!(recorded_output("", None), None);
     }
 
     #[test]

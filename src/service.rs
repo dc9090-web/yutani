@@ -26,8 +26,10 @@ pub fn unit_path() -> PathBuf {
     unit_path_in(&dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")))
 }
 
-/// The unit text. `exe` is the absolute daemon path.
+/// The unit text. `exe` is the absolute daemon path, quoted for
+/// `ExecStart` (see `quote_exec`).
 pub fn unit_text(exe: &str) -> String {
+    let exe = quote_exec(exe);
     format!(
         "[Unit]\n\
          Description=Yutani - EVE Online thumbnails, hotkeys and tunnel\n\
@@ -47,6 +49,25 @@ pub fn unit_text(exe: &str) -> String {
          [Install]\n\
          WantedBy=graphical-session.target\n"
     )
+}
+
+/// `path` as one `ExecStart` argument. Unquoted, systemd splits it on
+/// whitespace (`~/My Projects/yutani` becomes two words) and reads `%x`
+/// as a specifier; inside double quotes `\` and `"` need a backslash,
+/// and `%` still needs doubling.
+fn quote_exec(path: &str) -> String {
+    let mut quoted = String::with_capacity(path.len() + 2);
+    quoted.push('"');
+    for c in path.chars() {
+        match c {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '%' => quoted.push_str("%%"),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 pub fn installed() -> bool {
@@ -100,7 +121,7 @@ mod tests {
     fn the_unit_restarts_on_failure_only_and_lives_under_the_user_config() {
         let text = unit_text("/usr/local/bin/yutani");
         for line in [
-            "ExecStart=/usr/local/bin/yutani",
+            "ExecStart=\"/usr/local/bin/yutani\"",
             "Restart=on-failure",
             "RestartSec=1",
             "StartLimitIntervalSec=60",
@@ -114,5 +135,17 @@ mod tests {
         let unit = text.split("[Service]").next().unwrap();
         assert!(unit.contains("StartLimitBurst"));
         assert_eq!(unit_path_in(Path::new("/home/d/.config")), PathBuf::from("/home/d/.config/systemd/user/yutani.service"));
+    }
+
+    /// [M4] A checkout under `~/My Projects/` — or any path with a `%`,
+    /// `"` or `\` in it — has to survive systemd's ExecStart parsing:
+    /// quoted, with the three characters that mean something inside the
+    /// quotes (and the `%` specifier) escaped.
+    #[test]
+    fn the_exec_path_is_quoted_and_escaped_for_systemd() {
+        let text = unit_text("/home/d/My Projects/yutani");
+        assert!(text.lines().any(|l| l == "ExecStart=\"/home/d/My Projects/yutani\""), "{text}");
+        let text = unit_text(r#"/p/a"b\c%d"#);
+        assert!(text.lines().any(|l| l == r#"ExecStart="/p/a\"b\\c%%d""#), "{text}");
     }
 }

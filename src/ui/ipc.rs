@@ -7,6 +7,7 @@ use cosmic::iced::{self, Subscription};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::oneshot;
@@ -23,6 +24,17 @@ impl Responder {
         if let Some(tx) = self.0.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = tx.send(response);
         }
+    }
+}
+
+#[cfg(test)]
+impl Responder {
+    /// A reply handle together with the receiver a connection task would
+    /// be waiting on, so a test can see whether (and what) `handle_request`
+    /// answered from the update thread.
+    pub fn detached() -> (Responder, oneshot::Receiver<Response>) {
+        let (tx, rx) = oneshot::channel();
+        (Responder(Arc::new(Mutex::new(Some(tx)))), rx)
     }
 }
 
@@ -60,6 +72,17 @@ fn bind() -> std::io::Result<UnixListener> {
     Ok(listener)
 }
 
+/// How long to wait after the `failures`-th consecutive `accept` error
+/// (1-based) before trying again: 100 ms, doubling to a 1 s ceiling. An
+/// error that persists — EMFILE/ENFILE once the process is at its fd limit
+/// (dmabuf planes, GL, the reader threads' pipes), ENOMEM — comes back
+/// immediately on every call, and a loop that just `continue`s spins one
+/// tokio worker at 100 % and writes a warning per iteration to the journal.
+pub fn accept_backoff(failures: u32) -> Duration {
+    let ms = 100u64.saturating_mul(1u64 << failures.saturating_sub(1).min(4));
+    Duration::from_millis(ms.min(1000))
+}
+
 fn run() -> impl iced::futures::Stream<Item = IpcEvent> {
     let (tx, rx) = mpsc::channel::<IpcEvent>(16);
     // The accept loop never yields items itself; it feeds `tx`. Selecting it
@@ -72,11 +95,17 @@ fn run() -> impl iced::futures::Stream<Item = IpcEvent> {
                 return;
             }
         };
+        let mut failures = 0u32;
         loop {
             let (stream, _) = match listener.accept().await {
-                Ok(s) => s,
+                Ok(s) => {
+                    failures = 0;
+                    s
+                }
                 Err(err) => {
+                    failures = failures.saturating_add(1);
                     tracing::warn!("ipc accept failed: {err}");
+                    tokio::time::sleep(accept_backoff(failures)).await;
                     continue;
                 }
             };
@@ -113,4 +142,22 @@ fn run() -> impl iced::futures::Stream<Item = IpcEvent> {
     })
     .filter_map(|()| async { None::<IpcEvent> });
     iced::futures::stream::select(accept_loop, rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [I5] A persistent accept error must not spin the worker: every
+    /// failure waits, the wait grows, and it never exceeds a second.
+    #[test]
+    fn accept_errors_back_off_from_100ms_to_a_second() {
+        assert_eq!(accept_backoff(1), Duration::from_millis(100));
+        assert_eq!(accept_backoff(2), Duration::from_millis(200));
+        assert_eq!(accept_backoff(3), Duration::from_millis(400));
+        assert_eq!(accept_backoff(4), Duration::from_millis(800));
+        assert_eq!(accept_backoff(5), Duration::from_secs(1));
+        assert_eq!(accept_backoff(u32::MAX), Duration::from_secs(1));
+        assert!(accept_backoff(0) >= Duration::from_millis(100), "even a nonsense count waits");
+    }
 }

@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::adopt;
 use crate::backend::{self, CaptureImage, ClientInfo, Cmd, Event, Handle};
 use crate::model::client::Login;
-use crate::model::config::{Config, Mode, Visibility};
+use crate::model::config::{Config, Mode};
 use crate::model::layout::{self, Layout, Rect, ThumbPos};
 
 pub mod characters;
@@ -135,6 +135,23 @@ pub struct App {
     pub last_eve_focus: Option<Instant>,
     /// The settings window while it is open (spec §6).
     pub settings: Option<settings::State>,
+    /// A permanent 1×1 `Layer::Background` surface, created on the first
+    /// output before any thumbnail and never destroyed by us. libcosmic
+    /// binds its one clipboard to the first layer surface it creates and
+    /// drops it (worker thread, display connection, every `WlOutput`
+    /// binding) when that surface is destroyed, reconnecting on the next
+    /// create; with a thumbnail as that first surface, every hide of it
+    /// (EveFocusedOnly, hide_active, logout) was a reconnect — the churn
+    /// behind the SCTK-thread use-after-free. Its id is never a client's,
+    /// so `client_for_surface` and the pointer path ignore it.
+    pub keepalive: Option<SurfaceId>,
+    /// When `save_config` last wrote `config.ron`, and what it wrote. The
+    /// watcher re-reads our own write within its 200 ms debounce; a
+    /// live-only change (a slider still being dragged) made meanwhile is
+    /// not in the file, and applying the re-read would revert it. A
+    /// `ConfigChanged` carrying exactly what we wrote, this soon after, is
+    /// that echo and is ignored (see `OWN_WRITE_ECHO`).
+    pub last_config_write: Option<(Instant, Config)>,
     /// The `.conf` a tunnel install/uninstall/connect/disconnect started
     /// from, while that action runs on the blocking pool. It lives here and
     /// not in the window's state because the window can be closed and
@@ -150,6 +167,9 @@ pub enum Msg {
     Backend(Event),
     Pointer(SurfaceId, mouse::Event),
     ConfigChanged(Config),
+    /// `config.ron` changed on disk but cannot be read or parsed: the live
+    /// config stays, and the settings window (if open) shows the reason.
+    ConfigBroken(String),
     Ipc(ipc::IpcEvent),
     /// The answer to an IPC request that could not be produced on the update
     /// thread (see [`Reply::Later`]). Carries the request's one-shot reply
@@ -164,12 +184,24 @@ pub enum Msg {
     /// thumbnails if it has not come back.
     FocusGraceOver,
     Adopt(adopt::AdoptEvent),
+    /// The Characters page's files, read on the blocking pool by
+    /// `refresh_characters`; `on_characters_listed` takes them from here.
+    CharactersListed(CharactersListed),
     /// Files were dropped on one of our windows. Only the settings window
     /// cares (the Tunnel page takes a `.conf` this way); `FileHovered` is
     /// deliberately *not* a message — it repeats for every pointer motion
     /// while the drag is over the window.
     FileDropped(SurfaceId, Vec<PathBuf>),
     Settings(settings::Msg),
+}
+
+/// What the Characters page reads from disk: the profile listing (or why
+/// there is none), the newest backup, and the cached character names.
+#[derive(Clone, Debug)]
+pub struct CharactersListed {
+    pub listing: Result<yutani::eve_settings::Listing, String>,
+    pub last_backup: Option<PathBuf>,
+    pub cached: yutani::eve_settings::names::Names,
 }
 
 /// How an IPC request is answered. Every request produces exactly one
@@ -193,15 +225,29 @@ fn response_of(result: Result<Option<String>, String>) -> crate::ipc::Response {
     }
 }
 
+/// How long after our own `save_config` a `ConfigChanged` carrying exactly
+/// what we wrote is taken for the watcher's echo of that write (its
+/// debounce is 200 ms) rather than an edit by hand.
+const OWN_WRITE_ECHO: Duration = Duration::from_millis(500);
+
 impl App {
-    fn send(&self, cmd: Cmd) {
+    /// Hand a command to the backend. `false` when it could not be sent —
+    /// before the backend has handed over its channel (the first moments
+    /// after start), or after it closed — so a caller that answers someone
+    /// can say so instead of reporting success for nothing.
+    fn send(&self, cmd: Cmd) -> bool {
         match &self.cmd {
-            Some(sender) => {
-                if let Err(err) = sender.send(cmd) {
+            Some(sender) => match sender.send(cmd) {
+                Ok(()) => true,
+                Err(err) => {
                     tracing::error!("backend command channel closed: {err}");
+                    false
                 }
+            },
+            None => {
+                tracing::warn!("backend not ready; dropping command");
+                false
             }
-            None => tracing::warn!("backend not ready; dropping command"),
         }
     }
 
@@ -285,20 +331,25 @@ impl App {
     }
 
     /// After a client update: remember an activation, and when focus has
-    /// just left EVE, arrange a second look once the grace is over (the
-    /// surfaces are kept until then). Nothing is scheduled while focus is
-    /// still on EVE or while the grace could not matter.
-    fn note_activation(&mut self) -> Task<cosmic::Action<Msg>> {
-        if self.any_client_activated() {
+    /// just left EVE (`was_focused`: a client was activated before the
+    /// update), start the grace *now* and arrange a second look once it is
+    /// over (the surfaces are kept until then). See
+    /// [`rules::grace_after_update`] for why the stamp has to be taken on
+    /// the transition and not left at the last event seen while focused.
+    fn note_activation(&mut self, was_focused: bool) -> Task<cosmic::Action<Msg>> {
+        let (stamp, timer) = rules::grace_after_update(self.any_client_activated(), was_focused, self.eve_focused());
+        if stamp {
             self.last_eve_focus = Some(Instant::now());
+        }
+        if !timer {
             return Task::none();
         }
-        if self.config.visibility != Visibility::EveFocusedOnly || !self.eve_focused() {
-            return Task::none();
-        }
+        // The sleep is created inside the future: `tokio::time::sleep`
+        // wants a runtime at construction, and this runs on the update
+        // thread (and in tests, where there is none).
         cosmic::iced::Task::perform(
-            tokio::time::sleep(rules::FOCUS_GRACE + Duration::from_millis(20)),
-            |_| cosmic::Action::App(Msg::FocusGraceOver),
+            async { tokio::time::sleep(rules::FOCUS_GRACE + Duration::from_millis(20)).await },
+            |()| cosmic::Action::App(Msg::FocusGraceOver),
         )
     }
 
@@ -438,10 +489,7 @@ impl App {
             Request::Focus(n) => {
                 let order = self.focus_order();
                 match n.checked_sub(1).and_then(|i| order.get(i)) {
-                    Some(h) => {
-                        self.send(Cmd::Activate(h.clone()));
-                        (Reply::Now(Ok(None)), Task::none())
-                    }
+                    Some(h) => (Reply::Now(self.activate(h.clone())), Task::none()),
                     None => (Reply::Now(Err(format!("no client {n} ({} known)", order.len()))), Task::none()),
                 }
             }
@@ -449,10 +497,7 @@ impl App {
                 let order = self.focus_order();
                 let active = self.active_client();
                 match rules::step(&order, active.as_ref(), matches!(request, Request::Next)) {
-                    Some(h) => {
-                        self.send(Cmd::Activate(h));
-                        (Reply::Now(Ok(None)), Task::none())
-                    }
+                    Some(h) => (Reply::Now(self.activate(h)), Task::none()),
                     None => (Reply::Now(Err("no clients".into())), Task::none()),
                 }
             }
@@ -472,48 +517,48 @@ impl App {
             },
             Request::Settings => (Reply::Now(Ok(None)), self.open_settings()),
             // Quitting takes the tunnel with it (applet spec §4.5). The
-            // client is answered `ok` straight away either way: a
+            // client is answered `ok` before anything slow happens: a
             // `systemctl stop` can take the unit's whole TimeoutStopSec
             // (10 s), and neither the caller nor the thumbnails may hang on
             // it, so the stop runs on the blocking pool and the exit itself
-            // waits for `Msg::QuitAfterTunnel`.
+            // waits for `Msg::QuitAfterTunnel` (see `quit`).
             Request::Quit => {
-                let tunnel = crate::tunnel::control::current_tunnel_status(&self.config.tunnel.location);
-                match crate::tunnel::control::quit_plan(tunnel.installed, tunnel.connected) {
-                    crate::tunnel::control::QuitPlan::ExitNow => {
-                        ipc::remove_socket();
-                        (Reply::Now(Ok(None)), cosmic::iced::exit())
-                    }
-                    crate::tunnel::control::QuitPlan::DisconnectThenExit => {
-                        let task = cosmic::iced::Task::perform(
-                            async move {
-                                tokio::task::spawn_blocking(crate::tunnel::control::disconnect)
-                                    .await
-                                    .map_err(|e| format!("tunnel task failed: {e}"))
-                                    .and_then(|r| r.map_err(|e| format!("{e:#}")))
-                            },
-                            |result| cosmic::Action::App(Msg::QuitAfterTunnel(result)),
-                        );
-                        (Reply::Now(Ok(None)), task)
-                    }
-                }
+                // Two `stat`s decide the plan, not the full status: that
+                // one can spawn `systemctl`, which has no place here.
+                let plan = crate::tunnel::control::quit_plan(
+                    crate::tunnel::control::installed(),
+                    crate::tunnel::control::iface_present(),
+                );
+                self.quit(plan, reply)
             }
+            // The applet polls this every 5 s (1 s with its popup open),
+            // and the tunnel half can spawn `systemctl is-failed` (unit
+            // installed, link down — the ordinary state): a fork/exec and a
+            // D-Bus round trip, up to a second when systemd is slow. The
+            // client list is taken here; the rest runs on the blocking pool
+            // and the answer comes back as `IpcReplyLater`.
             Request::Status => {
                 let order = self.focus_order();
-                let clients = order
+                let clients: Vec<crate::tunnel::status::ClientStatus> = order
                     .iter()
                     .filter_map(|h| self.clients.get(h))
                     .map(|c| crate::tunnel::status::ClientStatus { name: c.info.login.label().to_string(), active: c.info.activated })
                     .collect();
-                let status = crate::tunnel::status::Status {
-                    clients,
-                    hidden: self.hidden,
-                    tunnel: crate::tunnel::control::current_tunnel_status(&self.config.tunnel.location),
-                };
-                match serde_json::to_string(&status) {
-                    Ok(json) => (Reply::Now(Ok(Some(json))), Task::none()),
-                    Err(e) => (Reply::Now(Err(format!("status: {e}"))), Task::none()),
-                }
+                let hidden = self.hidden;
+                let location = self.config.tunnel.location.clone();
+                let reply = reply.clone();
+                let task = cosmic::iced::Task::perform(
+                    async move {
+                        let tunnel =
+                            tokio::task::spawn_blocking(move || crate::tunnel::control::current_tunnel_status(&location))
+                                .await
+                                .map_err(|e| format!("status task failed: {e}"))?;
+                        let status = crate::tunnel::status::Status { clients, hidden, tunnel };
+                        serde_json::to_string(&status).map(Some).map_err(|e| format!("status: {e}"))
+                    },
+                    move |result| cosmic::Action::App(Msg::IpcReplyLater(reply, result)),
+                );
+                (Reply::Later, task)
             }
             // `systemctl start|stop` is a synchronous subprocess that can
             // take up to the unit's TimeoutStopSec (10 s). Running it here
@@ -538,6 +583,49 @@ impl App {
                     move |result| cosmic::Action::App(Msg::IpcReplyLater(reply, result)),
                 );
                 (Reply::Later, task)
+            }
+        }
+    }
+
+    /// `focus`/`next`/`prev`: the activation, as an IPC answer. A hotkey
+    /// pressed before the backend is ready does nothing, and must say so.
+    fn activate(&self, handle: Handle) -> Result<Option<String>, String> {
+        if self.send(Cmd::Activate(handle)) { Ok(None) } else { Err("backend not ready".into()) }
+    }
+
+    /// IPC `quit`, once the plan is known.
+    fn quit(&self, plan: crate::tunnel::control::QuitPlan, reply: &ipc::Responder) -> (Reply, Task<cosmic::Action<Msg>>) {
+        match plan {
+            // Answered from the task that exits, not from this update: the
+            // connection task still has to write the reply, and an exit
+            // returned alongside it raced that write — `yutani quit` could
+            // see EOF ("no reply") and exit 1 after a successful quit. A
+            // short sleep lets the write happen; then the socket goes and
+            // the exit follows.
+            crate::tunnel::control::QuitPlan::ExitNow => {
+                let reply = reply.clone();
+                let task = cosmic::iced::Task::perform(
+                    async move {
+                        reply.respond(crate::ipc::Response::Ok);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        ipc::remove_socket();
+                    },
+                    |()| cosmic::Action::None,
+                )
+                .chain(cosmic::iced::exit());
+                (Reply::Later, task)
+            }
+            crate::tunnel::control::QuitPlan::DisconnectThenExit => {
+                let task = cosmic::iced::Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(crate::tunnel::control::disconnect)
+                            .await
+                            .map_err(|e| format!("tunnel task failed: {e}"))
+                            .and_then(|r| r.map_err(|e| format!("{e:#}")))
+                    },
+                    |result| cosmic::Action::App(Msg::QuitAfterTunnel(result)),
+                );
+                (Reply::Now(Ok(None)), task)
             }
         }
     }
@@ -653,6 +741,34 @@ impl App {
         create
     }
 
+    /// Put up the keepalive surface (see `App::keepalive`) if it is not up
+    /// and there is an output to put it on. Batched *ahead of* the reconcile
+    /// that follows an output event, so its `get_layer_surface` reaches
+    /// libcosmic before any thumbnail's and the clipboard binds to it once:
+    /// `Task::batch` hands immediately-ready actions on in push order.
+    /// 1×1 on the background layer, top-left, no keyboard: the compositor
+    /// never shows it and the pointer never finds it.
+    fn ensure_keepalive(&mut self) -> Task<cosmic::Action<Msg>> {
+        if self.keepalive.is_some() || self.outputs.is_empty() {
+            return Task::none();
+        }
+        let id = SurfaceId::unique();
+        self.keepalive = Some(id);
+        tracing::info!(?id, "keepalive surface");
+        get_layer_surface(SctkLayerSurfaceSettings {
+            id,
+            layer: Layer::Background,
+            keyboard_interactivity: KeyboardInteractivity::None,
+            anchor: Anchor::TOP | Anchor::LEFT,
+            output: IcedOutput::Active,
+            namespace: "yutani-keepalive".into(),
+            size: Some((Some(1), Some(1))),
+            exclusive_zone: -1,
+            size_limits: Limits::NONE,
+            ..Default::default()
+        })
+    }
+
     fn destroy_surface(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {
         match self.forget_surface(handle) {
             Some(id) => {
@@ -732,7 +848,8 @@ impl App {
             return;
         };
         let (position, pinned) = (client.position, client.pinned);
-        let Some(output) = self.output_name_of(handle) else { return };
+        // Under the output the surface is actually on (see `recorded_output`).
+        let Some(output) = rules::recorded_output(&client.output, self.output_name_of(handle)) else { return };
         self.layout
             .thumbs
             .insert(name, ThumbPos { output, x: position.0, y: position.1, pinned });
@@ -741,6 +858,11 @@ impl App {
 
     /// If we have a saved position for this character, move there. Floating
     /// only: in dock mode the saved spot applies when (if) the mode changes.
+    /// The same resolution as `reposition_to_layout`: a layer surface is
+    /// bound to one output for life, so a saved spot on another output
+    /// (the thumbnail went up on the client's own output while the name
+    /// was unknown) is a destroy + recreate there, not a `set_margin` that
+    /// would put DP-2 coordinates on DP-1.
     fn apply_saved_position(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {
         if self.config.mode == Mode::Dock {
             return Task::none();
@@ -748,14 +870,22 @@ impl App {
         let Some(client) = self.clients.get(handle) else { return Task::none() };
         let Login::LoggedIn(name) = &client.info.login else { return Task::none() };
         let Some(saved) = self.layout.thumbs.get(name).cloned() else { return Task::none() };
+        let connected: Vec<String> = self.outputs.iter().map(|o| o.name.clone()).collect();
+        let Some(p) = layout::placement(&saved, &connected, &client.output) else { return Task::none() };
         let client = self.clients.get_mut(handle).unwrap();
-        client.position = (saved.x, saved.y);
-        client.pinned = saved.pinned;
+        client.position = (p.x, p.y);
+        client.pinned = p.pinned;
         let surface = client.surface;
         match surface {
+            // `output_for_thumb` now resolves to the saved output, so the
+            // reconcile recreates it there.
+            Some(_) if p.recreate => {
+                let destroy = self.destroy_surface(handle);
+                Task::batch([destroy, self.reconcile_surfaces()])
+            }
             // A drag canvas surface must keep its enlarged size until the
             // drag ends; a margin here would shrink it out from under the drag.
-            Some(id) if !self.in_canvas(id) => set_margin(id, saved.y, 0, 0, saved.x),
+            Some(id) if !self.in_canvas(id) => set_margin(id, p.y, 0, 0, p.x),
             _ => Task::none(),
         }
     }
@@ -880,19 +1010,21 @@ impl App {
 
     /// Resize `handle`'s surface to its current target size, but only if it
     /// isn't already that size and it isn't a full-output drag canvas.
-    fn resize_if_needed(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {
-        let Some(client) = self.clients.get(handle) else { return Task::none() };
-        let Some(id) = client.surface else { return Task::none() };
+    /// `None` when nothing was sent — the size is unchanged — so a caller
+    /// can skip the dock relayout that only a size change can move.
+    fn resize_if_needed(&mut self, handle: &Handle) -> Option<Task<cosmic::Action<Msg>>> {
+        let client = self.clients.get(handle)?;
+        let id = client.surface?;
         if self.in_canvas(id) {
-            return Task::none();
+            return None;
         }
         let size = self.surface_size(client);
         if client.last_size == Some(size) {
-            return Task::none();
+            return None;
         }
         self.clients.get_mut(handle).unwrap().last_size = Some(size);
         self.send_thumb_size(handle, size);
-        set_size(id, Some(size.0), Some(size.1))
+        Some(set_size(id, Some(size.0), Some(size.1)))
     }
 
     fn on_pointer(&mut self, id: SurfaceId, event: mouse::Event) -> Task<cosmic::Action<Msg>> {
@@ -1005,7 +1137,8 @@ impl App {
                 }
                 self.clients.get_mut(&handle).unwrap().hovered = true;
                 // Dock mode: a zoomed thumbnail shifts its neighbours.
-                Task::batch([self.resize_if_needed(&handle), self.relayout_dock()])
+                let resize = self.resize_if_needed(&handle).unwrap_or_else(Task::none);
+                Task::batch([resize, self.relayout_dock()])
             }
             mouse::Event::CursorLeft => {
                 // Releasing outside is delivered to us anyway (implicit grab); nothing
@@ -1014,7 +1147,8 @@ impl App {
                     return Task::none();
                 }
                 self.clients.get_mut(&handle).unwrap().hovered = false;
-                Task::batch([self.resize_if_needed(&handle), self.relayout_dock()])
+                let resize = self.resize_if_needed(&handle).unwrap_or_else(Task::none);
+                Task::batch([resize, self.relayout_dock()])
             }
             _ => Task::none(),
         }
@@ -1032,6 +1166,9 @@ impl App {
                 Task::none()
             }
             Event::ClientAdded(handle, info) | Event::ClientUpdated(handle, info) => {
+                // Taken before the update lands: whether focus *leaves*
+                // EVE with it is what starts the grace.
+                let was_focused = self.any_client_activated();
                 let entry = self.clients.entry(handle.clone()).or_insert_with(|| Client {
                     info: info.clone(),
                     image: None,
@@ -1049,7 +1186,7 @@ impl App {
                 let was_named = matches!(entry.info.login, Login::LoggedIn(_));
                 entry.info = info;
                 let became_named = !was_named && matches!(entry.info.login, Login::LoggedIn(_));
-                let grace = self.note_activation();
+                let grace = self.note_activation(was_focused);
                 // An activation change on one client can hide/show others, so
                 // reconcile every client's surface, not just this one's.
                 let reconciled = Task::batch([grace, self.reconcile_surfaces()]);
@@ -1066,10 +1203,11 @@ impl App {
                 }
             }
             Event::ClientRemoved(handle) => {
+                let was_focused = self.any_client_activated();
                 let task = self.destroy_surface(&handle);
                 self.clients.remove(&handle);
                 // The activated client may be the one that closed.
-                let grace = self.note_activation();
+                let grace = self.note_activation(was_focused);
                 // The layout order changed; the saved position stays, so the
                 // character comes back to the same spot next launch.
                 self.save_current_layout();
@@ -1080,16 +1218,21 @@ impl App {
                 let Some(client) = self.clients.get_mut(&handle) else { return Task::none() };
                 client.image = Some(image);
                 client.unavailable = false;
-                let task = if client.surface.is_some() {
+                if client.surface.is_some() {
                     // `resize_if_needed` skips a drag canvas and dedupes
-                    // against the last size actually sent.
-                    self.resize_if_needed(&handle)
+                    // against the last size actually sent. Dock mode: only
+                    // a new aspect changes this thumbnail's size and so
+                    // moves its neighbours — at fps × clients frames a
+                    // second, an unchanged size must not cost a relayout.
+                    match self.resize_if_needed(&handle) {
+                        Some(resize) => Task::batch([resize, self.relayout_dock()]),
+                        None => Task::none(),
+                    }
                 } else {
-                    self.create_surface(&handle)
-                };
-                // Dock mode: a first frame (or a new aspect) changes this
-                // thumbnail's size, which moves its neighbours.
-                Task::batch([task, self.relayout_dock()])
+                    // Dock mode: a first frame sizes the thumbnail.
+                    let create = self.create_surface(&handle);
+                    Task::batch([create, self.relayout_dock()])
+                }
             }
             Event::CaptureUnavailable(handle) => {
                 if let Some(c) = self.clients.get_mut(&handle) {
@@ -1150,7 +1293,7 @@ impl App {
             // `resize_if_needed` skips a drag canvas (must keep its size
             // until the drag ends — `leave_canvas` applies the current size
             // then) and dedupes against the last size actually sent.
-            tasks.push(self.resize_if_needed(&h));
+            tasks.extend(self.resize_if_needed(&h));
         }
         // Dock mode: `reconcile_surfaces` already re-laid out every surface
         // at its new size (the layout reads `surface_size`, not `last_size`)
@@ -1484,7 +1627,11 @@ impl App {
     }
 
     /// Characters page: re-read the profile listing, the newest backup and
-    /// the name cache, then ask ESI for any id still unnamed (blocking pool).
+    /// the name cache — on the blocking pool: `discover` walks the EVE
+    /// settings tree and every Steam library root in `libraryfolders.vdf`,
+    /// and a library on a spun-down disk or an unreachable mount would
+    /// otherwise stall every thumbnail for the stat/readdir latency. The
+    /// result arrives as `Msg::CharactersListed`.
     fn refresh_characters(&mut self) -> Task<cosmic::Action<Msg>> {
         // No window, nothing to refresh: the listing walk and the cache
         // read would be thrown away.
@@ -1493,15 +1640,37 @@ impl App {
         }
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let override_dir = self.config.eve_settings_dir.clone();
-        let listing = yutani::eve_settings::discover(override_dir.as_deref().map(Path::new), &home)
-            .and_then(|dir| yutani::eve_settings::list(&dir).map_err(|e| format!("cannot read {}: {e}", dir.display())));
         let backups = yutani::eve_settings::copy::backups_dir(&dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")));
         let cache = yutani::eve_settings::names::cache_path(&dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")));
-        let cached = yutani::eve_settings::names::load_cache(&cache);
+        cosmic::iced::Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || CharactersListed {
+                    listing: yutani::eve_settings::discover(override_dir.as_deref().map(Path::new), &home).and_then(
+                        |dir| yutani::eve_settings::list(&dir).map_err(|e| format!("cannot read {}: {e}", dir.display())),
+                    ),
+                    last_backup: yutani::eve_settings::copy::latest_backup(&backups),
+                    cached: yutani::eve_settings::names::load_cache(&cache),
+                })
+                .await
+                .unwrap_or_else(|e| CharactersListed {
+                    listing: Err(format!("listing task failed: {e}")),
+                    last_backup: None,
+                    cached: Default::default(),
+                })
+            },
+            |listed| cosmic::Action::App(Msg::CharactersListed(listed)),
+        )
+    }
+
+    /// The second half of `refresh_characters`: take what was read, then
+    /// ask ESI for any id still unnamed (blocking pool). A window closed
+    /// meanwhile has nothing to take it.
+    fn on_characters_listed(&mut self, listed: CharactersListed) -> Task<cosmic::Action<Msg>> {
+        let cache = yutani::eve_settings::names::cache_path(&dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")));
         let Some(state) = self.settings.as_mut() else { return Task::none() };
-        state.characters.set_listing(listing);
-        state.characters.last_backup = yutani::eve_settings::copy::latest_backup(&backups);
-        state.characters.names.extend(cached);
+        state.characters.set_listing(listed.listing);
+        state.characters.last_backup = listed.last_backup;
+        state.characters.names.extend(listed.cached);
         let missing = state.characters.unnamed();
         // Nothing to ask for, or an answer is already on its way: asking
         // twice would hit ESI twice for the same ids.
@@ -1767,9 +1936,12 @@ impl App {
         if broken {
             return;
         }
-        if let Err(e) = self.config.save() {
-            tracing::warn!("cannot save config: {e:#}");
-            self.settings_note(format!("cannot save config.ron: {e:#}"));
+        match self.config.save() {
+            Ok(()) => self.last_config_write = Some((Instant::now(), self.config.clone())),
+            Err(e) => {
+                tracing::warn!("cannot save config: {e:#}");
+                self.settings_note(format!("cannot save config.ron: {e:#}"));
+            }
         }
     }
 }
@@ -1812,6 +1984,8 @@ impl Application for App {
             last_eve_focus: None,
             tunnel_in_flight: None,
             settings: None,
+            keepalive: None,
+            last_config_write: None,
         };
         (app, Task::none())
     }
@@ -1826,10 +2000,18 @@ impl Application for App {
                 // moves the dock layout. `reconcile_surfaces` covers all.
                 self.on_output(event, output);
                 // A scale change is picked up at the next size send.
-                self.reconcile_surfaces()
+                let keepalive = self.ensure_keepalive();
+                Task::batch([keepalive, self.reconcile_surfaces()])
             }
             Msg::Wayland(WaylandEvent::Layer(LayerEvent::Done, _, id)) => {
                 // The compositor closed this surface (its output went away).
+                if self.keepalive == Some(id) {
+                    // Only on output loss; a new one goes up on whatever is
+                    // left (or with the next output), still ahead of any
+                    // thumbnail that is recreated for it.
+                    self.keepalive = None;
+                    return self.ensure_keepalive();
+                }
                 if let Some(handle) = self.client_for_surface(id) {
                     tracing::info!("layer surface closed by compositor; recreating");
                     self.forget_surface(&handle);
@@ -1842,13 +2024,27 @@ impl Application for App {
             Msg::Backend(event) => self.on_backend(event),
             Msg::Pointer(id, event) => self.on_pointer(id, event),
             Msg::ConfigChanged(config) => {
-                let task = self.apply_config(config);
+                // The watcher re-reading what we just wrote: a live-only
+                // change made since (a slider still being dragged) is not
+                // in the file and must not be reverted by it.
+                let echo = self
+                    .last_config_write
+                    .as_ref()
+                    .is_some_and(|(at, written)| at.elapsed() < OWN_WRITE_ECHO && *written == config);
+                let task = if echo { Task::none() } else { self.apply_config(config) };
                 // A hand edit may have fixed or broken the file; the text
                 // fields deliberately keep whatever is being typed.
                 if let Some(state) = self.settings.as_mut() {
                     state.refresh();
                 }
                 task
+            }
+            Msg::ConfigBroken(error) => {
+                tracing::warn!("{error}; keeping the current config");
+                if let Some(state) = self.settings.as_mut() {
+                    state.config_error = Some(error);
+                }
+                Task::none()
             }
             // The X11/XWayland route only (see `subscription`); the drop
             // the settings window itself receives comes through
@@ -1884,6 +2080,7 @@ impl Application for App {
                 ipc::remove_socket();
                 cosmic::iced::exit()
             }
+            Msg::CharactersListed(listed) => self.on_characters_listed(listed),
             Msg::Adopt(ev) => {
                 match ev.result {
                     Ok(()) => tracing::info!(pid = ev.pid, name = %ev.name, "adopted into yutani-eve.slice"),
@@ -1911,7 +2108,10 @@ impl Application for App {
         });
         let mut subs = vec![
             events,
-            config_watch::subscription().map(Msg::ConfigChanged),
+            config_watch::subscription().map(|loaded| match loaded {
+                Ok(config) => Msg::ConfigChanged(config),
+                Err(error) => Msg::ConfigBroken(error),
+            }),
             ipc::subscription().map(Msg::Ipc),
         ];
         if let Some(conn) = self.conn.clone() {
@@ -1995,5 +2195,329 @@ impl Application for App {
         } else {
             thumbnail::view(client, &self.config)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic::cctk::wayland_client::protocol::wl_registry::WlRegistry;
+    use cosmic::cctk::wayland_client::protocol::wl_surface::WlSurface;
+    use cosmic::cctk::wayland_client::{EventQueue, QueueHandle, backend::Backend, delegate_noop};
+    use std::os::unix::net::UnixStream;
+
+    use crate::model::config::Visibility;
+
+    /// A Wayland connection with nobody on the other end: enough to mint
+    /// proxies (outputs, toplevel handles) for an `App` without a
+    /// compositor. Requests go into the socket's buffer and nothing ever
+    /// answers them, which is fine — the tests only look at the app's
+    /// state, never at what the (absent) compositor would do.
+    struct Fake {
+        qh: QueueHandle<Nop>,
+        registry: WlRegistry,
+        _queue: EventQueue<Nop>,
+        _peer: UnixStream,
+    }
+
+    struct Nop;
+    delegate_noop!(Nop: ignore WlRegistry);
+    delegate_noop!(Nop: ignore WlOutput);
+    delegate_noop!(Nop: ignore Handle);
+    delegate_noop!(Nop: ignore WlSurface);
+
+    impl Fake {
+        fn new() -> Fake {
+            let (ours, peer) = UnixStream::pair().unwrap();
+            let conn = Connection::from_backend(Backend::connect(ours).unwrap());
+            let queue = conn.new_event_queue::<Nop>();
+            let qh = queue.handle();
+            let registry = conn.display().get_registry(&qh, ());
+            Fake { qh, registry, _queue: queue, _peer: peer }
+        }
+
+        fn output(&self) -> WlOutput {
+            self.registry.bind::<WlOutput, _, _>(1, 4, &self.qh, ())
+        }
+
+        /// A toplevel handle. The compositor would normally create these;
+        /// binding one as a global is nonsense on the wire but yields a
+        /// perfectly good proxy to key `clients` by.
+        fn handle(&self) -> Handle {
+            self.registry.bind::<Handle, _, _>(1, 1, &self.qh, ())
+        }
+
+        /// A `wl_surface` proxy, for the layer events that carry one.
+        fn wl_surface(&self) -> WlSurface {
+            self.registry.bind::<WlSurface, _, _>(1, 1, &self.qh, ())
+        }
+    }
+
+    fn app(config: Config) -> App {
+        App {
+            core: cosmic::app::Core::default(),
+            config,
+            conn: None,
+            cmd: None,
+            clients: HashMap::new(),
+            outputs: Vec::new(),
+            layout: Layout::default(),
+            layout_poisoned: false,
+            layout_poison_warned: false,
+            drag: None,
+            hidden: false,
+            last_eve_focus: None,
+            settings: None,
+            tunnel_in_flight: None,
+            keepalive: None,
+            last_config_write: None,
+        }
+    }
+
+    /// Announce an output to the app the way libcosmic does, and hand back
+    /// its handle so clients can be placed on it. sctk's `OutputInfo` is
+    /// `#[non_exhaustive]`, so the event carries no info and the record
+    /// `on_output` would have built from it is registered by hand — then
+    /// the same reconcile the event handler runs.
+    fn add_output(app: &mut App, fake: &Fake, name: &str) -> WlOutput {
+        let output = fake.output();
+        app.outputs.push(Output { handle: output.clone(), name: name.to_string(), logical_size: (2560, 1440), scale: 1 });
+        let _ = app.update(Msg::Wayland(WaylandEvent::Output(OutputEvent::Created(None), output.clone())));
+        output
+    }
+
+    fn info(activated: bool, outputs: Vec<WlOutput>) -> ClientInfo {
+        ClientInfo { login: Login::LoggingIn, activated, minimized: false, outputs }
+    }
+
+    fn surface_of(app: &App, h: &Handle) -> Option<SurfaceId> {
+        app.clients[h].surface
+    }
+
+    /// [I2] `status` is what the applet polls every 5 s (1 s with its popup
+    /// open), and the tunnel half of it can spawn `systemctl is-failed`
+    /// (installed unit, link down — the ordinary state). That must never
+    /// run on the thread that drives every thumbnail frame, so the request
+    /// is answered later, from a task, and nothing reaches the client from
+    /// this call.
+    #[test]
+    fn status_is_answered_off_the_update_thread() {
+        let mut app = app(Config::default());
+        let (reply, mut rx) = ipc::Responder::detached();
+        let (how, _task) = app.handle_request(&crate::ipc::Request::Status, &reply);
+        assert!(matches!(how, Reply::Later), "answered on the update thread");
+        assert!(rx.try_recv().is_err(), "the reply must come from the task, not from this call");
+    }
+
+    /// [I6] The first layer surface we create is the permanent keepalive,
+    /// never a thumbnail: libcosmic binds its clipboard to that first
+    /// surface and reconnects (a new worker thread, display connection and
+    /// output bindings, dropping the old ones) whenever it is destroyed.
+    /// So it exists before any client can have a surface, no client
+    /// lookup ever resolves to it, hiding a thumbnail leaves it alone, and
+    /// a `Done` from the compositor (its output went away) puts a new one
+    /// up without touching any client.
+    #[test]
+    fn the_first_surface_is_the_permanent_keepalive_and_never_a_thumbnail() {
+        let fake = Fake::new();
+        let mut app = app(Config { visibility: Visibility::Always, ..Config::default() });
+        assert_eq!(app.keepalive, None, "nothing before the first output");
+        add_output(&mut app, &fake, "DP-1");
+        let keepalive = app.keepalive.expect("created with the first output");
+        assert!(app.clients.is_empty());
+
+        let a = fake.handle();
+        let _ = app.on_backend(Event::ClientAdded(a.clone(), info(true, Vec::new())));
+        let thumb = surface_of(&app, &a).expect("shown");
+        assert!(keepalive < thumb, "the keepalive was minted first");
+        assert_eq!(app.client_for_surface(keepalive), None, "no client lookup resolves to it");
+
+        let _ = app.set_hidden(true);
+        assert_eq!(surface_of(&app, &a), None);
+        assert_eq!(app.keepalive, Some(keepalive), "hiding every thumbnail leaves it alone");
+
+        let _ = app.set_hidden(false);
+        let shown = surface_of(&app, &a).expect("shown again");
+        let _ = app.update(Msg::Wayland(WaylandEvent::Layer(LayerEvent::Done, fake.wl_surface(), keepalive)));
+        assert!(app.keepalive.is_some_and(|k| k != keepalive), "replaced after the compositor closed it");
+        assert_eq!(surface_of(&app, &a), Some(shown), "and no client was touched");
+    }
+
+    /// [I4] A character logs in on DP-1 (its thumbnail is created there,
+    /// on the client's own output) with a saved position on DP-2. When the
+    /// name resolves, the saved x/y must not be applied with a margin on
+    /// DP-1 — a layer surface is bound to one output for life — but the
+    /// surface destroyed and recreated on DP-2, as applying a layout does.
+    #[test]
+    fn a_saved_position_on_another_output_recreates_the_surface_there() {
+        let fake = Fake::new();
+        let mut app = app(Config { mode: Mode::Floating, visibility: Visibility::Always, ..Config::default() });
+        let dp1 = add_output(&mut app, &fake, "DP-1");
+        let _dp2 = add_output(&mut app, &fake, "DP-2");
+        app.layout.thumbs.insert("Aria".into(), ThumbPos { output: "DP-2".into(), x: 100, y: 100, pinned: false });
+        let a = fake.handle();
+        let _ = app.on_backend(Event::ClientAdded(a.clone(), info(true, vec![dp1])));
+        let before = surface_of(&app, &a).expect("shown");
+        assert_eq!(app.clients[&a].output, "DP-1", "created on the client's own output while unnamed");
+
+        app.clients.get_mut(&a).unwrap().info.login = Login::LoggedIn("Aria".into());
+        let _ = app.apply_saved_position(&a);
+
+        let client = &app.clients[&a];
+        assert_eq!(client.output, "DP-2", "the thumbnail belongs on the saved output");
+        assert_eq!(client.position, (100, 100));
+        assert!(client.surface.is_some_and(|id| id != before), "recreated, not margin-moved");
+    }
+
+    /// [M2] The watcher re-reads the file we just wrote (200 ms debounce).
+    /// A live-only slider change made in that window is not in the file,
+    /// so applying the re-read reverted it and the slider snapped back.
+    /// The echo of our own write is ignored; a real edit — a different
+    /// config, or one arriving long after our write — still applies.
+    #[test]
+    fn the_watchers_echo_of_our_own_write_does_not_revert_a_live_change() {
+        let written = Config { thumb_width: 300, ..Config::default() };
+        let mut app = app(written.clone());
+        app.last_config_write = Some((Instant::now(), written.clone()));
+        let live = Config { thumb_width: 400, ..written.clone() };
+        let _ = app.apply_config(live.clone());
+        let _ = app.update(Msg::ConfigChanged(written.clone()));
+        assert_eq!(app.config.thumb_width, 400, "our own write, echoed back, must not win");
+
+        // The same content long after our write is the user's edit.
+        app.last_config_write = Some((Instant::now() - Duration::from_secs(5), written.clone()));
+        let _ = app.update(Msg::ConfigChanged(written.clone()));
+        assert_eq!(app.config.thumb_width, 300);
+
+        // Different content inside the window is the user's edit too.
+        app.last_config_write = Some((Instant::now(), written.clone()));
+        let _ = app.update(Msg::ConfigChanged(Config { thumb_width: 500, ..written }));
+        assert_eq!(app.config.thumb_width, 500);
+    }
+
+    /// [M3] Before the backend has handed over its command channel, a
+    /// `focus`/`next`/`prev` cannot be carried out; answering `ok` then
+    /// told the hotkey user nothing happened for no reason.
+    #[test]
+    fn focus_requests_fail_honestly_while_the_backend_is_not_ready() {
+        let fake = Fake::new();
+        let mut app = app(Config::default());
+        let a = fake.handle();
+        let _ = app.on_backend(Event::ClientAdded(a.clone(), info(false, Vec::new())));
+        assert!(app.cmd.is_none());
+        for request in [crate::ipc::Request::Focus(1), crate::ipc::Request::Next, crate::ipc::Request::Prev] {
+            let (reply, _) = ipc::Responder::detached();
+            let (how, _task) = app.handle_request(&request, &reply);
+            assert!(matches!(how, Reply::Now(Err(ref m)) if m.contains("not ready")), "{request:?}: {}", match how {
+                Reply::Now(r) => format!("{r:?}"),
+                Reply::Later => "later".into(),
+            });
+        }
+    }
+
+    /// [P1] `relayout_dock` ran on every frame in dock mode (fps × clients
+    /// a second), though the size — the only thing a frame can change —
+    /// changes on the first frame or a new aspect only. `resize_if_needed`
+    /// says whether it sent a size, and the frame handler relays out only
+    /// then: unchanged is `None`, a zoom (hover) is `Some`.
+    #[test]
+    fn an_unchanged_size_sends_nothing_so_the_frame_path_skips_the_relayout() {
+        let fake = Fake::new();
+        let mut app = app(Config { visibility: Visibility::Always, zoom_factor: 1.5, ..Config::default() });
+        add_output(&mut app, &fake, "DP-1");
+        let a = fake.handle();
+        let _ = app.on_backend(Event::ClientAdded(a.clone(), info(true, Vec::new())));
+        assert!(surface_of(&app, &a).is_some());
+        assert!(app.resize_if_needed(&a).is_none(), "same size as at creation");
+        app.clients.get_mut(&a).unwrap().hovered = true;
+        assert!(app.resize_if_needed(&a).is_some(), "zoomed: a new size");
+        assert!(app.resize_if_needed(&a).is_none(), "and sent once");
+    }
+
+    /// [P3] The Characters page's listing walks the EVE settings tree and
+    /// every Steam library root; a library on a spun-down disk or an
+    /// unreachable mount stalls for the stat/readdir latency, and that
+    /// must not happen on the thread that draws every thumbnail. The
+    /// refresh hands back a task and touches nothing of the page's state
+    /// itself; the listing lands with `Msg::CharactersListed`.
+    #[test]
+    fn the_characters_listing_is_read_off_the_update_thread() {
+        let mut app = app(Config::default());
+        app.settings = Some(settings::State::new(SurfaceId::unique(), &app.config));
+        let _task = app.refresh_characters();
+        let characters = &app.settings.as_ref().unwrap().characters;
+        assert!(characters.listing.is_none() && characters.error.is_none(), "read synchronously");
+        assert!(characters.last_backup.is_none());
+    }
+
+    /// [I3] The watcher's answer to a `config.ron` that does not parse:
+    /// nothing changes live, and an open settings window shows why (the
+    /// same field `save_config` uses, so the Display/Behavior pages give
+    /// way to the reason and nothing is written over the file).
+    #[test]
+    fn a_broken_config_on_disk_leaves_the_live_config_alone_and_says_why() {
+        let custom = Config { thumb_width: 400, ..Config::default() };
+        let mut app = app(custom.clone());
+        app.settings = Some(settings::State::new(SurfaceId::unique(), &custom));
+        let _ = app.update(Msg::ConfigBroken("cannot parse config.ron: 3:1".into()));
+        assert_eq!(app.config, custom);
+        assert_eq!(app.settings.as_ref().unwrap().config_error.as_deref(), Some("cannot parse config.ron: 3:1"));
+    }
+
+    /// [M5] `quit` with nothing to wind down used to answer `ok` and return
+    /// `exit()` from the same update: the connection task's write of that
+    /// reply raced process teardown, and `yutani quit` could see EOF ("no
+    /// reply") and exit 1 after a successful quit. The answer now comes
+    /// from the task that exits, which writes it first.
+    #[test]
+    fn quit_answers_from_the_task_that_exits_so_the_reply_is_written_first() {
+        let app = app(Config::default());
+        let (reply, mut rx) = ipc::Responder::detached();
+        let (how, _task) = app.quit(crate::tunnel::control::QuitPlan::ExitNow, &reply);
+        assert!(matches!(how, Reply::Later), "answered in the same update as the exit");
+        assert!(rx.try_recv().is_err(), "the reply must come from the task, not from this call");
+    }
+
+    /// [I1] Play in client A for a minute (no toplevel events), then click
+    /// client B. cosmic-comp refreshes toplevel state in list order, so A's
+    /// deactivation lands first and B's activation a few milliseconds
+    /// later. The grace has to start the moment focus *leaves* — not date
+    /// from the last event that happened to arrive while EVE was focused —
+    /// or every surface is destroyed and recreated across that gap.
+    #[test]
+    fn a_click_from_one_eve_window_to_another_keeps_every_surface() {
+        let fake = Fake::new();
+        let mut app = app(Config { visibility: Visibility::EveFocusedOnly, ..Config::default() });
+        add_output(&mut app, &fake, "DP-1");
+        let (a, b) = (fake.handle(), fake.handle());
+        let _ = app.on_backend(Event::ClientAdded(a.clone(), info(true, Vec::new())));
+        let _ = app.on_backend(Event::ClientAdded(b.clone(), info(false, Vec::new())));
+        let before = (surface_of(&app, &a), surface_of(&app, &b));
+        assert!(before.0.is_some() && before.1.is_some(), "shown while EVE is focused");
+        // A quiet minute in A: nothing stamped `last_eve_focus` since.
+        app.last_eve_focus = Some(Instant::now().checked_sub(Duration::from_secs(60)).unwrap());
+
+        let _ = app.on_backend(Event::ClientUpdated(a.clone(), info(false, Vec::new())));
+        std::thread::sleep(Duration::from_millis(5));
+        let _ = app.on_backend(Event::ClientUpdated(b.clone(), info(true, Vec::new())));
+
+        let after = (surface_of(&app, &a), surface_of(&app, &b));
+        assert_eq!(after, before, "no surface was destroyed and recreated across the click");
+    }
+
+    /// The other half of the grace: once it has passed with nobody
+    /// activated, `FocusGraceOver` does take the surfaces down.
+    #[test]
+    fn the_surfaces_go_once_the_grace_passes_with_eve_unfocused() {
+        let fake = Fake::new();
+        let mut app = app(Config { visibility: Visibility::EveFocusedOnly, ..Config::default() });
+        add_output(&mut app, &fake, "DP-1");
+        let a = fake.handle();
+        let _ = app.on_backend(Event::ClientAdded(a.clone(), info(true, Vec::new())));
+        let _ = app.on_backend(Event::ClientUpdated(a.clone(), info(false, Vec::new())));
+        assert!(surface_of(&app, &a).is_some(), "kept for the grace");
+        app.last_eve_focus = Some(Instant::now().checked_sub(rules::FOCUS_GRACE + Duration::from_millis(100)).unwrap());
+        let _ = app.update(Msg::FocusGraceOver);
+        assert_eq!(surface_of(&app, &a), None);
     }
 }
