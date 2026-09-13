@@ -2041,7 +2041,17 @@ impl Application for App {
                 if let Some(handle) = self.client_for_surface(id) {
                     tracing::info!("layer surface closed by compositor; recreating");
                     self.forget_surface(&handle);
-                    return self.reconcile_surfaces();
+                    // The keepalive's own Done can be later in the same
+                    // batch (libcosmic has already disconnected its clipboard
+                    // when it is), and the recreate below must not be the
+                    // first surface after that. A fresh keepalive goes up
+                    // ahead of it; the old id is only abandoned, never
+                    // destroyed — the compositor closed it, or it is still
+                    // holding the clipboard — and its later Done matches
+                    // nothing.
+                    self.keepalive = None;
+                    let keepalive = self.ensure_keepalive();
+                    return Task::batch([keepalive, self.reconcile_surfaces()]);
                 }
                 Task::none()
             }
@@ -2367,6 +2377,35 @@ mod tests {
         let _ = app.update(Msg::Wayland(WaylandEvent::Layer(LayerEvent::Done, fake.wl_surface(), keepalive)));
         assert!(app.keepalive.is_some_and(|k| k != keepalive), "replaced after the compositor closed it");
         assert_eq!(surface_of(&app, &a), Some(shown), "and no client was touched");
+    }
+
+    /// [M3] On output loss the compositor closes every surface on it and
+    /// libcosmic disconnects its clipboard when the keepalive's `Done` is
+    /// among them — before any of our updates run. A thumbnail's `Done`
+    /// that comes first in that batch would otherwise make the recreated
+    /// thumbnail the first surface after the disconnect (and the clipboard
+    /// bind to it), so a fresh keepalive goes up ahead of the recreate and
+    /// the old one's later `Done` matches nothing.
+    #[test]
+    fn a_thumbnail_closed_by_the_compositor_puts_a_fresh_keepalive_ahead_of_its_recreate() {
+        let fake = Fake::new();
+        let mut app = app(Config { visibility: Visibility::Always, ..Config::default() });
+        add_output(&mut app, &fake, "DP-1");
+        let first = app.keepalive.expect("created with the first output");
+        let a = fake.handle();
+        let _ = app.on_backend(Event::ClientAdded(a.clone(), info(true, Vec::new())));
+        let thumb = surface_of(&app, &a).expect("shown");
+
+        let _ = app.update(Msg::Wayland(WaylandEvent::Layer(LayerEvent::Done, fake.wl_surface(), thumb)));
+        let fresh = app.keepalive.expect("a keepalive is up");
+        assert_ne!(fresh, first, "the keepalive was replaced, not kept");
+        let recreated = surface_of(&app, &a).expect("recreated");
+        assert!(fresh < recreated, "the fresh keepalive was minted before the thumbnail");
+
+        // The stale keepalive's own Done, later in the same batch.
+        let _ = app.update(Msg::Wayland(WaylandEvent::Layer(LayerEvent::Done, fake.wl_surface(), first)));
+        assert_eq!(app.keepalive, Some(fresh), "matches nothing");
+        assert_eq!(surface_of(&app, &a), Some(recreated), "and no client was touched");
     }
 
     /// [I4] A character logs in on DP-1 (its thumbnail is created there,
