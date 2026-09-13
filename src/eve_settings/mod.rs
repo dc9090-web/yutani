@@ -6,6 +6,7 @@
 //! a temp directory in tests.
 
 pub mod copy;
+pub mod names;
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
