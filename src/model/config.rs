@@ -290,6 +290,16 @@ impl Config {
                 tracing::warn!("config: tunnel.dns_domains is empty; using defaults");
                 self.tunnel.dns_domains = d.tunnel.dns_domains.clone();
             }
+            // A resolver the exit node cannot reach (the LAN router, a
+            // Pi-hole, loopback) would take the whole machine's DNS down
+            // while the tunnel is up: see `tunnel::usable_dns_server`.
+            self.tunnel.dns_servers.retain(|s| {
+                let usable = crate::tunnel::usable_dns_server(s);
+                if !usable {
+                    tracing::warn!("config: tunnel.dns_servers entry {s} {}; dropping it", crate::tunnel::UNUSABLE_DNS_SERVER);
+                }
+                usable
+            });
             if self.tunnel.dns_servers.is_empty() {
                 tracing::warn!("config: tunnel.dns_servers is empty; using defaults");
                 self.tunnel.dns_servers = d.tunnel.dns_servers.clone();
@@ -657,6 +667,24 @@ mod tests {
         // Good values survive untouched.
         let c = Config::default();
         assert_eq!(c.clone().validate(), c);
+    }
+
+    /// `dns_servers: ["192.168.1.1"]` — the router, a Pi-hole, the obvious
+    /// thing to type — would have every query on the machine to that
+    /// address marked for the tunnel and sent to the exit node, which
+    /// cannot reach the LAN: machine-wide DNS dies while connected. Such
+    /// addresses are dropped here, on the way in, and refused again by
+    /// `install-root`.
+    #[test]
+    fn validate_drops_dns_servers_the_exit_node_cannot_reach() {
+        let mut c = Config::default();
+        c.tunnel.dns_servers = vec![Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(127, 0, 0, 53)];
+        assert_eq!(c.validate().tunnel.dns_servers, vec![Ipv4Addr::new(8, 8, 8, 8)]);
+
+        // Nothing usable left → the defaults, as for an empty list.
+        let mut c = Config::default();
+        c.tunnel.dns_servers = vec![Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(169, 254, 1, 1)];
+        assert_eq!(c.validate().tunnel.dns_servers, Config::default().tunnel.dns_servers);
     }
 
     #[test]

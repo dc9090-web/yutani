@@ -5,6 +5,7 @@ use cosmic::cctk::wayland_client::{
     globals::{GlobalListContents, registry_queue_init},
     protocol::wl_registry,
 };
+use std::io;
 use std::process::ExitCode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +64,41 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for Doctor {
     }
 }
 
+/// The protocol table: one line per check.
+fn write_checks(out: &mut impl io::Write, checks: &[Check]) -> io::Result<()> {
+    writeln!(out, "{:<56} {:<9} found", "interface", "needed")?;
+    for c in checks {
+        let needed = if c.required { "required" } else { "optional" };
+        let found = match c.found {
+            Some(v) => format!("v{v}"),
+            None => "MISSING".to_string(),
+        };
+        writeln!(out, "{:<56} {:<9} {}", c.interface, needed, found)?;
+    }
+    Ok(())
+}
+
+/// The GL line and the verdict.
+fn write_verdict(out: &mut impl io::Write, gl_status: &str, ok: bool) -> io::Result<()> {
+    writeln!(out, "\n{:<56} {}", "gl (rounded corners)", gl_status)?;
+    if ok {
+        writeln!(out, "\nOK: cosmic-comp advertises everything Yutani needs.")
+    } else {
+        writeln!(out, "\nMISSING required protocols — Yutani cannot run on this compositor.")
+    }
+}
+
+/// `yutani doctor | head -1`: Rust ignores SIGPIPE, so once the reader has
+/// gone every write fails with EPIPE. That is the reader's choice, not an
+/// error — the report simply ends there. (`println!` would panic with
+/// "failed printing to stdout" instead, turning a pipeline into a trace.)
+fn tolerate_broken_pipe(r: io::Result<()>) -> io::Result<()> {
+    match r {
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        r => r,
+    }
+}
+
 pub fn run() -> anyhow::Result<ExitCode> {
     let conn = Connection::connect_to_env()?;
     let (globals, _queue) = registry_queue_init::<Doctor>(&conn)?;
@@ -74,15 +110,9 @@ pub fn run() -> anyhow::Result<ExitCode> {
         .collect();
 
     let checks = evaluate(&advertised);
-    println!("{:<56} {:<9} found", "interface", "needed");
-    for c in &checks {
-        let needed = if c.required { "required" } else { "optional" };
-        let found = match c.found {
-            Some(v) => format!("v{v}"),
-            None => "MISSING".to_string(),
-        };
-        println!("{:<56} {:<9} {}", c.interface, needed, found);
-    }
+    let ok = all_required_present(&checks);
+    let mut out = io::stdout().lock();
+    tolerate_broken_pipe(write_checks(&mut out, &checks))?;
 
     // GPU thumbnail pass: EGL on the first render node + a tiny offscreen render.
     let gl_status = crate::backend::gl::open_render_node()
@@ -92,20 +122,45 @@ pub fn run() -> anyhow::Result<ExitCode> {
         })
         .map(|()| "ok".to_string())
         .unwrap_or_else(|err| format!("unavailable: {err:#} (thumbnails will have square corners)"));
-    println!("\n{:<56} {}", "gl (rounded corners)", gl_status);
+    tolerate_broken_pipe(write_verdict(&mut out, &gl_status, ok))?;
 
-    if all_required_present(&checks) {
-        println!("\nOK: cosmic-comp advertises everything Yutani needs.");
-        Ok(ExitCode::SUCCESS)
-    } else {
-        println!("\nMISSING required protocols — Yutani cannot run on this compositor.");
-        Ok(ExitCode::from(2))
-    }
+    Ok(if ok { ExitCode::SUCCESS } else { ExitCode::from(2) })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `yutani doctor | head -1`: Rust ignores SIGPIPE, so once `head` has
+    /// gone every write fails with EPIPE — which `println!` turned into a
+    /// panic trace. The report goes through a fallible writer and a broken
+    /// pipe ends it quietly; any other write error still surfaces.
+    #[test]
+    fn a_closed_pipe_ends_the_report_quietly_and_other_write_errors_still_surface() {
+        struct Broken(std::io::ErrorKind);
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(self.0))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let checks = evaluate(&[]);
+        let r = write_checks(&mut Broken(std::io::ErrorKind::BrokenPipe), &checks);
+        assert!(r.is_err());
+        assert!(tolerate_broken_pipe(r).is_ok(), "the reader went away: not an error");
+        let r = write_verdict(&mut Broken(std::io::ErrorKind::Other), "ok", false);
+        assert!(tolerate_broken_pipe(r).is_err(), "a real write failure must surface");
+
+        let mut out = Vec::new();
+        write_checks(&mut out, &checks).unwrap();
+        write_verdict(&mut out, "ok", all_required_present(&checks)).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("interface"), "{s}");
+        assert!(s.contains("zwlr_layer_shell_v1") && s.contains("MISSING"), "{s}");
+        assert!(s.contains("gl (rounded corners)") && s.contains("MISSING required protocols"), "{s}");
+    }
 
     #[test]
     fn required_interface_present_is_found_with_version() {

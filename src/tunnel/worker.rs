@@ -11,37 +11,55 @@ use super::conf::WgConf;
 use super::status::{TunnelFile, parse_wg_dump};
 use super::{CONF_PATH, IFACE, STATUS_PATH, rules, write_with_mode};
 
-const RUN_DIR: &str = "/run/yutani";
 const WG_CONF_TMP: &str = "/run/yutani/wg.conf";
 
 fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// Run one command; `Err` carries the argv and stderr.
-fn exec(argv: &[String]) -> anyhow::Result<String> {
-    let out = Command::new(&argv[0]).args(&argv[1..]).output().with_context(|| format!("cannot exec {}", argv[0]))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        Err(anyhow!("`{}` failed ({}): {}", argv.join(" "), out.status, String::from_utf8_lossy(&out.stderr).trim()))
-    }
+/// The worker's one way of running anything. [`System`] is the real thing;
+/// the tests hand `bring_up`/`down`/`serve` a stub that records each argv
+/// and answers for it, so the order and the error handling of what root
+/// executes are pinned without touching the machine.
+trait Exec {
+    /// Run `argv` and yield its stdout; `Err` carries the argv and stderr.
+    /// With `timeout`, a command still running after that long is killed
+    /// and reported as a failure like any other.
+    fn run(&self, argv: &[String], timeout: Option<Duration>) -> anyhow::Result<String>;
+    /// Run `argv` with `stdin` on its standard input.
+    fn run_with_stdin(&self, argv: &[String], stdin: &str) -> anyhow::Result<()>;
 }
 
-fn exec_stdin(argv: &[String], stdin: &str) -> anyhow::Result<()> {
-    use std::io::Write;
-    let mut child = Command::new(&argv[0])
-        .args(&argv[1..])
-        .stdin(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .with_context(|| format!("cannot exec {}", argv[0]))?;
-    child.stdin.take().context("stdin")?.write_all(stdin.as_bytes())?;
-    let out = child.wait_with_output()?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("`{}` failed ({}): {}", argv.join(" "), out.status, String::from_utf8_lossy(&out.stderr).trim()))
+struct System;
+
+fn failed(argv: &[String], out: &std::process::Output) -> anyhow::Error {
+    anyhow!("`{}` failed ({}): {}", argv.join(" "), out.status, String::from_utf8_lossy(&out.stderr).trim())
+}
+
+impl Exec for System {
+    fn run(&self, argv: &[String], timeout: Option<Duration>) -> anyhow::Result<String> {
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        let out = match timeout {
+            None => cmd.output().with_context(|| format!("cannot exec {}", argv[0]))?,
+            Some(t) => crate::proc::output_with_timeout(&mut cmd, t)
+                .with_context(|| format!("cannot exec {}", argv[0]))?
+                .ok_or_else(|| anyhow!("`{}` outlived {t:?} and was killed", argv.join(" ")))?,
+        };
+        if out.status.success() { Ok(String::from_utf8_lossy(&out.stdout).into_owned()) } else { Err(failed(argv, &out)) }
+    }
+
+    fn run_with_stdin(&self, argv: &[String], stdin: &str) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut child = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .with_context(|| format!("cannot exec {}", argv[0]))?;
+        child.stdin.take().context("stdin")?.write_all(stdin.as_bytes())?;
+        let out = child.wait_with_output()?;
+        if out.status.success() { Ok(()) } else { Err(failed(argv, &out)) }
     }
 }
 
@@ -62,10 +80,23 @@ fn conf_list<'a>(text: &'a str, key: &str) -> Option<Vec<&'a str>> {
 /// `config.ron` (spec §9): `install-root` copies the values into the conf
 /// it owns. A conf written before this feature has no such line, and a line
 /// whose values are all unusable is no better than a missing one — both
-/// give the defaults, so an old install keeps working.
+/// give the defaults, so an old install keeps working. Re-checked here
+/// even though `install-root` refuses such addresses: this text is what
+/// the mark rule is built from, and a conf stored before that check could
+/// still name a resolver the exit node cannot reach.
 fn dns_servers_from_conf(text: &str) -> Vec<std::net::Ipv4Addr> {
-    let parsed: Vec<std::net::Ipv4Addr> =
-        conf_list(text, "dns_servers").unwrap_or_default().iter().filter_map(|s| s.parse().ok()).collect();
+    let parsed: Vec<std::net::Ipv4Addr> = conf_list(text, "dns_servers")
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok())
+        .filter(|a| {
+            let usable = super::usable_dns_server(a);
+            if !usable {
+                tracing::warn!("dns server {a} {}; ignoring it", super::UNUSABLE_DNS_SERVER);
+            }
+            usable
+        })
+        .collect();
     if parsed.is_empty() { super::DEFAULT_DNS_SERVERS.to_vec() } else { parsed }
 }
 
@@ -103,13 +134,28 @@ fn load(conf_path: &Path) -> anyhow::Result<Loaded> {
     Ok(Loaded { conf, uid, dns_servers: dns_servers_from_conf(&text), dns_domains: dns_domains_from_conf(&text) })
 }
 
+/// Bounds on each teardown command. `systemctl stop` allows the worker
+/// `TimeoutStopSec=10` in all and SIGKILLs it after that, so whatever has
+/// not run yet never does — with the nft table still marking and dropping
+/// EVE's packets and `/run/yutani` gone, so status says "disconnected".
+/// `resolvectl revert` is a D-Bus call whose own reply timeout (25 s) is
+/// longer than that whole budget, so a wedged resolved would eat all of it;
+/// the netlink commands take milliseconds, and one that does not is stuck.
+/// 1 + 5 × 1.5 = 8.5 s worst case, inside the budget with room to spare.
+const RESOLVED_TIMEOUT: Duration = Duration::from_secs(1);
+const NETLINK_TIMEOUT: Duration = Duration::from_millis(1500);
+
+fn down_timeout(argv: &[String]) -> Duration {
+    if argv.first().is_some_and(|c| c == "resolvectl") { RESOLVED_TIMEOUT } else { NETLINK_TIMEOUT }
+}
+
 /// Every step is attempted even if an earlier one fails: teardown must leave
 /// nothing behind after a partial `up`. Failures are expected (an object that
-/// never existed) but not hidden: `exec`'s error carries the argv and the
+/// never existed) but not hidden: the error carries the argv and the
 /// command's stderr, and `info` is inside the unit's default filter.
-fn down() {
+fn down(x: &dyn Exec) {
     for argv in rules::down_commands() {
-        if let Err(e) = exec(&argv) {
+        if let Err(e) = x.run(&argv, Some(down_timeout(&argv))) {
             tracing::info!("teardown: {e:#}");
         }
     }
@@ -117,18 +163,40 @@ fn down() {
     let _ = std::fs::remove_file(WG_CONF_TMP);
 }
 
-/// Runs its action once when it goes out of scope — normal return, `?`, or a
-/// panic. `run` holds one from just before `up` until it returns, so the
-/// tunnel is torn down on every path out and never twice.
-struct Teardown(Option<fn()>);
+/// Before `up`: whatever a previous run left behind. A worker that ended
+/// without its teardown — SIGKILLed after `TimeoutStopSec`, OOM-killed,
+/// crashed — leaves `yutani0`, the two ip rules and the nft table in
+/// place, and `ip link add` / `ip rule add` then fail with `File exists`
+/// on every start until someone cleans up by hand. Each teardown command
+/// fails harmlessly on an object that is not there, so running them first
+/// costs a few milliseconds on a clean machine and makes a start
+/// independent of how the previous run ended. The failures are the normal
+/// case here, hence `debug`; the one thing worth a line is a link that
+/// really was left behind.
+fn remove_leftovers(x: &dyn Exec) {
+    if Path::new(&format!("/sys/class/net/{IFACE}")).exists() {
+        tracing::warn!("{IFACE} is still present from a previous run that did not tear down; removing it first");
+    }
+    for argv in rules::down_commands() {
+        if let Err(e) = x.run(&argv, Some(down_timeout(&argv))) {
+            tracing::debug!("pre-start cleanup: {e:#}");
+        }
+    }
+    let _ = std::fs::remove_file(STATUS_PATH);
+}
 
-impl Teardown {
-    fn new(action: fn()) -> Self {
-        Teardown(Some(action))
+/// Runs its action once when it goes out of scope — normal return, `?`, or a
+/// panic. `serve` holds one from before anything is created until it
+/// returns, so the tunnel is torn down on every path out and never twice.
+struct Teardown<'a>(Option<Box<dyn FnOnce() + 'a>>);
+
+impl<'a> Teardown<'a> {
+    fn new(action: impl FnOnce() + 'a) -> Self {
+        Teardown(Some(Box::new(action)))
     }
 }
 
-impl Drop for Teardown {
+impl Drop for Teardown<'_> {
     fn drop(&mut self) {
         if let Some(action) = self.0.take() {
             action();
@@ -136,20 +204,26 @@ impl Drop for Teardown {
     }
 }
 
-fn up(conf: &WgConf, uid: u32, dns_servers: &[std::net::Ipv4Addr]) -> anyhow::Result<()> {
-    std::fs::create_dir_all(RUN_DIR)?;
-    write_with_mode(WG_CONF_TMP, &conf.wg_native(), 0o600)?;
-    for argv in rules::up_commands(conf, WG_CONF_TMP) {
-        let r = exec(&argv);
+/// `wg_conf_tmp` is the transient 0600 file `wg setconf` reads
+/// ([`WG_CONF_TMP`] in the real worker; a scratch path in tests).
+fn up(x: &dyn Exec, conf: &WgConf, uid: u32, dns_servers: &[std::net::Ipv4Addr], wg_conf_tmp: &Path) -> anyhow::Result<()> {
+    if let Some(dir) = wg_conf_tmp.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let wg_conf_tmp = wg_conf_tmp.to_str().context("wg conf path is not UTF-8")?;
+    write_with_mode(wg_conf_tmp, &conf.wg_native(), 0o600)?;
+    for argv in rules::up_commands(conf, wg_conf_tmp) {
+        let r = x.run(&argv, None);
         // The conf is only needed by `wg setconf`; drop it as soon as that
-        // command has run, failure or not.
-        if argv.first().is_some_and(|c| c == "wg") {
-            let _ = std::fs::remove_file(WG_CONF_TMP);
+        // command has run, failure or not — and on any earlier failure,
+        // so the key never outlives the step that stopped needing it.
+        if argv.first().is_some_and(|c| c == "wg") || r.is_err() {
+            let _ = std::fs::remove_file(wg_conf_tmp);
         }
         r?;
     }
-    let _ = std::fs::remove_file(WG_CONF_TMP);
-    exec_stdin(&["nft".to_string(), "-f".to_string(), "-".to_string()], &rules::nft_ruleset(uid, conf.dns, dns_servers))?;
+    let _ = std::fs::remove_file(wg_conf_tmp);
+    x.run_with_stdin(&["nft".to_string(), "-f".to_string(), "-".to_string()], &rules::nft_ruleset(uid, conf.dns, dns_servers))?;
     Ok(())
 }
 
@@ -159,24 +233,55 @@ fn up(conf: &WgConf, uid: u32, dns_servers: &[std::net::Ipv4Addr]) -> anyhow::Re
 /// is lost is only the DNS improvement — EVE's lookups then behave exactly
 /// as they did before this feature (the design doc's §2 gap). So: warn,
 /// loudly enough to be found in the journal, and carry on.
-fn resolved_up(servers: &[std::net::Ipv4Addr], domains: &[String]) {
+fn resolved_up(x: &dyn Exec, servers: &[std::net::Ipv4Addr], domains: &[String]) {
     for argv in rules::resolved_up_commands(servers, domains) {
-        if let Err(e) = exec(&argv) {
+        if let Err(e) = x.run(&argv, None) {
             tracing::warn!("resolved: {e:#}; EVE's DNS lookups will not go through the tunnel");
         }
     }
+}
+
+/// Everything between "the conf is loaded" and "the tunnel is up", in
+/// order: clear leftovers, `up`, then resolved — the link must exist before
+/// resolved can be told anything about it, and the nft rule that puts
+/// those queries into the tunnel is loaded by `up` itself.
+fn bring_up(x: &dyn Exec, loaded: &Loaded, wg_conf_tmp: &Path) -> anyhow::Result<()> {
+    remove_leftovers(x);
+    up(x, &loaded.conf, loaded.uid, &loaded.dns_servers, wg_conf_tmp)?;
+    resolved_up(x, &loaded.dns_servers, &loaded.dns_domains);
+    Ok(())
+}
+
+/// `IFF_UP` (bit 0) of `/sys/class/net/<iface>/flags`, which is hex.
+fn link_flags_say_up(flags: &str) -> bool {
+    let hex = flags.trim().trim_start_matches("0x");
+    u32::from_str_radix(hex, 16).is_ok_and(|f| f & 1 != 0)
+}
+
+fn link_is_up() -> bool {
+    std::fs::read_to_string(format!("/sys/class/net/{IFACE}/flags")).is_ok_and(|f| link_flags_say_up(&f))
+}
+
+/// Whether this tick has to re-assert the route: the link is up and either
+/// nothing has asserted it since the loop began or the link was down on the
+/// previous tick. Every other tick leaves the routing table alone — an
+/// unconditional `ip route replace` still emits an `RTM_NEWROUTE`
+/// notification for an unchanged route, and NetworkManager, networkd,
+/// resolved and avahi would each wake up on it once a second for nothing.
+fn route_needs_readd(link_was_up: bool, link_is_up: bool) -> bool {
+    link_is_up && !link_was_up
 }
 
 /// Re-assert `default dev yutani0 table 51820`. The kernel deletes that
 /// route whenever the link goes down (`ip link set yutani0 down`) and never
 /// puts it back when the link comes up again; without it marked packets
 /// fall through to the LAN route and the kill-switch drops them for the
-/// rest of the session. `ip route replace` is idempotent, so the tick can
-/// run it unconditionally. While the link really is down the command fails
-/// — that is the expected state, not a reason to tear the tunnel down, so
-/// it is logged at debug and otherwise ignored.
-fn ensure_route() {
-    if let Err(e) = exec(&rules::ensure_route_command()) {
+/// rest of the session. `ip route replace` is idempotent, so re-asserting
+/// it on the first tick is harmless. A failure (the link vanished between
+/// the sysfs read and the command) is the expected state, not a reason to
+/// tear the tunnel down, so it is logged at debug and otherwise ignored.
+fn ensure_route(x: &dyn Exec) {
+    if let Err(e) = x.run(&rules::ensure_route_command(), None) {
         tracing::debug!("route: {e:#}");
     }
 }
@@ -250,34 +355,27 @@ impl ExitIp {
     /// [`should_refresh_exit_ip`] names. Every failure keeps the previous
     /// value and is logged at debug: the exit address is a nicety on the
     /// applet's band, never a reason to disturb a working tunnel.
-    fn refresh(&mut self, addr: std::net::Ipv4Addr, handshake: u64, now: u64) {
+    fn refresh(&mut self, x: &dyn Exec, addr: std::net::Ipv4Addr, handshake: u64, now: u64) {
         let handshake_changed = self.last_handshake == 0 && handshake > 0;
         self.last_handshake = handshake;
         if !should_refresh_exit_ip(self.last_refresh, now, handshake_changed) {
             return;
         }
         self.last_refresh = now;
-        let argv = exit_ip_command(addr);
-        let mut cmd = Command::new(&argv[0]);
-        cmd.args(&argv[1..]);
-        match crate::proc::output_with_timeout(&mut cmd, EXIT_IP_TIMEOUT) {
-            Ok(Some(out)) if out.status.success() => {
-                match parse_exit_ip(&String::from_utf8_lossy(&out.stdout)) {
-                    Some(ip) => self.address = Some(ip.to_string()),
-                    None => tracing::debug!("exit ip: answer is not an IPv4 address"),
-                }
-            }
-            Ok(Some(out)) => tracing::debug!("exit ip: curl failed ({})", out.status),
-            Ok(None) => tracing::debug!("exit ip: curl outlived {EXIT_IP_TIMEOUT:?}"),
-            Err(e) => tracing::debug!("exit ip: {e}"),
+        match x.run(&exit_ip_command(addr), Some(EXIT_IP_TIMEOUT)) {
+            Ok(body) => match parse_exit_ip(&body) {
+                Some(ip) => self.address = Some(ip.to_string()),
+                None => tracing::debug!("exit ip: answer is not an IPv4 address"),
+            },
+            Err(e) => tracing::debug!("exit ip: {e:#}"),
         }
     }
 }
 
-fn write_status(conf: &WgConf, since: u64, exit: &mut ExitIp) -> anyhow::Result<()> {
-    let dump = exec(&["wg".to_string(), "show".to_string(), IFACE.to_string(), "dump".to_string()])?;
+fn write_status(x: &dyn Exec, conf: &WgConf, since: u64, exit: &mut ExitIp) -> anyhow::Result<()> {
+    let dump = x.run(&["wg".to_string(), "show".to_string(), IFACE.to_string(), "dump".to_string()], None)?;
     let (endpoint, handshake, rx, tx) = parse_wg_dump(&dump).unwrap_or((conf.endpoint.clone(), 0, 0, 0));
-    exit.refresh(conf.address, handshake, now_unix());
+    exit.refresh(x, conf.address, handshake, now_unix());
     let file = TunnelFile {
         up: true,
         iface: IFACE.into(),
@@ -295,50 +393,74 @@ fn write_status(conf: &WgConf, since: u64, exit: &mut ExitIp) -> anyhow::Result<
     write_with_mode(STATUS_PATH, &serde_json::to_string(&file)?, 0o644)
 }
 
-pub fn run() -> anyhow::Result<()> {
-    let Loaded { conf, uid, dns_servers, dns_domains } = load(Path::new(CONF_PATH))?;
-    tracing::info!("tunnel up: {} via {} for uid {uid}", conf.label, conf.endpoint);
-    // From here on every exit tears the tunnel down: the guard is the only
-    // caller of `down`, so it happens exactly once.
-    let _teardown = Teardown::new(down);
-    if let Err(e) = up(&conf, uid, &dns_servers) {
+/// The worker's life once the signal handlers are in place: bring the
+/// tunnel up, publish status once a second, return on SIGTERM/SIGINT or
+/// on a failure to come up. The teardown guard is taken here, before
+/// anything is created, so every way out — a signal, `?`, a panic — tears
+/// the tunnel down exactly once; it is the only caller of `down`.
+async fn serve(
+    x: &dyn Exec,
+    loaded: &Loaded,
+    wg_conf_tmp: &Path,
+    term: &mut tokio::signal::unix::Signal,
+    int: &mut tokio::signal::unix::Signal,
+) -> anyhow::Result<()> {
+    let _teardown = Teardown::new(|| down(x));
+    if let Err(e) = bring_up(x, loaded, wg_conf_tmp) {
         tracing::error!("tunnel start failed: {e:#}; tearing down");
         return Err(e);
     }
-    // After `up`: the link must exist before resolved can be told anything
-    // about it, and the nft rule that puts these queries into the tunnel is
-    // loaded by `up` itself.
-    resolved_up(&dns_servers, &dns_domains);
     let since = now_unix();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    // The exit-IP refresh can block a tick for as long as
+    // `EXIT_IP_TIMEOUT`; without this an interval that fell behind
+    // would then fire every missed tick back to back (tokio's default
+    // `Burst`) instead of simply carrying on once a second.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut exit = ExitIp::new();
+    let mut link_was_up = false;
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                let up_now = link_is_up();
+                if route_needs_readd(link_was_up, up_now) {
+                    ensure_route(x);
+                }
+                link_was_up = up_now;
+                if let Err(e) = write_status(x, &loaded.conf, since, &mut exit) {
+                    tracing::warn!("status: {e:#}");
+                }
+            }
+            _ = term.recv() => break,
+            _ = int.recv() => break,
+        }
+    }
+    Ok(())
+}
+
+pub fn run() -> anyhow::Result<()> {
+    let loaded = load(Path::new(CONF_PATH))?;
+    tracing::info!("tunnel up: {} via {} for uid {}", loaded.conf.label, loaded.conf.endpoint, loaded.uid);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let result: anyhow::Result<()> = rt.block_on(async {
+        // The handlers go in before anything is created. Until `signal()`
+        // has run, SIGTERM and SIGINT keep their default disposition and
+        // kill the process on the spot — no unwinding, so no `Teardown` —
+        // and a `systemctl stop` during `up` (a Disconnect right after a
+        // Connect, a `restart`, `quit` just after a connect) would leave the
+        // link, the rules and the nft table behind while systemd records a
+        // clean stop. That window is the whole of `up`: seconds, when
+        // `wg setconf` is resolving a hostname `Endpoint`. tokio keeps a
+        // signal that lands between registration and the first `recv`, so
+        // one that arrives while `up` is running ends the loop as soon as
+        // it is entered — after `up`, and followed by the teardown.
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
-        // The exit-IP refresh can block a tick for as long as
-        // `EXIT_IP_TIMEOUT`; without this an interval that fell behind
-        // would then fire every missed tick back to back (tokio's default
-        // `Burst`) instead of simply carrying on once a second.
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut exit = ExitIp::new();
-        loop {
-            tokio::select! {
-                _ = tick.tick() => {
-                    ensure_route();
-                    if let Err(e) = write_status(&conf, since, &mut exit) {
-                        tracing::warn!("status: {e:#}");
-                    }
-                }
-                _ = term.recv() => break,
-                _ = int.recv() => break,
-            }
-        }
-        Ok(())
+        serve(&System, &loaded, Path::new(WG_CONF_TMP), &mut term, &mut int).await
     });
-    // Drop the guard before logging: teardown runs on drop, so logging first
-    // would put "tunnel down" in the journal ahead of the commands that take
-    // it down (and ahead of any failure among them).
-    drop(_teardown);
+    // The guard dropped inside `serve`, so this line lands in the journal
+    // after the commands that took the tunnel down (and any failure among
+    // them), never ahead of them.
     tracing::info!("tunnel down");
     result
 }
@@ -453,6 +575,18 @@ mod tests {
             dns_domains_from_conf("# yutani: dns_domains = eveonline.com bad~domain\n"),
             vec!["eveonline.com"]
         );
+
+        // A resolver the exit node cannot reach never reaches the mark rule
+        // either — a conf stored before `install-root` refused such
+        // addresses is treated as if the line held only the usable ones.
+        assert_eq!(
+            dns_servers_from_conf("# yutani: dns_servers = 192.168.1.1 8.8.8.8\n"),
+            vec!["8.8.8.8".parse::<std::net::Ipv4Addr>().unwrap()]
+        );
+        assert_eq!(
+            dns_servers_from_conf("# yutani: dns_servers = 192.168.1.1 127.0.0.53\n"),
+            crate::tunnel::DEFAULT_DNS_SERVERS.to_vec()
+        );
     }
 
     /// The exit IP is fetched *through* the tunnel: the policy rule
@@ -505,6 +639,209 @@ mod tests {
         assert!(should_refresh_exit_ip(1_789_180_000, 1_789_180_000 + EXIT_IP_REFRESH_S, false));
         // A clock that stepped backwards must not turn into a refresh storm.
         assert!(!should_refresh_exit_ip(1_789_180_000, 1_000, false));
+    }
+
+    use std::cell::RefCell;
+
+    /// Records every argv (and the bound it was given) instead of running
+    /// it. `fail` says which commands answer with an error, the way the
+    /// real ones do on an object that is not there.
+    struct Recorder {
+        calls: RefCell<Vec<(Vec<String>, Option<Duration>)>>,
+        stdin: RefCell<Vec<String>>,
+        fail: fn(&[String]) -> bool,
+    }
+
+    impl Recorder {
+        fn new(fail: fn(&[String]) -> bool) -> Self {
+            Recorder { calls: RefCell::new(Vec::new()), stdin: RefCell::new(Vec::new()), fail }
+        }
+
+        fn joined(&self) -> Vec<String> {
+            self.calls.borrow().iter().map(|(argv, _)| argv.join(" ")).collect()
+        }
+    }
+
+    impl Exec for Recorder {
+        fn run(&self, argv: &[String], timeout: Option<Duration>) -> anyhow::Result<String> {
+            self.calls.borrow_mut().push((argv.to_vec(), timeout));
+            if (self.fail)(argv) { Err(anyhow!("`{}` failed (stub)", argv.join(" "))) } else { Ok(String::new()) }
+        }
+
+        fn run_with_stdin(&self, argv: &[String], stdin: &str) -> anyhow::Result<()> {
+            self.calls.borrow_mut().push((argv.to_vec(), None));
+            self.stdin.borrow_mut().push(stdin.to_string());
+            if (self.fail)(argv) { Err(anyhow!("`{}` failed (stub)", argv.join(" "))) } else { Ok(()) }
+        }
+    }
+
+    /// What a clean machine answers: every teardown command fails because
+    /// there is nothing to tear down.
+    fn nothing_to_tear_down(argv: &[String]) -> bool {
+        rules::down_commands().iter().any(|d| d == argv)
+    }
+
+    fn loaded() -> Loaded {
+        let conf = WgConf::parse(
+            "[Interface]\nPrivateKey = U0VDUkVU\nAddress = 10.2.0.2/32\nDNS = 10.2.0.1\n[Peer]\nPublicKey = p=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n",
+            "t",
+        )
+        .unwrap();
+        let dns_servers = crate::tunnel::DEFAULT_DNS_SERVERS.to_vec();
+        let dns_domains = crate::tunnel::DEFAULT_DNS_DOMAINS.iter().map(|d| (*d).to_string()).collect();
+        Loaded { conf, uid: 1000, dns_servers, dns_domains }
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("yutani-worker-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn joined(cmds: &[Vec<String>]) -> Vec<String> {
+        cmds.iter().map(|c| c.join(" ")).collect()
+    }
+
+    /// A worker that ended without its teardown (SIGKILL after
+    /// `TimeoutStopSec`, an OOM kill, a crash) leaves `yutani0`, the ip
+    /// rules and the nft table behind, and `ip link add` / `ip rule add`
+    /// then fail with `File exists` on every start. So a start begins by
+    /// running the teardown, whose failures on a clean machine are
+    /// expected and ignored — and only then brings the link up and tells
+    /// resolved about it.
+    #[test]
+    fn a_start_clears_leftovers_then_brings_the_link_up_then_tells_resolved() {
+        let dir = scratch("start");
+        let wg = dir.join("wg.conf");
+        let rec = Recorder::new(nothing_to_tear_down);
+        let l = loaded();
+        bring_up(&rec, &l, &wg).unwrap();
+        let mut expected = joined(&rules::down_commands());
+        expected.extend(joined(&rules::up_commands(&l.conf, wg.to_str().unwrap())));
+        expected.push("nft -f -".to_string());
+        expected.extend(joined(&rules::resolved_up_commands(&l.dns_servers, &l.dns_domains)));
+        assert_eq!(rec.joined(), expected);
+        assert_eq!(rec.stdin.borrow().as_slice(), [rules::nft_ruleset(1000, l.conf.dns, &l.dns_servers)]);
+        assert!(!wg.exists(), "the wg conf holds the private key and must not outlive `wg setconf`");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A failure while coming up stops right there: nothing after the
+    /// failed command runs (resolved is never told about a link that does
+    /// not exist), and the error names the command.
+    #[test]
+    fn a_failure_while_coming_up_stops_there_and_names_the_command() {
+        let dir = scratch("start-fail");
+        let wg = dir.join("wg.conf");
+        fn link_add_fails(argv: &[String]) -> bool {
+            nothing_to_tear_down(argv) || argv.join(" ") == "ip link add yutani0 type wireguard"
+        }
+        let rec = Recorder::new(link_add_fails);
+        let e = bring_up(&rec, &loaded(), &wg).unwrap_err().to_string();
+        assert!(e.contains("ip link add yutani0"), "got {e}");
+        let calls = rec.joined();
+        assert_eq!(calls.last().map(String::as_str), Some("ip link add yutani0 type wireguard"));
+        assert!(!calls.iter().any(|c| c.starts_with("resolvectl dns")));
+        assert!(!wg.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `systemctl stop` gives the worker `TimeoutStopSec=10` in all and
+    /// SIGKILLs it after that, so whatever has not run yet never does —
+    /// with the nft table still marking and dropping EVE's packets.
+    /// `resolvectl revert` is a D-Bus call whose own reply timeout (25 s)
+    /// alone exceeds the budget, so every teardown command is bounded and
+    /// the bounds add up to less than the budget.
+    #[test]
+    fn every_teardown_command_is_bounded_inside_the_stop_budget() {
+        for pass in [down as fn(&dyn Exec), remove_leftovers] {
+            let rec = Recorder::new(nothing_to_tear_down);
+            pass(&rec);
+            let calls = rec.calls.borrow();
+            assert_eq!(calls.len(), rules::down_commands().len());
+            let mut total = Duration::ZERO;
+            for (argv, timeout) in calls.iter() {
+                let timeout = timeout.expect("every teardown command must carry a bound");
+                let want = if argv[0] == "resolvectl" { RESOLVED_TIMEOUT } else { NETLINK_TIMEOUT };
+                assert_eq!(timeout, want, "{}", argv.join(" "));
+                total += timeout;
+            }
+            assert!(total < Duration::from_secs(10), "the bounds add up to {total:?}, more than TimeoutStopSec");
+        }
+    }
+
+    /// The real runner honours that bound: a command that hangs is killed
+    /// and reported as a failure, not waited for.
+    #[test]
+    fn the_system_runner_kills_a_command_that_outlives_its_bound() {
+        let sleep = ["sleep".to_string(), "10".to_string()];
+        let started = std::time::Instant::now();
+        let e = System.run(&sleep, Some(Duration::from_millis(100))).unwrap_err().to_string();
+        assert!(started.elapsed() < Duration::from_secs(2), "must not wait for the child's own 10 s");
+        assert!(e.contains("outlived"), "got {e}");
+        assert_eq!(System.run(&["echo".to_string(), "hi".to_string()], Some(Duration::from_secs(5))).unwrap().trim(), "hi");
+        assert!(System.run(&["false".to_string()], None).is_err());
+        assert!(System.run(&["true".to_string()], None).is_ok());
+    }
+
+    /// The stop that used to lose the tunnel: SIGTERM while `up` is still
+    /// running. The handlers are registered *before* anything is created,
+    /// and tokio keeps a signal that lands between registration and the
+    /// first `recv`, so a stop that arrives during `up` is honoured as soon
+    /// as the loop is entered — after `up` has finished, and followed by a
+    /// full teardown.
+    #[test]
+    fn a_stop_that_arrives_while_the_tunnel_is_coming_up_still_tears_it_down() {
+        use tokio::signal::unix::{SignalKind, signal};
+        let dir = scratch("signal");
+        let wg = dir.join("wg.conf");
+        let rec = Recorder::new(nothing_to_tear_down);
+        let l = loaded();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
+        let result: anyhow::Result<()> = rt.block_on(async {
+            let mut term = signal(SignalKind::terminate())?;
+            let mut int = signal(SignalKind::interrupt())?;
+            // Delivered before `serve` has run a single command — the
+            // handler is in place, so it is queued rather than fatal.
+            let st = Command::new("kill").args(["-TERM", &std::process::id().to_string()]).status()?;
+            assert!(st.success());
+            serve(&rec, &l, &wg, &mut term, &mut int).await
+        });
+        result.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5), "the queued signal must end the loop at once");
+        let calls = rec.joined();
+        let up = joined(&rules::up_commands(&l.conf, wg.to_str().unwrap()));
+        let down = joined(&rules::down_commands());
+        // Leftover cleanup, the whole of `up`, resolved — nothing skipped.
+        assert_eq!(&calls[..down.len()], &down[..]);
+        assert_eq!(&calls[down.len()..down.len() + up.len()], &up[..]);
+        assert!(calls.iter().any(|c| c.starts_with("resolvectl dns yutani0")));
+        // And the teardown ran at the end, exactly once.
+        assert_eq!(&calls[calls.len() - down.len()..], &down[..]);
+        assert_eq!(calls.iter().filter(|c| *c == "ip link del yutani0").count(), 2, "one leftover pass, one teardown");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `ip link set yutani0 down` makes the kernel drop the table-51820
+    /// route and bringing the link back up does not restore it. Only that
+    /// transition needs the route re-added: doing it every second would be
+    /// an `RTM_NEWROUTE` notification per second for NetworkManager,
+    /// resolved and friends to wake up on.
+    #[test]
+    fn the_route_is_re_added_on_the_first_tick_and_when_the_link_comes_back_up() {
+        assert!(route_needs_readd(false, true), "first tick: the link is up and nothing has asserted the route yet");
+        assert!(!route_needs_readd(true, true), "steady state: nothing to do");
+        assert!(!route_needs_readd(true, false), "the link went down: the route is gone and cannot be added yet");
+        assert!(!route_needs_readd(false, false));
+        assert!(route_needs_readd(false, true), "the link came back: this is the case the tick exists for");
+        // `/sys/class/net/<iface>/flags` is hex with IFF_UP as bit 0.
+        assert!(link_flags_say_up("0x1003\n"));
+        assert!(link_flags_say_up("0x1"));
+        assert!(!link_flags_say_up("0x1002\n"));
+        assert!(!link_flags_say_up(""));
+        assert!(!link_flags_say_up("junk"));
     }
 
     #[test]

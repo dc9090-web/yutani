@@ -301,6 +301,14 @@ fn dns_conf_lines(servers: &[std::net::Ipv4Addr], domains: &[String]) -> anyhow:
             "{d:?} is not a plain DNS host name (letters, digits, `-`, `.`)"
         );
     }
+    // Every packet to these addresses on port 53 is marked for the tunnel,
+    // whoever sends it, so one the exit node cannot reach (the LAN router,
+    // a Pi-hole, loopback) would take the whole machine's DNS down for as
+    // long as the tunnel is up. Refused here, root-side, whatever the user
+    // side let through.
+    for s in servers {
+        ensure!(super::usable_dns_server(s), "dns server {s} {}", super::UNUSABLE_DNS_SERVER);
+    }
     let servers: Vec<String> = if servers.is_empty() {
         super::DEFAULT_DNS_SERVERS.iter().map(|s| s.to_string()).collect()
     } else {
@@ -312,6 +320,41 @@ fn dns_conf_lines(servers: &[std::net::Ipv4Addr], domains: &[String]) -> anyhow:
         domains.to_vec()
     };
     Ok(format!("# yutani: dns_servers = {}\n# yutani: dns_domains = {}\n", servers.join(" "), domains.join(" ")))
+}
+
+/// The most `install-root` will read from `--conf`. A WireGuard conf is a
+/// few hundred bytes; 64 KiB is a generous ceiling that still keeps a root
+/// process from reading something unbounded.
+const CONF_MAX_LEN: u64 = 64 * 1024;
+
+/// Whether root may read `--conf` at all, decided on what the path *is*
+/// before a byte of it is read: a regular file (not a symlink, which
+/// `install` would have resolved; not a FIFO, which would hang the
+/// pkexec'd root process forever; not a device — `/dev/zero` is unbounded
+/// memory), no larger than [`CONF_MAX_LEN`], and owned by the user it is
+/// being installed for, by root, or by `self` — the uid running the check,
+/// which is root on the real install and `uid` on a dry run, so that last
+/// case changes nothing outside the test-suite, where `uid` is a fixture.
+/// Spec §9 calls the conf the one deliberate crossing of the root/user
+/// boundary; this is its guard.
+fn conf_guard(conf: &Path, uid: u32) -> anyhow::Result<()> {
+    let md = std::fs::symlink_metadata(conf).with_context(|| format!("stat {}", conf.display()))?;
+    ensure!(!md.file_type().is_symlink(), "{} is a symlink; pass the file it points to", conf.display());
+    conf_readable(md.is_file(), md.uid(), md.len(), uid, crate::ipc::uid()).map_err(|why| anyhow!("{}: {why}", conf.display()))
+}
+
+/// The verdict behind [`conf_guard`], on the facts alone.
+fn conf_readable(regular: bool, owner: u32, len: u64, uid: u32, this: u32) -> Result<(), String> {
+    if !regular {
+        return Err("not a regular file".to_string());
+    }
+    if len > CONF_MAX_LEN {
+        return Err(format!("{len} bytes is larger than a WireGuard conf can be (at most {} KiB)", CONF_MAX_LEN / 1024));
+    }
+    if owner != uid && owner != 0 && owner != this {
+        return Err(format!("owned by uid {owner}, not by uid {uid} or root"));
+    }
+    Ok(())
 }
 
 /// Root side. With `dry_run`, returns what would be written instead of writing.
@@ -327,11 +370,16 @@ pub fn install_root(
     ensure!(conf.is_absolute() && Path::new(exe).is_absolute(), "paths must be absolute");
     ensure!(valid_username(username), "{username:?} is not a POSIX portable user name ([a-z_][a-z0-9_-]*$)");
     check_pkexec_uid(std::env::var("PKEXEC_UID").ok().as_deref(), uid)?;
+    conf_guard(conf, uid)?;
     let text = std::fs::read_to_string(conf).with_context(|| format!("read {}", conf.display()))?;
     let label = conf.file_stem().and_then(|s| s.to_str()).unwrap_or("tunnel");
     let parsed = WgConf::parse(&text, label).map_err(|e| anyhow!("{}: {e}", conf.display()))?;
     let dns_lines = dns_conf_lines(dns_servers, dns_domains)?;
-    let stored = format!("# yutani: label = {}\n# yutani: uid = {uid}\n{dns_lines}{text}", parsed.label);
+    // Root's own lines first, and nothing derived from a user-chosen string
+    // among them: the worker takes the first `# yutani: uid`/`dns_*` line it
+    // finds, and a file name (which may contain a newline) used to be
+    // written ahead of these as a label nobody read.
+    let stored = format!("# yutani: uid = {uid}\n{dns_lines}{text}");
     // Resolve once, up front: `unit_text` and the trust check must agree on
     // the same path (see `resolved_exe`). When resolution itself fails, fall
     // back to the raw `--exe` string for display purposes only — the check
@@ -379,12 +427,27 @@ pub fn install_root(
         write(POLKIT_PATH, &rule, 0o644, 0o755)?,
     ]
     .contains(&true);
-    let st = Command::new("systemctl").arg("daemon-reload").status().context("systemctl daemon-reload")?;
-    ensure!(st.success(), "systemctl daemon-reload failed");
+    daemon_reload()?;
     if parsed.dns.is_none() {
         eprintln!("warning: the conf has no DNS entry; EVE's DNS lookups will not go through the tunnel");
     }
     Ok(if changed { report } else { format!("{report}{NOTHING_CHANGED_MARKER}\n") })
+}
+
+/// `systemctl daemon-reload`, and whether it worked. systemd keeps a unit
+/// it has loaded until told to re-read: a reload that fails after the unit
+/// was written leaves the old definition running, and one that fails after
+/// it was deleted leaves `systemctl start` working from the cached
+/// definition — without the polkit rule, so with a password prompt — while
+/// `installed()` says false. So it is an error on both sides.
+fn daemon_reload() -> anyhow::Result<()> {
+    reload_outcome(Command::new("systemctl").arg("daemon-reload").status())
+}
+
+fn reload_outcome(status: std::io::Result<std::process::ExitStatus>) -> anyhow::Result<()> {
+    let st = status.context("systemctl daemon-reload")?;
+    ensure!(st.success(), "systemctl daemon-reload failed ({st})");
+    Ok(())
 }
 
 /// Uninstall proceeds even when nothing is installed, so a stop that had
@@ -420,7 +483,7 @@ pub fn uninstall_root(dry_run: bool) -> anyhow::Result<String> {
             Err(e) => return Err(e).with_context(|| format!("remove {p}")),
         }
     }
-    let _ = Command::new("systemctl").arg("daemon-reload").status();
+    daemon_reload()?;
     Ok(report)
 }
 
@@ -518,6 +581,89 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The conf's file name is the user's to choose and a Linux file name
+    /// may contain a newline. The label used to be written first, ahead of
+    /// the `uid`/`dns_servers` lines, and the worker takes the first match
+    /// — so `x\n# yutani: uid = 0\n# yutani: dns_servers = 10.0.0.1.conf`
+    /// installed a worker routing for uid 0. Nothing reads the label line
+    /// (the worker re-derives it from the `[Peer]` comment), so it is gone:
+    /// root's own lines come first, and the first `uid` line is root's.
+    #[test]
+    fn the_confs_file_name_cannot_forge_the_lines_root_writes() {
+        let dir = temp_dir("inst-forge");
+        let conf = dir.join("x\n# yutani: uid = 0\n# yutani: dns_servers = 10.0.0.1.conf");
+        std::fs::write(&conf, "[Interface]\nPrivateKey = U0VDUkVU\nAddress = 10.2.0.2/32\n[Peer]\nPublicKey = p=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n").unwrap();
+        let report = install_root(&conf, 1000, "daniel", "/opt/yutani/yutani", &servers(), &domains(), true).unwrap();
+        assert!(!report.contains("# yutani: label"), "the label line is dead and must not be written: {report}");
+        let first = |key: &str| {
+            let prefix = format!("# yutani: {key} =");
+            report.lines().find_map(|l| l.trim().strip_prefix(prefix.as_str())).map(str::trim).map(str::to_string)
+        };
+        assert_eq!(first("uid").as_deref(), Some("1000"), "the first uid line must be root's: {report}");
+        assert_eq!(first("dns_servers").as_deref(), Some("1.1.1.1 9.9.9.9"), "{report}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A LAN or loopback resolver in `--dns-servers` would have the mark
+    /// rule send every query on the machine to it into the tunnel, where
+    /// the exit node cannot reach it: machine-wide DNS dies while
+    /// connected, with the applet showing a healthy tunnel. The root side
+    /// refuses it, naming the address, whatever the user side validated.
+    #[test]
+    fn install_root_refuses_dns_servers_the_exit_node_cannot_reach() {
+        let dir = temp_dir("inst-lan-dns");
+        let conf = dir.join("EVE.conf");
+        std::fs::write(&conf, GOOD_CONF).unwrap();
+        for bad in ["192.168.1.1", "10.0.0.1", "127.0.0.53", "169.254.1.1", "0.0.0.0"] {
+            let servers = vec![bad.parse().unwrap(), "8.8.8.8".parse().unwrap()];
+            let e = install_root(&conf, 1000, "daniel", "/opt/y", &servers, &domains(), true).unwrap_err().to_string();
+            assert!(e.contains(bad), "the message must name the address, got {e}");
+            assert!(e.contains("exit node"), "got {e}");
+        }
+        assert!(install_root(&conf, 1000, "daniel", "/opt/y", &["8.8.8.8".parse().unwrap()], &domains(), true).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Root reads whatever `--conf` names. A symlink, a device (`/dev/zero`
+    /// would be unbounded memory in a root process; a FIFO would hang it
+    /// forever) or an oversized file is refused before the read, by what
+    /// the path *is*, never by what it holds. `install` canonicalises the
+    /// path and a WireGuard conf is a few hundred bytes, so none of this
+    /// touches a real install.
+    #[test]
+    fn install_root_reads_only_a_small_regular_file_that_is_not_a_symlink() {
+        let dir = temp_dir("inst-guard");
+        let real = dir.join("EVE.conf");
+        std::fs::write(&real, GOOD_CONF).unwrap();
+        let link = dir.join("link.conf");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let e = install_root(&link, 1000, "daniel", "/opt/y", &servers(), &domains(), true).unwrap_err().to_string();
+        assert!(e.contains("symlink"), "got {e}");
+        let e = install_root(Path::new("/dev/null"), 1000, "daniel", "/opt/y", &servers(), &domains(), true).unwrap_err().to_string();
+        assert!(e.contains("regular file"), "got {e}");
+        let big = dir.join("big.conf");
+        std::fs::write(&big, format!("{GOOD_CONF}# {}\n", "x".repeat(CONF_MAX_LEN as usize))).unwrap();
+        let e = install_root(&big, 1000, "daniel", "/opt/y", &servers(), &domains(), true).unwrap_err().to_string();
+        assert!(e.contains("KiB"), "got {e}");
+        assert!(install_root(&real, 1000, "daniel", "/opt/y", &servers(), &domains(), true).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The owner rule: the user's own file, or root's; a file some third
+    /// user owns is not root's to read on this user's behalf. `this` is
+    /// the uid running the check, root or `uid` outside the tests.
+    #[test]
+    fn the_conf_must_be_a_small_regular_file_of_the_user_or_root() {
+        assert!(conf_readable(true, 1000, 300, 1000, 1000).is_ok());
+        assert!(conf_readable(true, 0, 300, 1000, 0).is_ok(), "an admin may stage the conf as root");
+        assert!(conf_readable(true, 1000, 300, 1000, 0).is_ok(), "the real install: root checking the user's file");
+        let e = conf_readable(true, 1001, 300, 1000, 0).unwrap_err();
+        assert!(e.contains("uid 1001") && e.contains("uid 1000"), "got {e}");
+        assert!(conf_readable(false, 1000, 0, 1000, 0).unwrap_err().contains("regular file"));
+        assert!(conf_readable(true, 1000, CONF_MAX_LEN, 1000, 0).is_ok(), "exactly the ceiling is fine");
+        assert!(conf_readable(true, 1000, CONF_MAX_LEN + 1, 1000, 0).unwrap_err().contains("KiB"));
+    }
+
     #[test]
     fn install_root_dry_run_writes_nothing_and_hides_the_key() {
         let existed = Path::new(CONF_PATH).exists();
@@ -526,7 +672,6 @@ mod tests {
         let conf = dir.join("EVE-UK-455.conf");
         std::fs::write(&conf, "[Interface]\nPrivateKey = U0VDUkVU\nAddress = 10.2.0.2/32\nDNS = 10.2.0.1\n[Peer]\n# UK#455\nPublicKey = p=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n").unwrap();
         let report = install_root(&conf, 1000, "daniel", "/opt/yutani/yutani", &servers(), &domains(), true).unwrap();
-        assert!(report.contains("# yutani: label = UK#455"));
         assert!(report.contains("# yutani: uid = 1000"));
         assert!(report.contains("PrivateKey = <redacted>"));
         assert!(!report.contains("U0VDUkVU"));
@@ -607,6 +752,21 @@ mod tests {
         assert!(m.contains("yutani tunnel connect"));
         assert!(m.contains("yutani tunnel disconnect && yutani tunnel connect"));
         assert!(m.contains("/home/d/EVE.conf"));
+    }
+
+    /// `systemctl daemon-reload` is what makes systemd forget a deleted
+    /// unit (and see a new one). Its failure is an error on both sides, as
+    /// it always was for install: swallowed on uninstall, systemd kept the
+    /// deleted unit loaded, so `systemctl start` still worked from the
+    /// cached definition — without the polkit rule, so with a password
+    /// prompt — while `installed()` said false.
+    #[test]
+    fn a_failed_daemon_reload_is_an_error_not_a_shrug() {
+        assert!(reload_outcome(Command::new("true").status()).is_ok());
+        let e = reload_outcome(Command::new("false").status()).unwrap_err().to_string();
+        assert!(e.contains("daemon-reload"), "got {e}");
+        let e = reload_outcome(Command::new("/nonexistent-yutani-systemctl").status()).unwrap_err().to_string();
+        assert!(e.contains("daemon-reload"), "got {e}");
     }
 
     #[test]
