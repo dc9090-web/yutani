@@ -427,12 +427,27 @@ pub fn install_root(
         write(POLKIT_PATH, &rule, 0o644, 0o755)?,
     ]
     .contains(&true);
-    let st = Command::new("systemctl").arg("daemon-reload").status().context("systemctl daemon-reload")?;
-    ensure!(st.success(), "systemctl daemon-reload failed");
+    daemon_reload()?;
     if parsed.dns.is_none() {
         eprintln!("warning: the conf has no DNS entry; EVE's DNS lookups will not go through the tunnel");
     }
     Ok(if changed { report } else { format!("{report}{NOTHING_CHANGED_MARKER}\n") })
+}
+
+/// `systemctl daemon-reload`, and whether it worked. systemd keeps a unit
+/// it has loaded until told to re-read: a reload that fails after the unit
+/// was written leaves the old definition running, and one that fails after
+/// it was deleted leaves `systemctl start` working from the cached
+/// definition — without the polkit rule, so with a password prompt — while
+/// `installed()` says false. So it is an error on both sides.
+fn daemon_reload() -> anyhow::Result<()> {
+    reload_outcome(Command::new("systemctl").arg("daemon-reload").status())
+}
+
+fn reload_outcome(status: std::io::Result<std::process::ExitStatus>) -> anyhow::Result<()> {
+    let st = status.context("systemctl daemon-reload")?;
+    ensure!(st.success(), "systemctl daemon-reload failed ({st})");
+    Ok(())
 }
 
 /// Uninstall proceeds even when nothing is installed, so a stop that had
@@ -468,7 +483,7 @@ pub fn uninstall_root(dry_run: bool) -> anyhow::Result<String> {
             Err(e) => return Err(e).with_context(|| format!("remove {p}")),
         }
     }
-    let _ = Command::new("systemctl").arg("daemon-reload").status();
+    daemon_reload()?;
     Ok(report)
 }
 
@@ -737,6 +752,21 @@ mod tests {
         assert!(m.contains("yutani tunnel connect"));
         assert!(m.contains("yutani tunnel disconnect && yutani tunnel connect"));
         assert!(m.contains("/home/d/EVE.conf"));
+    }
+
+    /// `systemctl daemon-reload` is what makes systemd forget a deleted
+    /// unit (and see a new one). Its failure is an error on both sides, as
+    /// it always was for install: swallowed on uninstall, systemd kept the
+    /// deleted unit loaded, so `systemctl start` still worked from the
+    /// cached definition — without the polkit rule, so with a password
+    /// prompt — while `installed()` said false.
+    #[test]
+    fn a_failed_daemon_reload_is_an_error_not_a_shrug() {
+        assert!(reload_outcome(Command::new("true").status()).is_ok());
+        let e = reload_outcome(Command::new("false").status()).unwrap_err().to_string();
+        assert!(e.contains("daemon-reload"), "got {e}");
+        let e = reload_outcome(Command::new("/nonexistent-yutani-systemctl").status()).unwrap_err().to_string();
+        assert!(e.contains("daemon-reload"), "got {e}");
     }
 
     #[test]
