@@ -86,20 +86,37 @@ pub fn backup_name(now: SystemTime) -> String {
     format!("{year:04}{month:02}{day:02}T{h:02}{m:02}{s:02}Z")
 }
 
+/// Write `from`'s bytes over `to` via a sibling temporary and a rename;
+/// the temporary never survives a failure of either step.
+fn replace_via_tmp(from: &Path, to: &Path) -> std::io::Result<()> {
+    let tmp = to.with_extension("tmp");
+    let result = std::fs::copy(from, &tmp).and_then(|_| std::fs::rename(&tmp, to));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// Back up every target into `backup`, then overwrite each with its
-/// source. A failure part-way leaves the files already written in place —
-/// they are all in the backup, so `restore` puts everything back.
+/// source. A failure part-way leaves the targets already replaced in
+/// their new state — they are all in the backup, so `restore` puts
+/// everything back.
 pub fn execute(plan: &Plan, backup: &Path) -> std::io::Result<Report> {
-    std::fs::create_dir_all(backup)?;
+    if let Some(parent) = backup.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir(backup).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            std::io::Error::new(e.kind(), format!("backup directory {} already exists", backup.display()))
+        } else {
+            e
+        }
+    })?;
     let mut report = Report { characters: 0, accounts: 0, backup: backup.to_path_buf() };
     for target in &plan.targets {
         let name = target.to.file_name().ok_or_else(|| std::io::Error::other("target has no file name"))?;
         std::fs::copy(&target.to, backup.join(name))?;
-        let tmp = target.to.with_extension("tmp");
-        std::fs::copy(&target.from, &tmp)?;
-        std::fs::rename(&tmp, &target.to).inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })?;
+        replace_via_tmp(&target.from, &target.to)?;
         match target.kind {
             Kind::Character => report.characters += 1,
             Kind::Account => report.accounts += 1,
@@ -129,11 +146,7 @@ pub fn restore(backup: &Path, dir: &Path) -> std::io::Result<usize> {
             continue;
         }
         let to = dir.join(&name);
-        let tmp = to.with_extension("tmp");
-        std::fs::copy(entry.path(), &tmp)?;
-        std::fs::rename(&tmp, &to).inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })?;
+        replace_via_tmp(&entry.path(), &to)?;
         restored += 1;
     }
     Ok(restored)
@@ -235,6 +248,44 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("core_char_3.dat")).unwrap(), b"CCCC");
         assert_eq!(std::fs::read(dir.join("core_user_20.dat")).unwrap(), b"YYYY");
         assert_eq!(std::fs::read(dir.join("core_char_1.dat")).unwrap(), b"AAAA", "source untouched");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_backup_directory_is_never_reused() {
+        let dir = profile("reuse");
+        let listing = super::super::list(&dir).unwrap();
+        let backup = dir.join("backups").join("20260913T024100Z");
+        execute(&plan(&listing, 1, Some(10)).unwrap(), &backup).unwrap();
+
+        let backup_files_after_first: std::collections::BTreeMap<_, _> = std::fs::read_dir(&backup)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (e.file_name(), std::fs::read(e.path()).unwrap())
+            })
+            .collect();
+        let profile_files_after_first: Vec<_> = ["core_char_1.dat", "core_char_2.dat", "core_char_3.dat", "core_user_10.dat", "core_user_20.dat"]
+            .iter()
+            .map(|n| std::fs::read(dir.join(n)).unwrap())
+            .collect();
+
+        let err = execute(&plan(&listing, 2, Some(20)).unwrap(), &backup).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+        let backup_files_after_second: std::collections::BTreeMap<_, _> = std::fs::read_dir(&backup)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (e.file_name(), std::fs::read(e.path()).unwrap())
+            })
+            .collect();
+        assert_eq!(backup_files_after_first, backup_files_after_second, "backup untouched by the rejected second run");
+        let profile_files_after_second: Vec<_> = ["core_char_1.dat", "core_char_2.dat", "core_char_3.dat", "core_user_10.dat", "core_user_20.dat"]
+            .iter()
+            .map(|n| std::fs::read(dir.join(n)).unwrap())
+            .collect();
+        assert_eq!(profile_files_after_first, profile_files_after_second, "profile untouched by the rejected second run");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
