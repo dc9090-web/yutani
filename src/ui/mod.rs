@@ -1705,7 +1705,9 @@ impl App {
         let Some(listing) = state.characters.listing.as_ref() else { return };
         // The toplevel list empties when the window closes; the process
         // outlives it and writes these files while it exits.
-        if let Some(reason) = characters::write_blocker_now(listing, &self.config.tunnel.adopt_processes) {
+        if let Some(reason) =
+            characters::write_blocker_now(listing, &self.config.tunnel.adopt_processes, state.characters.last_write)
+        {
             return self.settings_note(reason);
         }
         let Some(character) = state.characters.selected_character() else {
@@ -1721,14 +1723,25 @@ impl App {
         let source = state.characters.source_label();
         let backups = yutani::eve_settings::copy::backups_dir(&dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")));
         let backup = backups.join(yutani::eve_settings::copy::backup_name(SystemTime::now()));
-        let note = match yutani::eve_settings::copy::plan(listing, character, account) {
-            Err(e) => e,
+        let (note, wrote) = match yutani::eve_settings::copy::plan(listing, character, account) {
+            Err(e) => (e, false),
             Ok(plan) => match yutani::eve_settings::copy::execute(&plan, &backup) {
-                Ok(report) => characters::copy_note(&source, &report),
-                Err(e) => characters::copy_failure_note(&e, &backup),
+                Ok(report) => (characters::copy_note(&source, &report), true),
+                Err(e) => (characters::copy_failure_note(&e, &backup), true),
             },
         };
+        if wrote {
+            self.mark_own_settings_write();
+        }
         self.settings_note(note);
+    }
+
+    /// The profile's files were just replaced by us: their fresh mtimes
+    /// are not a client's (see `characters::write_blocker`).
+    fn mark_own_settings_write(&mut self) {
+        if let Some(state) = self.settings.as_mut() {
+            state.characters.last_write = Some(SystemTime::now());
+        }
     }
 
     /// Characters page: put the newest backup back over the profile —
@@ -1745,33 +1758,41 @@ impl App {
         else {
             return self.settings_note("nothing to restore".to_string());
         };
-        if let Some(reason) = characters::write_blocker_now(listing, &self.config.tunnel.adopt_processes) {
+        if let Some(reason) =
+            characters::write_blocker_now(listing, &self.config.tunnel.adopt_processes, state.characters.last_write)
+        {
             return self.settings_note(reason);
         }
         let dir = listing.dir.clone();
         let backups = copy::backups_dir(&dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")));
         let saved = backups.join(copy::backup_name(SystemTime::now()));
-        let note = match copy::restore_plan(&backup, &dir) {
-            Err(e) => format!("restore failed: {e}"),
+        let (note, wrote) = match copy::restore_plan(&backup, &dir) {
+            Err(e) => (format!("restore failed: {e}"), false),
             // Nothing in the backup matches a file in the profile. Making
             // an empty backup directory here would hide the real newest
             // backup behind it, so do nothing at all.
             Ok(targets) if targets.is_empty() => {
-                format!("nothing to restore: no file in {} is in {}", backup.display(), dir.display())
+                (format!("nothing to restore: no file in {} is in {}", backup.display(), dir.display()), false)
             }
             Ok(targets) => match copy::backup_files(&targets, &saved)
                 .map_err(|error| copy::Failure { error, replaced: 0, planned: targets.len() })
                 .and_then(|_| copy::restore(&backup, &dir))
             {
-                Ok(n) => format!(
-                    "restored {n} file{} from {}; the files it replaced are in {}",
-                    if n == 1 { "" } else { "s" },
-                    backup.display(),
-                    saved.display()
+                Ok(n) => (
+                    format!(
+                        "restored {n} file{} from {}; the files it replaced are in {}",
+                        if n == 1 { "" } else { "s" },
+                        backup.display(),
+                        saved.display()
+                    ),
+                    true,
                 ),
-                Err(e) => characters::restore_failure_note(&e, &saved),
+                Err(e) => (characters::restore_failure_note(&e, &saved), true),
             },
         };
+        if wrote {
+            self.mark_own_settings_write();
+        }
         self.settings_note(note);
     }
 

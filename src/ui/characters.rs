@@ -56,6 +56,11 @@ pub struct State {
     pub copy_account: bool,
     /// The newest backup directory, for the Restore button.
     pub last_backup: Option<PathBuf>,
+    /// When our own last copy or restore finished: the files it replaced
+    /// carry fresh mtimes, and [`write_blocker`] must not take them for a
+    /// client's. Taken *after* the write (file mtimes come from the
+    /// kernel's coarse clock, which can trail an instant read before it).
+    pub last_write: Option<SystemTime>,
 }
 
 impl State {
@@ -233,20 +238,29 @@ pub fn recent_write(listing: &Listing, now: SystemTime) -> Option<&Entry> {
 /// what to wait for: a matching process still alive (a `/proc` walk, a
 /// few ms), and a listed file written within [`RECENT_WRITE_WINDOW`] — its
 /// mtime re-read from disk, since the listing the page holds can be
-/// minutes old.
-pub fn write_blocker(listing: &Listing, patterns: &[String], proc_root: &Path, uid: u32, now: SystemTime) -> Option<String> {
+/// minutes old. A file written at or before `own_write` (our own last
+/// copy/restore, see [`State::last_write`]) is ours: that press was let
+/// through, so nothing else fresh existed then and no client was running.
+pub fn write_blocker(
+    listing: &Listing,
+    patterns: &[String],
+    proc_root: &Path,
+    uid: u32,
+    now: SystemTime,
+    own_write: Option<SystemTime>,
+) -> Option<String> {
     if let Some((pid, name)) = running_eve_processes(proc_root, patterns, uid).first() {
         return Some(format!("{name} (pid {pid}) is still running; wait for it to exit and press again"));
     }
     let fresh = yutani::eve_settings::list(&listing.dir).unwrap_or_else(|_| listing.clone());
-    let entry = recent_write(&fresh, now)?;
+    let entry = recent_write(&fresh, now).filter(|e| own_write.is_none_or(|ours| e.modified > ours))?;
     let name = entry.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     Some(format!("{name} was written a moment ago, a client may still be writing it; wait a few seconds and press again"))
 }
 
 /// [`write_blocker`] against the real `/proc`, our uid and the clock.
-pub fn write_blocker_now(listing: &Listing, patterns: &[String]) -> Option<String> {
-    write_blocker(listing, patterns, Path::new("/proc"), crate::ipc::uid(), SystemTime::now())
+pub fn write_blocker_now(listing: &Listing, patterns: &[String], own_write: Option<SystemTime>) -> Option<String> {
+    write_blocker(listing, patterns, Path::new("/proc"), crate::ipc::uid(), SystemTime::now(), own_write)
 }
 
 pub fn copy_note(source: &str, report: &Report) -> String {
@@ -687,12 +701,12 @@ mod tests {
             characters: vec![entry(1, 3600, now), entry(2, 3600, now)],
             accounts: vec![],
         };
-        let note = write_blocker(&stale, &patterns(), &proc_root, uid, now).expect("fresh on disk");
+        let note = write_blocker(&stale, &patterns(), &proc_root, uid, now, None).expect("fresh on disk");
         assert!(note.contains("core_char_") && note.contains("a moment ago") && note.contains("press again"), "{note}");
         assert!(!note.starts_with(|c: char| c.is_uppercase()) && !note.ends_with('.'), "{note}");
 
         fake_process(&proc_root, 4242, "exefile.exe", &["exefile.exe"]);
-        let note = write_blocker(&stale, &patterns(), &proc_root, uid, now).expect("process alive");
+        let note = write_blocker(&stale, &patterns(), &proc_root, uid, now, None).expect("process alive");
         assert!(note.contains("exefile.exe") && note.contains("4242") && note.contains("press again"), "{note}");
         assert!(!note.starts_with(|c: char| c.is_uppercase()) && !note.ends_with('.'), "{note}");
 
@@ -701,7 +715,34 @@ mod tests {
         for name in ["core_char_1.dat", "core_char_2.dat"] {
             std::fs::File::open(profile.join(name)).unwrap().set_modified(old).unwrap();
         }
-        assert_eq!(write_blocker(&stale, &patterns(), &proc_root, uid, now), None, "no process, nothing fresh");
+        assert_eq!(write_blocker(&stale, &patterns(), &proc_root, uid, now, None), None, "no process, nothing fresh");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Our own Copy/Restore gives every file it replaces a fresh mtime, and
+    /// for the next 3 s the other button would blame "a client" for it.
+    /// Files written at or before our last write are ours (or were already
+    /// old when that press was allowed); a write after it is a client's.
+    #[test]
+    fn our_own_copy_or_restore_is_not_a_client_writing() {
+        let root = tmpdir("own-write");
+        let (proc_root, profile) = (root.join("proc"), root.join("profile"));
+        std::fs::create_dir_all(&proc_root).unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        let now = SystemTime::now();
+        for name in ["core_char_1.dat", "core_char_2.dat"] {
+            std::fs::write(profile.join(name), b"~").unwrap();
+            std::fs::File::open(profile.join(name)).unwrap().set_modified(now - Duration::from_secs(1)).unwrap();
+        }
+        let listing = yutani::eve_settings::list(&profile).unwrap();
+        let uid = crate::ipc::uid();
+        assert!(write_blocker(&listing, &patterns(), &proc_root, uid, now, None).is_some(), "fresh, nobody claims it");
+        let ours = now - Duration::from_secs(1);
+        assert_eq!(write_blocker(&listing, &patterns(), &proc_root, uid, now, Some(ours)), None, "written by us");
+        assert_eq!(write_blocker(&listing, &patterns(), &proc_root, uid, now, Some(now)), None, "before our write");
+        std::fs::File::open(profile.join("core_char_2.dat")).unwrap().set_modified(now).unwrap();
+        let note = write_blocker(&listing, &patterns(), &proc_root, uid, now, Some(ours)).expect("a write after ours");
+        assert!(note.contains("core_char_2.dat"), "{note}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
