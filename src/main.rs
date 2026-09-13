@@ -66,7 +66,7 @@ enum Command {
         #[command(subcommand)]
         action: ShortcutsAction,
     },
-    /// Install or remove the COSMIC panel applet (icons and .desktop file)
+    /// Install or remove the COSMIC panel applet (icons, .desktop files, Applications launcher)
     Applet {
         #[command(subcommand)]
         action: AppletAction,
@@ -88,9 +88,9 @@ enum ShortcutsAction {
 
 #[derive(Subcommand)]
 enum AppletAction {
-    /// Copy the icons and write the applet's .desktop file (idempotent)
+    /// Copy the icons and write the applet and launcher .desktop files (idempotent)
     Install,
-    /// Remove the icons and the .desktop file
+    /// Remove the icons and both .desktop files
     Uninstall,
 }
 

@@ -52,12 +52,22 @@ cosmic-panel ──spawns──▶ yutani-applet (libcosmic applet, own process)
 ## 3. Panel button and icon states
 
 Icon name `y-symbolic` (tinted by the panel). `yutani applet install`
-copies the five SVGs to `~/.local/share/icons/hicolor/symbolic/apps/`,
-runs `gtk-update-icon-cache` if present, and prints the one manual step:
-*Settings → Desktop → Panel → Applets → add "Yutani"*. It also writes the
-applet's `.desktop` file (`~/.local/share/applications/
-com.yutani.Applet.desktop`, `X-CosmicApplet=true`, `Exec=<abs
-yutani-applet>`) that the panel needs to list it.
+copies the five SVGs into `~/.local/share/icons/hicolor/` (the four
+symbolic marks to `symbolic/apps/`, the full-colour `y-color.svg` to
+`scalable/apps/`), runs `gtk-update-icon-cache` if present, and prints the
+one manual step: *Settings → Desktop → Panel → Applets → add "Yutani"*. It
+also writes two `.desktop` files into `~/.local/share/applications/`:
+
+- `com.yutani.Applet.desktop` — `X-CosmicApplet=true`, `NoDisplay=true`,
+  `Exec=<abs yutani-applet>`: what the panel needs to list the applet.
+- `com.yutani.Yutani.desktop` — an ordinary visible launcher named
+  "Yutani", `Icon=y-color` (the `scalable/apps` copy above),
+  `Categories=Game;Utility;`, `Exec=<abs canonicalised yutani>`: what puts
+  Yutani in the Applications list, so the daemon can be started without a
+  terminal. `update-desktop-database` is run afterwards if present, so it
+  appears without a re-login.
+
+`applet uninstall` removes both, and the icons.
 
 | Daemon / tunnel state | Icon | Treatment (handoff table) |
 |---|---|---|
