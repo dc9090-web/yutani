@@ -73,35 +73,66 @@ pub fn curl_command(ids: &[u64]) -> Command {
     cmd
 }
 
-fn fetch_once(ids: &[u64]) -> Result<Names, String> {
-    let output = output_with_timeout(&mut curl_command(ids), PROCESS_TIMEOUT)
-        .map_err(|e| format!("cannot run curl: {e}"))?
-        .ok_or_else(|| "ESI lookup timed out".to_string())?;
-    if !output.status.success() {
-        return Err(format!("curl failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
-    }
-    parse_response(&String::from_utf8_lossy(&output.stdout))
+/// Why one ESI request gave no names. The distinction decides whether
+/// asking again per id can help: ESI rejects a whole batch when any id
+/// in it is unknown (`Rejected`), but a network that could not be
+/// reached once will not be reached N more times (`Transport`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchError {
+    /// curl could not run, could not connect, or timed out.
+    Transport(String),
+    /// ESI answered, and the body is not a names array.
+    Rejected(String),
 }
 
-/// One batch; if that fails (ESI rejects the whole batch when any id is
-/// unknown — a biomassed character, say) each id alone, keeping what
+impl FetchError {
+    fn into_message(self) -> String {
+        match self {
+            FetchError::Transport(m) | FetchError::Rejected(m) => m,
+        }
+    }
+}
+
+fn fetch_once(ids: &[u64]) -> Result<Names, FetchError> {
+    let output = output_with_timeout(&mut curl_command(ids), PROCESS_TIMEOUT)
+        .map_err(|e| FetchError::Transport(format!("cannot run curl: {e}")))?
+        .ok_or_else(|| FetchError::Transport("ESI lookup timed out".to_string()))?;
+    if !output.status.success() {
+        return Err(FetchError::Transport(format!("curl failed: {}", String::from_utf8_lossy(&output.stderr).trim())));
+    }
+    parse_response(&String::from_utf8_lossy(&output.stdout)).map_err(FetchError::Rejected)
+}
+
+/// One batch; if ESI rejects it (it rejects the whole batch when any id
+/// is unknown — a biomassed character, say) each id alone, keeping what
 /// resolves. The error, if any is left, is the batch's.
 pub fn fetch(ids: &[u64]) -> Result<Names, String> {
+    fetch_with(ids, fetch_once)
+}
+
+/// [`fetch`] with the request swapped out. The fallback runs only on a
+/// `Rejected` batch: a transport failure would be 1 + N timeouts on the
+/// blocking pool with the caption stuck on "Looking up character names…",
+/// and a transport failure part-way through the fallback stops it for
+/// the same reason.
+pub fn fetch_with(ids: &[u64], mut once: impl FnMut(&[u64]) -> Result<Names, FetchError>) -> Result<Names, String> {
     if ids.is_empty() {
         return Ok(Names::new());
     }
-    match fetch_once(ids) {
+    match once(ids) {
         Ok(names) => Ok(names),
-        Err(batch_error) if ids.len() > 1 => {
+        Err(FetchError::Rejected(batch_error)) if ids.len() > 1 => {
             let mut names = Names::new();
             for id in ids {
-                if let Ok(one) = fetch_once(std::slice::from_ref(id)) {
-                    names.extend(one);
+                match once(std::slice::from_ref(id)) {
+                    Ok(one) => names.extend(one),
+                    Err(FetchError::Rejected(_)) => {}
+                    Err(FetchError::Transport(_)) => break,
                 }
             }
             if names.is_empty() { Err(batch_error) } else { Ok(names) }
         }
-        Err(e) => Err(e),
+        Err(e) => Err(e.into_message()),
     }
 }
 
@@ -188,6 +219,51 @@ mod tests {
         std::fs::write(&path, "(((").unwrap();
         assert!(load_cache(&path).is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The per-id fallback exists for ESI rejecting a batch that has one
+    /// unknown id in it. A transport failure (curl could not connect, the
+    /// process timed out) is not that: with a black-holed network it would
+    /// be 1 + N curls at 8 s each with the caption stuck on "Looking up".
+    #[test]
+    fn a_transport_failure_is_not_retried_per_id_but_a_rejected_batch_is() {
+        let ids = [1, 2, 3];
+        let mut calls = Vec::new();
+        let err = fetch_with(&ids, |asked: &[u64]| {
+            calls.push(asked.to_vec());
+            Err(FetchError::Transport("curl failed: could not resolve host".to_string()))
+        })
+        .unwrap_err();
+        assert_eq!(calls, vec![vec![1, 2, 3]], "one batch, no fallback");
+        assert!(err.contains("could not resolve host"), "{err}");
+
+        let mut calls = Vec::new();
+        let names = fetch_with(&ids, |asked: &[u64]| {
+            calls.push(asked.to_vec());
+            match asked {
+                [2] => Err(FetchError::Rejected("ESI did not return names: {\"error\":…}".to_string())),
+                [id] => Ok([(*id, format!("Name {id}"))].into_iter().collect()),
+                _ => Err(FetchError::Rejected("ESI did not return names: {\"error\":…}".to_string())),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, vec![vec![1, 2, 3], vec![1], vec![2], vec![3]], "the batch, then each id alone");
+        assert_eq!(names.keys().copied().collect::<Vec<_>>(), vec![1, 3]);
+
+        // A fallback that hits a transport failure part-way stops there:
+        // the network is gone, the remaining ids would only add timeouts.
+        let mut calls = Vec::new();
+        let names = fetch_with(&ids, |asked: &[u64]| {
+            calls.push(asked.to_vec());
+            match asked {
+                [1] => Ok([(1, "One".to_string())].into_iter().collect()),
+                [2] => Err(FetchError::Transport("ESI lookup timed out".to_string())),
+                _ => Err(FetchError::Rejected("rejected".to_string())),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, vec![vec![1, 2, 3], vec![1], vec![2]], "stopped at the timeout");
+        assert_eq!(names.keys().copied().collect::<Vec<_>>(), vec![1]);
     }
 
     /// ESI's reply is trusted only as far as the schema: a name of any
