@@ -477,11 +477,11 @@ impl App {
             },
             Request::Settings => (Reply::Now(Ok(None)), self.open_settings()),
             // Quitting takes the tunnel with it (applet spec §4.5). The
-            // client is answered `ok` straight away either way: a
+            // client is answered `ok` before anything slow happens: a
             // `systemctl stop` can take the unit's whole TimeoutStopSec
             // (10 s), and neither the caller nor the thumbnails may hang on
             // it, so the stop runs on the blocking pool and the exit itself
-            // waits for `Msg::QuitAfterTunnel`.
+            // waits for `Msg::QuitAfterTunnel` (see `quit`).
             Request::Quit => {
                 // Two `stat`s decide the plan, not the full status: that
                 // one can spawn `systemctl`, which has no place here.
@@ -489,24 +489,7 @@ impl App {
                     crate::tunnel::control::installed(),
                     crate::tunnel::control::iface_present(),
                 );
-                match plan {
-                    crate::tunnel::control::QuitPlan::ExitNow => {
-                        ipc::remove_socket();
-                        (Reply::Now(Ok(None)), cosmic::iced::exit())
-                    }
-                    crate::tunnel::control::QuitPlan::DisconnectThenExit => {
-                        let task = cosmic::iced::Task::perform(
-                            async move {
-                                tokio::task::spawn_blocking(crate::tunnel::control::disconnect)
-                                    .await
-                                    .map_err(|e| format!("tunnel task failed: {e}"))
-                                    .and_then(|r| r.map_err(|e| format!("{e:#}")))
-                            },
-                            |result| cosmic::Action::App(Msg::QuitAfterTunnel(result)),
-                        );
-                        (Reply::Now(Ok(None)), task)
-                    }
-                }
+                self.quit(plan, reply)
             }
             // The applet polls this every 5 s (1 s with its popup open),
             // and the tunnel half can spawn `systemctl is-failed` (unit
@@ -560,6 +543,43 @@ impl App {
                     move |result| cosmic::Action::App(Msg::IpcReplyLater(reply, result)),
                 );
                 (Reply::Later, task)
+            }
+        }
+    }
+
+    /// IPC `quit`, once the plan is known.
+    fn quit(&self, plan: crate::tunnel::control::QuitPlan, reply: &ipc::Responder) -> (Reply, Task<cosmic::Action<Msg>>) {
+        match plan {
+            // Answered from the task that exits, not from this update: the
+            // connection task still has to write the reply, and an exit
+            // returned alongside it raced that write — `yutani quit` could
+            // see EOF ("no reply") and exit 1 after a successful quit. A
+            // short sleep lets the write happen; then the socket goes and
+            // the exit follows.
+            crate::tunnel::control::QuitPlan::ExitNow => {
+                let reply = reply.clone();
+                let task = cosmic::iced::Task::perform(
+                    async move {
+                        reply.respond(crate::ipc::Response::Ok);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        ipc::remove_socket();
+                    },
+                    |()| cosmic::Action::None,
+                )
+                .chain(cosmic::iced::exit());
+                (Reply::Later, task)
+            }
+            crate::tunnel::control::QuitPlan::DisconnectThenExit => {
+                let task = cosmic::iced::Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(crate::tunnel::control::disconnect)
+                            .await
+                            .map_err(|e| format!("tunnel task failed: {e}"))
+                            .and_then(|r| r.map_err(|e| format!("{e:#}")))
+                    },
+                    |result| cosmic::Action::App(Msg::QuitAfterTunnel(result)),
+                );
+                (Reply::Now(Ok(None)), task)
             }
         }
     }
@@ -2113,6 +2133,20 @@ mod tests {
         let (reply, mut rx) = ipc::Responder::detached();
         let (how, _task) = app.handle_request(&crate::ipc::Request::Status, &reply);
         assert!(matches!(how, Reply::Later), "answered on the update thread");
+        assert!(rx.try_recv().is_err(), "the reply must come from the task, not from this call");
+    }
+
+    /// [M5] `quit` with nothing to wind down used to answer `ok` and return
+    /// `exit()` from the same update: the connection task's write of that
+    /// reply raced process teardown, and `yutani quit` could see EOF ("no
+    /// reply") and exit 1 after a successful quit. The answer now comes
+    /// from the task that exits, which writes it first.
+    #[test]
+    fn quit_answers_from_the_task_that_exits_so_the_reply_is_written_first() {
+        let app = app(Config::default());
+        let (reply, mut rx) = ipc::Responder::detached();
+        let (how, _task) = app.quit(crate::tunnel::control::QuitPlan::ExitNow, &reply);
+        assert!(matches!(how, Reply::Later), "answered in the same update as the exit");
         assert!(rx.try_recv().is_err(), "the reply must come from the task, not from this call");
     }
 
