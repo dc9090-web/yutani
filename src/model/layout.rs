@@ -60,8 +60,8 @@ pub struct Layout {
 /// on 2026-09-13 at Daniel's request — 32 made the top edge feel far away).
 pub const SNAP_GRID: i32 = 16;
 
-fn round_to(v: i32, grid: i32) -> i32 {
-    ((v as f64 / grid as f64).round() as i32) * grid
+fn round_to(v: i64, grid: i64) -> i64 {
+    ((v as f64 / grid as f64).round() as i64) * grid
 }
 
 /// Snap a dragged rect's top-left. Edge snapping (flush against, or aligned
@@ -70,25 +70,33 @@ fn round_to(v: i32, grid: i32) -> i32 {
 /// coordinate (when grid snapping is on), so a thumbnail that lands on a
 /// grid line near a neighbour still snaps flush; the effective edge
 /// threshold is therefore up to `grid/2 + edge_threshold`.
+///
+/// Arithmetic in i64, as `stacked_position` does: `others` are saved
+/// positions from a file a hand can edit, so a neighbour's far edge or a
+/// grid multiple can lie past `i32::MAX`. The answer is clamped back into
+/// i32 rather than wrapped.
 pub fn snap(rect: Rect, others: &[Rect], grid: Option<i32>, edge_threshold: Option<i32>) -> (i32, i32) {
-    let mut x = rect.x;
-    let mut y = rect.y;
+    let mut x = i64::from(rect.x);
+    let mut y = i64::from(rect.y);
+    let (w, h) = (i64::from(rect.w), i64::from(rect.h));
     if let Some(g) = grid.filter(|g| *g > 0) {
-        x = round_to(x, g);
-        y = round_to(y, g);
+        x = round_to(x, i64::from(g));
+        y = round_to(y, i64::from(g));
     }
     if let Some(t) = edge_threshold.filter(|t| *t > 0) {
-        let mut best_x: Option<(i32, i32)> = None; // (distance, snapped x)
-        let mut best_y: Option<(i32, i32)> = None;
+        let t = i64::from(t);
+        let mut best_x: Option<(i64, i64)> = None; // (distance, snapped x)
+        let mut best_y: Option<(i64, i64)> = None;
         for o in others {
+            let (ox, oy, ow, oh) = (i64::from(o.x), i64::from(o.y), i64::from(o.w), i64::from(o.h));
             // candidate x values: flush right-of-o, flush left-of-o, aligned left edges
-            for cand in [o.x + o.w, o.x - rect.w, o.x] {
+            for cand in [ox + ow, ox - w, ox] {
                 let d = (x - cand).abs();
                 if d <= t && best_x.map_or(true, |(bd, _)| d < bd) {
                     best_x = Some((d, cand));
                 }
             }
-            for cand in [o.y + o.h, o.y - rect.h, o.y] {
+            for cand in [oy + oh, oy - h, oy] {
                 let d = (y - cand).abs();
                 if d <= t && best_y.map_or(true, |(bd, _)| d < bd) {
                     best_y = Some((d, cand));
@@ -102,7 +110,8 @@ pub fn snap(rect: Rect, others: &[Rect], grid: Option<i32>, edge_threshold: Opti
             y = sy;
         }
     }
-    (x, y)
+    let clamp = |v: i64| i32::try_from(v).unwrap_or(if v < 0 { i32::MIN } else { i32::MAX });
+    (clamp(x), clamp(y))
 }
 
 /// Successive unnamed clients stack this far down-right of the anchor.
@@ -517,6 +526,25 @@ mod tests {
     fn edge_snap_wins_over_grid_when_both_enabled() {
         let other = r(200, 40);
         assert_eq!(snap(r(93, 51), &[other], Some(32), Some(12)), (100, 64));
+    }
+
+    #[test]
+    fn snap_survives_a_hand_edited_position_at_the_edge_of_the_coordinate_space() {
+        // `others` come from `current.ron`, which a hand can edit: a
+        // neighbour at x: 2147483600 must not make the next drag overflow
+        // (a panic with overflow checks on, a garbage x without them).
+        let far = Rect { x: i32::MAX - 47, y: i32::MAX - 47, w: 100, h: 60 };
+        assert_eq!(snap(r(10, 10), &[far], None, Some(12)), (10, 10));
+        assert_eq!(snap(r(10, 10), &[far], Some(32), Some(12)), (0, 0));
+        // The dragged rect itself at the edge: the grid rounds past
+        // `i32::MAX`, and the answer is clamped to it, not wrapped.
+        assert_eq!(snap(r(i32::MAX, i32::MIN), &[], Some(16), None), (i32::MAX, i32::MIN));
+        assert_eq!(snap(r(i32::MAX, i32::MAX), &[far], Some(16), Some(12)), (i32::MAX, i32::MAX));
+        // …and near it, the edge snap still lands flush (in range).
+        assert_eq!(snap(r(i32::MAX - 150, i32::MAX - 100), &[far], None, Some(12)), (i32::MAX - 147, i32::MAX - 107));
+        // A neighbour at the far negative edge: `o.x - rect.w` underflows.
+        let low = Rect { x: i32::MIN, y: i32::MIN, w: 100, h: 60 };
+        assert_eq!(snap(r(10, 10), &[low], None, Some(12)), (10, 10));
     }
 
     #[test]
