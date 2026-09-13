@@ -21,12 +21,12 @@ use cosmic::iced::{self, Length, Point, Subscription};
 use cosmic::{Application, Element, Task, widget};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::adopt;
 use crate::backend::{self, CaptureImage, ClientInfo, Cmd, Event, Handle};
 use crate::model::client::Login;
-use crate::model::config::{Config, Mode};
+use crate::model::config::{Config, Mode, Visibility};
 use crate::model::layout::{self, Layout, Rect, ThumbPos};
 
 pub mod characters;
@@ -127,6 +127,11 @@ pub struct App {
     /// through IPC, so this is the only route in; only `set_hidden` writes
     /// it.
     pub hidden: bool,
+    /// When an EVE client was last seen activated. `EveFocusedOnly` keeps
+    /// the thumbnails for [`rules::FOCUS_GRACE`] after that, so a click
+    /// from one EVE window to another does not destroy and recreate every
+    /// surface (see `rules::FOCUS_GRACE` for why that matters).
+    pub last_eve_focus: Option<Instant>,
     /// The settings window while it is open (spec §6).
     pub settings: Option<settings::State>,
 }
@@ -147,6 +152,9 @@ pub enum Msg {
     /// drop its socket and exit. The client that asked was answered `ok`
     /// the moment the request arrived — it is not waiting on this.
     QuitAfterTunnel(Result<(), String>),
+    /// [`rules::FOCUS_GRACE`] has passed since focus left EVE: hide the
+    /// thumbnails if it has not come back.
+    FocusGraceOver,
     Adopt(adopt::AdoptEvent),
     Settings(settings::Msg),
 }
@@ -254,12 +262,39 @@ impl App {
         self.clients.values().any(|c| c.info.activated)
     }
 
+    /// EVE has focus, or had it within [`rules::FOCUS_GRACE`].
+    fn eve_focused(&self) -> bool {
+        rules::eve_focused(
+            self.any_client_activated(),
+            self.last_eve_focus.map(|t| t.elapsed()),
+            rules::FOCUS_GRACE,
+        )
+    }
+
+    /// After a client update: remember an activation, and when focus has
+    /// just left EVE, arrange a second look once the grace is over (the
+    /// surfaces are kept until then). Nothing is scheduled while focus is
+    /// still on EVE or while the grace could not matter.
+    fn note_activation(&mut self) -> Task<cosmic::Action<Msg>> {
+        if self.any_client_activated() {
+            self.last_eve_focus = Some(Instant::now());
+            return Task::none();
+        }
+        if self.config.visibility != Visibility::EveFocusedOnly || !self.eve_focused() {
+            return Task::none();
+        }
+        cosmic::iced::Task::perform(
+            tokio::time::sleep(rules::FOCUS_GRACE + Duration::from_millis(20)),
+            |_| cosmic::Action::App(Msg::FocusGraceOver),
+        )
+    }
+
     fn should_show(&self, client: &Client) -> bool {
         rules::should_show(
             self.config.visibility,
             self.config.hide_active,
             self.hidden,
-            self.any_client_activated(),
+            self.eve_focused(),
             client.info.activated,
         )
     }
@@ -1001,9 +1036,10 @@ impl App {
                 let was_named = matches!(entry.info.login, Login::LoggedIn(_));
                 entry.info = info;
                 let became_named = !was_named && matches!(entry.info.login, Login::LoggedIn(_));
+                let grace = self.note_activation();
                 // An activation change on one client can hide/show others, so
                 // reconcile every client's surface, not just this one's.
-                let reconciled = self.reconcile_surfaces();
+                let reconciled = Task::batch([grace, self.reconcile_surfaces()]);
                 if became_named {
                     // A new character name changes the layout order, and a
                     // saved position must apply even if the surface was just
@@ -1019,11 +1055,13 @@ impl App {
             Event::ClientRemoved(handle) => {
                 let task = self.destroy_surface(&handle);
                 self.clients.remove(&handle);
+                // The activated client may be the one that closed.
+                let grace = self.note_activation();
                 // The layout order changed; the saved position stays, so the
                 // character comes back to the same spot next launch.
                 self.save_current_layout();
                 // Dock mode: its neighbours close the gap.
-                Task::batch([task, self.relayout_dock()])
+                Task::batch([task, grace, self.relayout_dock()])
             }
             Event::Frame(handle, image) => {
                 let Some(client) = self.clients.get_mut(&handle) else { return Task::none() };
@@ -1553,6 +1591,7 @@ impl Application for App {
             layout_poison_warned: false,
             drag: None,
             hidden: false,
+            last_eve_focus: None,
             settings: None,
         };
         (app, Task::none())
@@ -1607,6 +1646,7 @@ impl Application for App {
             // A failed stop is logged, not fatal: the user asked to quit,
             // and refusing to would leave them with a daemon they cannot
             // close. `yutani tunnel disconnect` still works afterwards.
+            Msg::FocusGraceOver => self.reconcile_surfaces(),
             Msg::QuitAfterTunnel(result) => {
                 if let Err(err) = result {
                     tracing::warn!("stopping the tunnel before quitting failed: {err}");

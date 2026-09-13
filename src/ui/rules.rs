@@ -1,8 +1,25 @@
 //! Pure decision rules for the UI, kept free of iced/Wayland types so they
 //! can be unit-tested.
 
+use std::time::Duration;
+
 use crate::model::config::{Mode, Visibility};
 use crate::model::layout::ThumbPos;
+
+/// How long EVE still counts as focused after its last client lost focus.
+/// Clicking from one EVE window to another passes through a moment where
+/// no client is activated; without a grace every such click destroyed
+/// every thumbnail surface and recreated it milliseconds later. Besides
+/// the flicker, that destroy/recreate burst is what preceded each of the
+/// daemon's crashes (a use-after-free in libcosmic's surface teardown), so
+/// the grace is both polish and a mitigation.
+pub const FOCUS_GRACE: Duration = Duration::from_millis(300);
+
+/// Whether EVE counts as focused: a client is activated now, or one was
+/// less than `grace` ago.
+pub fn eve_focused(any_activated: bool, since_last_activation: Option<Duration>, grace: Duration) -> bool {
+    any_activated || since_last_activation.is_some_and(|since| since < grace)
+}
 
 /// Whether a client's thumbnail should be on screen right now.
 pub fn should_show(
@@ -99,6 +116,16 @@ pub fn step<H: Clone + PartialEq>(order: &[H], active: Option<&H>, forward: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eve_stays_focused_for_the_grace_after_its_last_client_loses_focus() {
+        let g = Duration::from_millis(300);
+        assert!(eve_focused(true, None, g));
+        assert!(!eve_focused(false, None, g), "never focused");
+        assert!(eve_focused(false, Some(Duration::from_millis(100)), g), "inside the grace");
+        assert!(!eve_focused(false, Some(g), g), "the grace is exclusive");
+        assert!(!eve_focused(false, Some(Duration::from_secs(5)), g));
+    }
 
     #[test]
     fn always_shows_unless_hidden_or_hide_active() {
