@@ -59,16 +59,30 @@ impl Paths {
     }
 }
 
-/// `path` as a Desktop Entry `Exec=` argument. The spec splits `Exec` on
-/// whitespace and reads `%x` as a field code, `\`, `"`, `` ` `` and `$` as
-/// quoting syntax, so a path containing any of its reserved characters is
-/// wrapped in double quotes with those four backslash-escaped, and every
-/// `%` is doubled (field codes are expanded after unquoting). A plain path
-/// is returned unchanged, so the common entry stays readable.
+/// `path` as a Desktop Entry `Exec=` argument for a spec-following reader
+/// (the launcher entry). The spec splits `Exec` on whitespace and reads
+/// `%x` as a field code, `\`, `"`, `` ` `` and `$` as quoting syntax, so a
+/// path containing any of its reserved characters is wrapped in double
+/// quotes with those four backslash-escaped, and every `%` is doubled
+/// (field codes are expanded after unquoting). A plain path is returned
+/// unchanged, so the common entry stays readable.
 pub fn exec_quote(path: &str) -> String {
+    quote_exec(path, true)
+}
+
+/// `path` as the applet entry's `Exec=` argument. Its only reader is
+/// cosmic-panel, which takes the line raw and splits it with shlex — the
+/// same quoting rules, but no field-code expansion — so a `%` is written
+/// as it is: doubled, it would reach `exec` literally and the panel slot
+/// would sit empty.
+pub fn applet_exec_quote(path: &str) -> String {
+    quote_exec(path, false)
+}
+
+fn quote_exec(path: &str, double_percent: bool) -> String {
     const RESERVED: &[char] =
         &[' ', '\t', '\n', '"', '\'', '\\', '>', '<', '~', '|', '&', ';', '$', '*', '?', '#', '(', ')', '`'];
-    let percent_escaped = path.replace('%', "%%");
+    let percent_escaped = if double_percent { path.replace('%', "%%") } else { path.to_string() };
     if !path.contains(RESERVED) {
         return percent_escaped;
     }
@@ -115,9 +129,10 @@ pub fn yutani_exe() -> PathBuf {
 }
 
 /// The desktop entry, shaped like COSMIC's own applets
-/// (`/usr/share/applications/com.system76.CosmicApplet*.desktop`).
+/// (`/usr/share/applications/com.system76.CosmicApplet*.desktop`). Its
+/// `Exec=` is quoted for cosmic-panel ([`applet_exec_quote`]), not the spec.
 pub fn desktop_entry(exec: &str) -> String {
-    let exec = exec_quote(exec);
+    let exec = applet_exec_quote(exec);
     format!(
         "[Desktop Entry]\n\
          Name=Yutani\n\
@@ -417,8 +432,8 @@ mod tests {
     }
 
     /// Desktop Entry `Exec=` splits on whitespace and reads `%x` as a field
-    /// code, so a binary under `~/Projects/EVE Tools` or a `%` in the path
-    /// must be quoted and escaped, or cosmic-panel execs nothing at all.
+    /// code, so for a spec-following launcher a binary under
+    /// `~/Projects/EVE Tools` must be quoted and a `%` in the path doubled.
     #[test]
     fn exec_quote_quotes_a_space_and_doubles_a_percent() {
         assert_eq!(
@@ -443,6 +458,31 @@ mod tests {
         assert!(applet.lines().any(|l| l == "Exec=\"/home/d/EVE Tools/yutani-applet\""), "{applet}");
         let launcher = launcher_entry("/home/d/EVE Tools/yutani");
         assert!(launcher.lines().any(|l| l == "Exec=\"/home/d/EVE Tools/yutani\" start"), "{launcher}");
+    }
+
+    /// cosmic-panel — the applet entry's only reader — takes `Exec=` raw and
+    /// splits it with shlex, never expanding field codes, so a doubled `%`
+    /// would reach `exec` literally and the panel slot would sit empty
+    /// (`ENOENT`). The applet entry keeps a `%` as it is; only the quoting
+    /// (which shlex undoes) applies.
+    #[test]
+    fn the_applet_entry_keeps_a_percent_for_cosmic_panel() {
+        assert_eq!(applet_exec_quote("/opt/100%/yutani-applet"), "/opt/100%/yutani-applet");
+        assert_eq!(applet_exec_quote("/opt/50% off/yutani-applet"), "\"/opt/50% off/yutani-applet\"");
+        let applet = desktop_entry("/opt/100%/yutani-applet");
+        assert!(applet.lines().any(|l| l == "Exec=/opt/100%/yutani-applet"), "{applet}");
+        let applet = desktop_entry("/opt/50% off/yutani-applet");
+        assert!(applet.lines().any(|l| l == "Exec=\"/opt/50% off/yutani-applet\""), "{applet}");
+    }
+
+    /// The launcher entry is read by spec-following launchers, which expand
+    /// `%x` field codes after unquoting, so there a `%` is doubled.
+    #[test]
+    fn the_launcher_entry_doubles_a_percent_for_spec_launchers() {
+        let launcher = launcher_entry("/opt/100%/yutani");
+        assert!(launcher.lines().any(|l| l == "Exec=/opt/100%%/yutani start"), "{launcher}");
+        let launcher = launcher_entry("/opt/50% off/yutani");
+        assert!(launcher.lines().any(|l| l == "Exec=\"/opt/50%% off/yutani\" start"), "{launcher}");
     }
 
     /// No resolvable XDG data dir (`env -i`, a user with no passwd entry) is

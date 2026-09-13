@@ -3,7 +3,7 @@
 
 use std::io::{self, Read as _};
 use std::os::unix::process::CommandExt;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
@@ -109,15 +109,34 @@ struct Exit {
 /// applet's interest simply finds it dropped. Used for the one spawn there
 /// is: `Start Yutani`.
 ///
+/// The thread goes up *before* the child and is handed it over a channel:
+/// a thread that cannot be spawned (`RLIMIT_NPROC`, cgroup `pids.max` —
+/// the limits a fork would hit too) is then a start that did not happen,
+/// an error under the row, rather than a child with nobody to drain its
+/// stderr or wait on it. Should the child's own spawn fail instead, the
+/// dropped channel sends the thread away.
+///
 /// The thread drains stderr to EOF *before* waiting: the daemon's own
 /// children are all short-lived or given their own stderr, so EOF follows
 /// its exit closely, and reading first means the whole of a short dying
 /// message is there when the status is.
 fn spawn_detached(cmd: &mut Command) -> io::Result<oneshot::Receiver<Exit>> {
+    spawn_reaped(cmd, |reap| std::thread::Builder::new().name("reap-yutani".into()).spawn(reap).map(drop))
+}
+
+/// [`spawn_detached`] with the reaper thread's spawner passed in, so the
+/// one failure that is hard to arrange for real — no thread to be had —
+/// is testable.
+fn spawn_reaped(
+    cmd: &mut Command,
+    spawn_thread: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>,
+) -> io::Result<oneshot::Receiver<Exit>> {
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).process_group(0);
-    let mut child = cmd.spawn()?;
+    let (child_tx, child_rx) = std::sync::mpsc::channel::<Child>();
     let (tx, rx) = oneshot::channel();
     let reap = move || {
+        // The sender was dropped without a child: its spawn failed.
+        let Ok(mut child) = child_rx.recv() else { return };
         let mut kept = Vec::new();
         if let Some(mut stderr) = child.stderr.take() {
             let mut buf = [0u8; 1024];
@@ -132,12 +151,11 @@ fn spawn_detached(cmd: &mut Command) -> io::Result<oneshot::Receiver<Exit>> {
             let _ = tx.send(Exit { status, stderr: String::from_utf8_lossy(&kept).into_owned() });
         }
     };
-    // A thread that cannot be spawned (`RLIMIT_NPROC`, cgroup `pids.max`)
-    // is an error to show, not a panic that takes the applet down; the
-    // child is left to init and its receiver reports nothing.
-    if let Err(err) = std::thread::Builder::new().name("reap-yutani".into()).spawn(reap) {
-        tracing::warn!("cannot spawn the reaper thread for yutani start: {err}");
-    }
+    spawn_thread(Box::new(reap))?;
+    // On `Err` here `child_tx` is dropped, and the thread's `recv` ends.
+    let child = cmd.spawn()?;
+    // Cannot fail: the thread holds its receiver until a child arrives.
+    let _ = child_tx.send(child);
     Ok(rx)
 }
 
@@ -311,6 +329,11 @@ impl cosmic::Application for Applet {
                 self.rates = Rates::default();
                 self.pending = None;
                 self.quitting = None;
+                // The rows a wait sits under are gone with the daemon; its
+                // reply still comes, and finds nothing to clear.
+                if self.note.as_ref().is_some_and(|n| n.progress) {
+                    self.note = None;
+                }
                 after_reply
             }
             Msg::Status(Err(IpcError::Failed(msg))) => {
@@ -322,7 +345,11 @@ impl cosmic::Application for Applet {
                 }
                 self.sampler.reset();
                 self.rates = Rates::default();
-                self.note(msg, None);
+                // A wait that is still on outranks a poll error: its reply
+                // is what ends it, and it must find its own note to clear.
+                if !self.note.as_ref().is_some_and(|n| n.progress) {
+                    self.note(msg, None);
+                }
                 after_reply
             }
             Msg::Press(Action::StartDaemon) => match spawn_detached(&mut start_command()) {
@@ -520,12 +547,46 @@ mod tests {
     }
 
     /// A command that cannot even start (no such binary) is a plain
-    /// `spawn` error, not a panic or a hang.
+    /// `spawn` error, not a panic or a hang — and the reaper thread, which
+    /// goes up before the child, must go away when no child comes, not
+    /// wait for one forever.
     #[test]
     fn spawn_detached_reports_a_missing_binary_as_an_error() {
         let mut cmd = Command::new("/no/such/binary-yutani-test");
-        let err = spawn_detached(&mut cmd).expect_err("must not exist");
+        let mut reaper = None;
+        let err = spawn_reaped(&mut cmd, |reap| {
+            reaper = Some(std::thread::spawn(reap));
+            Ok(())
+        })
+        .expect_err("must not exist");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let reaper = reaper.expect("the reaper is spawned before the child");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !reaper.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reaper.is_finished(), "a reaper with no child to reap must exit");
+    }
+
+    /// No reaper thread (`RLIMIT_NPROC`, cgroup `pids.max`) used to mean a
+    /// child nobody drained or waited on: its stderr pipe closed at once
+    /// and it sat as a zombie under the applet for as long as the applet
+    /// ran. The thread now goes up first, so its failure is a start that
+    /// did not happen — an error under the row, and no child at all.
+    #[test]
+    fn spawn_detached_without_a_reaper_thread_spawns_no_child() {
+        let before = zombie_children_of(std::process::id());
+        let marker = std::env::temp_dir().join(format!("yutani-applet-no-reaper-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", &format!("touch {}", marker.display())]);
+        let err = spawn_reaped(&mut cmd, |_reap| Err(io::Error::from(io::ErrorKind::WouldBlock)))
+            .expect_err("no thread, no start");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!marker.exists(), "the child must not have been spawned");
+        assert_eq!(zombie_children_of(std::process::id()), before);
+        let _ = std::fs::remove_file(&marker);
     }
 
     /// I1: a daemon that dies at startup (config parse error, "yutani is
@@ -678,5 +739,39 @@ mod tests {
         assert!(!note.progress);
         assert_eq!(note.action, Some(Action::Disconnect));
         assert!(note.text.contains("timeout"), "{}", note.text);
+    }
+
+    /// A poll that fails while a connect is in flight (a 3 s status
+    /// timeout, a `socket_path` error) must not replace "connecting…" with
+    /// its own error: the wait is still on, and the daemon's answer would
+    /// then find no progress note to clear and leave the red poll error
+    /// standing. With no wait on, the poll error is shown as before.
+    #[test]
+    fn a_failed_poll_does_not_overwrite_a_progress_note() {
+        let mut applet = applet();
+        let _ = applet.update(Msg::Press(Action::Connect));
+        let _ = applet.update(Msg::Status(Err(IpcError::Failed("timeout after 3000ms".into()))));
+        let note = applet.note.as_ref().expect("still waiting");
+        assert!(note.progress, "the poll error must not replace the wait: {}", note.text);
+        assert_eq!(note.action, Some(Action::Connect));
+        let _ = applet.update(Msg::Done(Action::Connect, Ok(())));
+        assert!(applet.note.is_none(), "the answer ends the wait");
+
+        let _ = applet.update(Msg::Status(Err(IpcError::Failed("timeout after 3000ms".into()))));
+        let note = applet.note.as_ref().expect("a poll error with nothing in flight is shown");
+        assert!(!note.progress && note.action.is_none(), "{}", note.text);
+    }
+
+    /// Quit pressed while a connect is still running: the daemon goes, the
+    /// polls go Offline and the menu collapses to "Start Yutani" — which
+    /// must not keep "connecting…" at its foot with no row to belong to.
+    #[test]
+    fn going_offline_clears_a_progress_note() {
+        let mut applet = applet();
+        let _ = applet.update(Msg::Status(Ok(connected())));
+        let _ = applet.update(Msg::Press(Action::Connect));
+        assert!(applet.note.as_ref().is_some_and(|n| n.progress));
+        let _ = applet.update(Msg::Status(Err(IpcError::Offline)));
+        assert!(applet.note.is_none(), "no row owns the wait once the daemon is gone");
     }
 }
