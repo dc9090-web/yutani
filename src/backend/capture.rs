@@ -394,6 +394,9 @@ impl ScreencopyHandler for AppData {
             WEnum::Value(FailureReason::Stopped) => {
                 tracing::info!("capture stopped by compositor");
                 capture.stop();
+                // Grey the thumbnail rather than leave the last frame looking
+                // live; the next `update_toplevel` restarts the session.
+                self.send_event(Event::CaptureUnavailable(capture.handle.clone()));
             }
             other => {
                 let mut guard = capture.session.lock().unwrap();
@@ -435,6 +438,9 @@ impl ScreencopyHandler for AppData {
     fn stopped(&mut self, _: &Connection, _: &QueueHandle<Self>, session: &CaptureSession) {
         if let Some(capture) = Capture::for_session(session) {
             capture.stop();
+            // As for `FailureReason::Stopped`: nothing else restarts this
+            // session, so the UI must not keep showing its last frame as live.
+            self.send_event(Event::CaptureUnavailable(capture.handle.clone()));
         }
     }
 }
