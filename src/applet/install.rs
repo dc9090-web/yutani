@@ -89,9 +89,35 @@ pub fn yutani_exe() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("yutani"))
 }
 
+/// `path` as a Desktop Entry `Exec=` argument. The spec splits `Exec` on
+/// whitespace and reads `%x` as a field code, `\`, `"`, `` ` `` and `$` as
+/// quoting syntax, so a path containing any of its reserved characters is
+/// wrapped in double quotes with those four backslash-escaped, and every
+/// `%` is doubled (field codes are expanded after unquoting). A plain path
+/// is returned unchanged, so the common entry stays readable.
+pub fn exec_quote(path: &str) -> String {
+    const RESERVED: &[char] =
+        &[' ', '\t', '\n', '"', '\'', '\\', '>', '<', '~', '|', '&', ';', '$', '*', '?', '#', '(', ')', '`'];
+    let percent_escaped = path.replace('%', "%%");
+    if !path.contains(RESERVED) {
+        return percent_escaped;
+    }
+    let mut quoted = String::with_capacity(percent_escaped.len() + 2);
+    quoted.push('"');
+    for c in percent_escaped.chars() {
+        if matches!(c, '"' | '`' | '$' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    quoted
+}
+
 /// The desktop entry, shaped like COSMIC's own applets
 /// (`/usr/share/applications/com.system76.CosmicApplet*.desktop`).
 pub fn desktop_entry(exec: &str) -> String {
+    let exec = exec_quote(exec);
     format!(
         "[Desktop Entry]\n\
          Name=Yutani\n\
@@ -115,6 +141,7 @@ pub fn desktop_entry(exec: &str) -> String {
 /// `hicolor/scalable/apps` — the handoff's app icon, and the one thing in
 /// the theme the shell will not recolour.
 pub fn launcher_entry(exec: &str) -> String {
+    let exec = exec_quote(exec);
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
@@ -380,6 +407,42 @@ mod tests {
     fn uninstall_on_a_clean_system_removes_nothing_and_does_not_fail() {
         let s = dirs("clean");
         assert_eq!(uninstall_from(&s.paths).unwrap(), 0);
+    }
+
+    /// A plain absolute path is written as it is: the common case must
+    /// stay byte-for-byte what the tests above expect.
+    #[test]
+    fn exec_quote_leaves_a_plain_path_alone() {
+        assert_eq!(exec_quote("/usr/local/bin/yutani-applet"), "/usr/local/bin/yutani-applet");
+    }
+
+    /// Desktop Entry `Exec=` splits on whitespace and reads `%x` as a field
+    /// code, so a binary under `~/Projects/EVE Tools` or a `%` in the path
+    /// must be quoted and escaped, or cosmic-panel execs nothing at all.
+    #[test]
+    fn exec_quote_quotes_a_space_and_doubles_a_percent() {
+        assert_eq!(
+            exec_quote("/home/d/Projects/EVE Tools/target/release/yutani-applet"),
+            "\"/home/d/Projects/EVE Tools/target/release/yutani-applet\""
+        );
+        assert_eq!(exec_quote("/opt/100%/yutani"), "/opt/100%%/yutani");
+        assert_eq!(exec_quote("/opt/50% off/yutani"), "\"/opt/50%% off/yutani\"");
+    }
+
+    /// Inside the quotes the spec's four characters are backslash-escaped.
+    #[test]
+    fn exec_quote_escapes_the_reserved_characters_inside_the_quotes() {
+        assert_eq!(exec_quote(r#"/a "b"/c\d/$e`f"#), r#""/a \"b\"/c\\d/\$e\`f""#);
+    }
+
+    /// The entries carry the quoted form, and a quoted path still ends up
+    /// followed by the launcher's ` start`.
+    #[test]
+    fn the_entries_quote_the_exec_path() {
+        let applet = desktop_entry("/home/d/EVE Tools/yutani-applet");
+        assert!(applet.lines().any(|l| l == "Exec=\"/home/d/EVE Tools/yutani-applet\""), "{applet}");
+        let launcher = launcher_entry("/home/d/EVE Tools/yutani");
+        assert!(launcher.lines().any(|l| l == "Exec=\"/home/d/EVE Tools/yutani\" start"), "{launcher}");
     }
 
     #[test]
