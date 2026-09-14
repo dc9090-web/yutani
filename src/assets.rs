@@ -16,12 +16,6 @@ pub const YUTANI_APP: &[u8] = include_bytes!("../assets/icons/yutani.svg");
 pub const YUTANI_APP_48: &[u8] = include_bytes!("../assets/icons/yutani-48.svg");
 pub const YUTANI_APP_32: &[u8] = include_bytes!("../assets/icons/yutani-32.svg");
 
-/// Popup decorations. Not icon-theme icons: they carry fixed colours from
-/// the handoff and are never tinted, so they are not installed.
-pub const PIN: &[u8] = include_bytes!("../assets/glyphs/pin.svg");
-pub const ARROW_UP: &[u8] = include_bytes!("../assets/glyphs/arrow-up.svg");
-pub const ARROW_DOWN: &[u8] = include_bytes!("../assets/glyphs/arrow-down.svg");
-
 /// The symbolic mark at any size: `…/icons/hicolor/symbolic/status`.
 pub const SYMBOLIC_DIR: &str = "symbolic/status";
 /// The solid 16 px mark: `…/icons/hicolor/16x16/status`.
@@ -126,12 +120,5 @@ mod tests {
             assert!(name.starts_with("y-"), "{name}");
             assert!(!ICONS.iter().any(|(d, n, _)| *d == dir && *n == name));
         }
-    }
-
-    #[test]
-    fn the_popup_glyphs_carry_the_handoff_stroke_colours() {
-        assert!(text(PIN).contains(r##"stroke="#9096A0""##));
-        assert!(text(ARROW_UP).contains(r##"stroke="#2FD6B0""##));
-        assert!(text(ARROW_DOWN).contains(r##"stroke="#5B9BFF""##));
     }
 }

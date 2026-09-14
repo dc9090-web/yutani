@@ -48,6 +48,31 @@ pub enum Modifier {
     Shift,
 }
 
+impl Modifier {
+    /// The name the popup and the settings chips print.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Modifier::Super => "Super",
+            Modifier::Ctrl => "Ctrl",
+            Modifier::Alt => "Alt",
+            Modifier::Shift => "Shift",
+        }
+    }
+}
+
+/// A keysym as the popup prints it: the arrow keys as arrows, anything
+/// else by its COSMIC name.
+pub fn key_symbol(keysym: &str) -> String {
+    match keysym {
+        "Right" => "→",
+        "Left" => "←",
+        "Up" => "↑",
+        "Down" => "↓",
+        other => other,
+    }
+    .to_string()
+}
+
 /// Keys for `yutani shortcuts install` (spec §7). `next`/`prev` are xkb
 /// keysym names as COSMIC writes them ("Right", "Left", "Tab", "a").
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +86,13 @@ pub struct ShortcutsConfig {
 impl Default for ShortcutsConfig {
     fn default() -> Self {
         Self { focus_prefix: vec![Modifier::Ctrl, Modifier::Alt], next: "Right".into(), prev: "Left".into() }
+    }
+}
+
+impl ShortcutsConfig {
+    /// The prefix as the popup and the chips print it: `Ctrl+Alt`.
+    pub fn prefix_label(&self) -> String {
+        self.focus_prefix.iter().map(Modifier::label).collect::<Vec<_>>().join("+")
     }
 }
 
@@ -521,6 +553,16 @@ mod tests {
         let c: Config = ron::from_str(text).unwrap();
         assert_eq!(c.mode, Mode::Floating);
         assert_eq!(c.dock_edge, Edge::Left);
+    }
+
+    #[test]
+    fn the_shortcut_hint_prints_the_prefix_and_arrow_keys() {
+        assert_eq!(ShortcutsConfig::default().prefix_label(), "Ctrl+Alt");
+        let s = ShortcutsConfig { focus_prefix: vec![Modifier::Super], ..Default::default() };
+        assert_eq!(s.prefix_label(), "Super");
+        assert_eq!(key_symbol("Right"), "→");
+        assert_eq!(key_symbol("Left"), "←");
+        assert_eq!(key_symbol("Tab"), "Tab");
     }
 
     #[test]

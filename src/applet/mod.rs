@@ -6,6 +6,7 @@
 pub mod client;
 pub mod display;
 pub mod format;
+pub mod history;
 pub mod icon;
 pub mod install;
 pub mod menu;
@@ -52,6 +53,8 @@ pub enum Action {
     Quit,
     /// Ask the daemon to open its settings window (spec §6).
     Preferences,
+    /// The settings window on its Layouts page (redesign spec §2).
+    LayoutsAndCharacters,
     /// Spawn the daemon (offline state only).
     StartDaemon,
 }
@@ -67,6 +70,7 @@ impl Action {
             Action::Focus(n) => Some(Request::Focus(*n)),
             Action::Quit => Some(Request::Quit),
             Action::Preferences => Some(Request::Settings),
+            Action::LayoutsAndCharacters => Some(Request::SettingsPage("layouts".into())),
             Action::StartDaemon => None,
         }
     }
@@ -198,6 +202,7 @@ mod tests {
         assert_eq!(Action::Focus(3).request(), Some(Request::Focus(3)));
         assert_eq!(Action::Quit.request(), Some(Request::Quit));
         assert_eq!(Action::Preferences.request(), Some(crate::ipc::Request::Settings));
+        assert_eq!(Action::LayoutsAndCharacters.request(), Some(crate::ipc::Request::SettingsPage("layouts".into())));
         assert_eq!(Action::StartDaemon.request(), None);
     }
 
@@ -206,7 +211,15 @@ mod tests {
     fn only_the_tunnel_actions_have_something_to_say_while_waiting() {
         assert_eq!(waiting_note(Action::Connect).as_deref(), Some("connecting… (up to 15 s)"));
         assert_eq!(waiting_note(Action::Disconnect).as_deref(), Some("disconnecting… (up to 15 s)"));
-        for action in [Action::ShowThumbs, Action::HideThumbs, Action::Focus(1), Action::Quit, Action::Preferences, Action::StartDaemon] {
+        for action in [
+            Action::ShowThumbs,
+            Action::HideThumbs,
+            Action::Focus(1),
+            Action::Quit,
+            Action::Preferences,
+            Action::LayoutsAndCharacters,
+            Action::StartDaemon,
+        ] {
             assert_eq!(waiting_note(action), None, "{action:?}");
         }
     }

@@ -33,6 +33,22 @@ pub enum Page {
     Steam,
 }
 
+impl Page {
+    /// The page an IPC `settings <page>` names; British and American
+    /// spellings of Behaviour both work.
+    pub fn from_name(name: &str) -> Option<Page> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "display" => Some(Page::Display),
+            "behavior" | "behaviour" => Some(Page::Behavior),
+            "layouts" => Some(Page::Layouts),
+            "characters" => Some(Page::Characters),
+            "tunnel" => Some(Page::Tunnel),
+            "steam" => Some(Page::Steam),
+            _ => None,
+        }
+    }
+}
+
 /// The tab strip, in order. `State::new` builds the segmented control from
 /// this, so the list *is* the window: a page missing here has no tab.
 pub const PAGES: [(&str, Page); 6] = [
@@ -842,6 +858,14 @@ mod tests {
     /// The tab strip is built from `PAGES`, so the list is the window: a
     /// page missing from it has no tab, and a tab with no page cannot be
     /// rendered.
+    #[test]
+    fn a_page_can_be_named_over_ipc() {
+        assert_eq!(Page::from_name("layouts"), Some(Page::Layouts));
+        assert_eq!(Page::from_name(" Behaviour "), Some(Page::Behavior));
+        assert_eq!(Page::from_name("behavior"), Some(Page::Behavior));
+        assert_eq!(Page::from_name("nope"), None);
+    }
+
     #[test]
     fn every_page_has_a_tab_in_the_documented_order() {
         assert_eq!(labels(&PAGES), vec!["Display", "Behavior", "Layouts", "Characters", "Tunnel", "Steam"]);

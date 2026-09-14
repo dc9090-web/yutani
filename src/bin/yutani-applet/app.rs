@@ -14,7 +14,8 @@ use cosmic::iced::{Rectangle, Subscription};
 use cosmic::surface::action::{app_popup, destroy_popup};
 
 use yutani::applet::client::{self, IpcError};
-use yutani::applet::display::{Display, OfflineTunnel, degrade, display};
+use yutani::applet::display::{Popover, degrade, popover};
+use yutani::applet::history::History;
 use yutani::applet::rate::{Rates, Sampler};
 use yutani::applet::{
     Action, PENDING_S, Poll, clip_note, note_visible, pending_done, poll_interval, start_command,
@@ -44,6 +45,10 @@ pub struct Applet {
     /// (or this deadline passes) describes a tunnel on its way down, so it
     /// is degraded rather than believed. See `Msg::Done(Action::Quit, ..)`.
     pub quitting: Option<Instant>,
+    /// The throughput graph's last 34 samples, one per poll.
+    pub history: History,
+    /// The `⋯` overflow menu is showing; closes with the popup.
+    pub menu_open: bool,
     /// The last `err …` reply, shown for 3 s — or what a tunnel action is
     /// still doing, shown until the daemon answers it.
     pub note: Option<Note>,
@@ -72,6 +77,11 @@ pub enum Msg {
     Press(Action),
     /// A pressed action finished.
     Done(Action, Result<(), String>),
+    /// The header's master switch: on starts the daemon, off quits it
+    /// (which takes the tunnel down first).
+    ToggleService(bool),
+    /// The `⋯` button.
+    ToggleMenu,
     /// Popup create/destroy, handled by libcosmic.
     Surface(cosmic::surface::Action<Msg>),
     PopupClosed(Id),
@@ -183,17 +193,8 @@ impl Applet {
             .is_some_and(|(want, until)| still_pending(until, Instant::now(), pending_done(want, observed)))
     }
 
-    pub fn display(&self) -> Display {
-        // Offline, the WireGuard row is read off the worker's status file
-        // and the unit file — cheap, unprivileged, and only when there is
-        // no daemon to ask.
-        let offline = if self.status.is_some() {
-            OfflineTunnel::default()
-        } else {
-            use yutani::tunnel::control::{iface_present, installed, read_tunnel_file};
-            OfflineTunnel { link_up: read_tunnel_file().is_some_and(|f| f.up) && iface_present(), installed: installed() }
-        };
-        display(self.status.as_ref(), self.rates, offline)
+    pub fn popover(&self) -> Popover {
+        popover(self.status.as_ref(), self.rates, self.history.bars())
     }
 
     /// Ask for a `status` now, or — if one is already outstanding — leave
@@ -269,6 +270,8 @@ impl cosmic::Application for Applet {
             pending: None,
             poll: Poll::default(),
             quitting: None,
+            history: History::new(),
+            menu_open: false,
             note: None,
         };
         // Through the guard like every other poll, so the very first reply
@@ -318,6 +321,7 @@ impl cosmic::Application for Applet {
                     self.sampler.reset();
                     self.rates = Rates::default();
                 }
+                self.history.push(self.rates);
                 // The deadline is the upper bound; the daemon agreeing ends
                 // it sooner, which is the common case.
                 if let Some((want, until)) = self.pending
@@ -332,6 +336,7 @@ impl cosmic::Application for Applet {
                 self.status = None;
                 self.sampler.reset();
                 self.rates = Rates::default();
+                self.history.clear();
                 self.pending = None;
                 self.quitting = None;
                 // The rows a wait sits under are gone with the daemon; its
@@ -350,12 +355,18 @@ impl cosmic::Application for Applet {
                 }
                 self.sampler.reset();
                 self.rates = Rates::default();
+                self.history.push(Rates::default());
                 // A wait that is still on outranks a poll error: its reply
                 // is what ends it, and it must find its own note to clear.
                 if !self.note.as_ref().is_some_and(|n| n.progress) {
                     self.note(msg, None);
                 }
                 after_reply
+            }
+            Msg::ToggleService(on) => self.update(Msg::Press(if on { Action::StartDaemon } else { Action::Quit })),
+            Msg::ToggleMenu => {
+                self.menu_open = !self.menu_open;
+                Task::none()
             }
             Msg::Press(Action::StartDaemon) => match spawn_detached(&mut start_command()) {
                 // Watch it for the window off the UI thread: a start that
@@ -428,6 +439,7 @@ impl cosmic::Application for Applet {
             Msg::PopupClosed(id) => {
                 if self.popup == Some(id) {
                     self.popup = None;
+                    self.menu_open = false;
                 }
                 Task::none()
             }
@@ -466,6 +478,10 @@ pub fn open_popup_message(bounds: Rectangle, offset: cosmic::iced::Vector) -> Ms
             let parent = state.core.main_window_id().unwrap_or(Id::RESERVED);
             let mut settings =
                 state.core.applet.get_popup_settings(parent, new_id, None, None, None);
+            // libcosmic pins every applet popup to 360 px; the design is 340.
+            let width = yutani::applet::theme::POPOVER_WIDTH as f32;
+            settings.positioner.size_limits =
+                cosmic::iced::Limits::NONE.min_height(1.0).min_width(width).max_width(width).max_height(1080.0);
             settings.positioner.anchor_rect = Rectangle {
                 x: (bounds.x - offset.x) as i32,
                 y: (bounds.y - offset.y) as i32,
@@ -660,7 +676,7 @@ mod tests {
     fn connected() -> Status {
         use yutani::tunnel::status::{Status, TunnelStatus};
         let tunnel = TunnelStatus { installed: true, connected: true, handshake_age_s: Some(4), ..Default::default() };
-        Status { clients: vec![], hidden: false, tunnel }
+        Status { clients: vec![], hidden: false, tunnel, shortcuts: None }
     }
 
     /// M1: `quit` is acknowledged at once but the daemon spends up to 10 s

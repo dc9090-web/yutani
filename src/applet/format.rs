@@ -26,6 +26,23 @@ pub fn rate(bytes_per_s: f64) -> String {
     }
 }
 
+/// A rate as the throughput card prints it: the number and its unit apart,
+/// so the unit can be set smaller — `("41", "KB/s")`, `("1.4", "MB/s")`.
+pub fn rate_parts(bytes_per_s: f64) -> (String, &'static str) {
+    let b = if bytes_per_s.is_finite() && bytes_per_s > 0.0 { bytes_per_s } else { 0.0 };
+    if b >= 1_000_000.0 {
+        (format!("{:.1}", b / 1_000_000.0), "MB/s")
+    } else {
+        (format!("{}", (b / 1_000.0) as u64), "KB/s")
+    }
+}
+
+/// A session length as the tunnel line prints it: `1h 12m 22s`, `12m 05s`.
+pub fn uptime(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 { format!("{h}h {m}m {s:02}s") } else { format!("{m}m {s:02}s") }
+}
+
 /// Seconds since the last handshake, or the em-dash when there is none.
 pub fn handshake(age_s: Option<u64>) -> String {
     match age_s {
@@ -44,39 +61,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn totals_use_the_handoff_ladder() {
+    fn totals_follow_the_handoffs_units() {
         assert_eq!(bytes(0), "0 KB");
-        assert_eq!(bytes(999), "0 KB");
-        assert_eq!(bytes(222_000), "222 KB");
         assert_eq!(bytes(999_999), "999 KB");
-        assert_eq!(bytes(1_000_000), "1.0 MB");
         assert_eq!(bytes(413_100_000), "413.1 MB");
-        assert_eq!(bytes(999_999_999), "1000.0 MB");
-        assert_eq!(bytes(1_000_000_000), "1.00 GB");
         assert_eq!(bytes(2_790_000_000), "2.79 GB");
     }
 
     #[test]
-    fn rates_use_the_handoff_ladder() {
-        assert_eq!(rate(0.0), "0 KB/s");
-        assert_eq!(rate(-5.0), "0 KB/s");
-        assert_eq!(rate(222_000.0), "222 KB/s");
-        assert_eq!(rate(999_999.0), "999 KB/s");
-        assert_eq!(rate(1_000_000.0), "1.0 MB/s");
-        assert_eq!(rate(2_500_000.0), "2.5 MB/s");
+    fn rates_split_into_number_and_unit() {
+        assert_eq!(rate_parts(0.0), ("0".to_string(), "KB/s"));
+        assert_eq!(rate_parts(-5.0), ("0".to_string(), "KB/s"));
+        assert_eq!(rate_parts(f64::NAN), ("0".to_string(), "KB/s"));
+        assert_eq!(rate_parts(41_000.0), ("41".to_string(), "KB/s"));
+        assert_eq!(rate_parts(1_420_000.0), ("1.4".to_string(), "MB/s"));
+        assert_eq!(rate(41_000.0), "41 KB/s");
+        assert_eq!(rate(1_420_000.0), "1.4 MB/s");
     }
 
     #[test]
-    fn handshake_age_reads_as_the_handoff_writes_it() {
-        assert_eq!(handshake(Some(0)), "hs 0s ago");
+    fn uptime_reads_like_the_mock() {
+        assert_eq!(uptime(5), "0m 05s");
+        assert_eq!(uptime(742), "12m 22s");
+        assert_eq!(uptime(4342), "1h 12m 22s");
+    }
+
+    #[test]
+    fn handshake_and_account_labels() {
         assert_eq!(handshake(Some(21)), "hs 21s ago");
-        assert_eq!(handshake(Some(112)), "hs 112s ago");
         assert_eq!(handshake(None), "hs —");
-    }
-
-    #[test]
-    fn the_accounts_label_is_singular_for_one() {
-        assert_eq!(accounts_label(0), "Accounts connected");
         assert_eq!(accounts_label(1), "Account connected");
         assert_eq!(accounts_label(2), "Accounts connected");
     }

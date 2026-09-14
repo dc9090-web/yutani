@@ -1,159 +1,215 @@
-//! Everything the popup's read-only area shows, as finished strings. The
+//! Everything the popover shows, as finished strings and small enums. The
 //! view renders this and decides nothing; the rules live here where they
-//! are tested. Spec §4.1–§4.3.
+//! are tested. Redesign spec §2 / handoff "Screen 1".
 
+use crate::applet::Action;
 use crate::applet::format;
 use crate::applet::icon::HANDSHAKE_STALE_S;
 use crate::applet::rate::Rates;
-use crate::applet::theme::DASH;
-use crate::tunnel::status::Status;
+use crate::tunnel::status::{ShortcutHint, Status};
 
-/// One row of the services band (2026-09-14 spec §1): a dot, a name, a
-/// note. `up` is the dot's colour — green or red, nothing in between.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Service {
-    pub name: &'static str,
-    pub up: bool,
-    pub note: &'static str,
-}
+pub const DASH: &str = "—";
 
-/// What the applet can see of the tunnel *without* the daemon: the worker's
-/// status file says whether the link is up, the unit file whether the
-/// tunnel is installed at all. Only consulted in the offline state.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct OfflineTunnel {
-    pub link_up: bool,
-    pub installed: bool,
-}
-
+/// One row of the accounts card: the hotkey digit, the character, and
+/// whether it is the one the keyboard is driving.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Display {
-    /// The daemon answered.
-    pub online: bool,
-    /// The services band: Yutani (the daemon), then WireGuard (the tunnel).
-    pub services: [Service; 2],
-    /// The tunnel is up *and* handshaked within the last
-    /// [`HANDSHAKE_STALE_S`] seconds — the handoff's "Connected" state,
-    /// which drives the dot, its glow, the colours and the menu label.
-    pub connected: bool,
-    pub status_text: &'static str,
-    pub location: String,
-    pub iface: String,
-    pub accounts: usize,
-    pub accounts_label: &'static str,
-    pub address: String,
-    pub handshake: String,
-    pub up_total: String,
-    pub up_rate: String,
-    pub down_total: String,
-    pub down_rate: String,
-    /// Thumbnails are hidden (drives the Show/Hide row).
-    pub hidden: bool,
-    /// A tunnel conf has been installed (a false disables Connect).
-    pub installed: bool,
+pub struct AccountRow {
+    pub index: usize,
+    pub name: String,
+    pub focused: bool,
 }
 
-/// Stale the last good reply so it presents as Disconnected (spec §7).
+/// The small button in the accounts card's footer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThumbsButton {
+    Hide,
+    Show,
+    /// The service is stopped: dim and inert.
+    Off,
+}
+
+impl ThumbsButton {
+    pub fn label(self) -> &'static str {
+        match self {
+            ThumbsButton::Hide => "Hide thumbnails",
+            ThumbsButton::Show => "Show thumbnails",
+            ThumbsButton::Off => "Thumbnails off",
+        }
+    }
+
+    pub fn action(self) -> Option<Action> {
+        match self {
+            ThumbsButton::Hide => Some(Action::HideThumbs),
+            ThumbsButton::Show => Some(Action::ShowThumbs),
+            ThumbsButton::Off => None,
+        }
+    }
+}
+
+/// The tunnel status line: dot, name, city, uptime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TunnelLine {
+    /// The handoff's "connected": link up *and* a fresh handshake. Drives
+    /// the dot, its glow ring and the uptime's colour.
+    pub on: bool,
+    pub location: String,
+    /// `1h 12m 22s` while the link is up, `idle` otherwise.
+    pub uptime: String,
+}
+
+/// The throughput card.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Throughput {
+    /// Number and unit, set apart so the unit can be smaller.
+    pub up: (String, &'static str),
+    pub down: (String, &'static str),
+    /// `(up, down)` per column in `0..=1`, oldest first.
+    pub bars: Vec<(f32, f32)>,
+    pub sent: String,
+    pub received: String,
+}
+
+/// The one primary action, in the handoff's three treatments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Primary {
+    /// Muted surface, dim text, no press.
+    Inert(&'static str),
+    Standard(&'static str, Action),
+    Accent(&'static str, Action),
+}
+
+impl Primary {
+    pub fn label(self) -> &'static str {
+        match self {
+            Primary::Inert(l) | Primary::Standard(l, _) | Primary::Accent(l, _) => l,
+        }
+    }
+
+    pub fn action(self) -> Option<Action> {
+        match self {
+            Primary::Inert(_) => None,
+            Primary::Standard(_, a) | Primary::Accent(_, a) => Some(a),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Popover {
+    /// The daemon answered: the master switch is on.
+    pub running: bool,
+    pub state_word: &'static str,
+    pub accounts: Vec<AccountRow>,
+    /// The accounts card's count, mono.
+    pub count: String,
+    /// `Ctrl+Alt+1…4 · Ctrl+Alt+←/→`, or `hotkeys inactive`.
+    pub hint: String,
+    pub thumbs: ThumbsButton,
+    pub tunnel: TunnelLine,
+    pub throughput: Throughput,
+    /// `ENDPOINT` and `PEER`.
+    pub tiles: [(&'static str, String); 2],
+    pub primary: Primary,
+}
+
+/// Stale the last good reply so it presents as disconnected (spec §7).
 ///
 /// A poll that fails after a success keeps the daemon's last `status` on
 /// screen — the totals are counters and must not jump back to zero — but
 /// that reply is now old news, so it may not go on claiming a live tunnel
-/// with a fresh handshake. Dropping the link and the handshake age is
-/// enough: [`display`] derives the status text, the dot, the address and
-/// the rates from them.
+/// with a fresh handshake.
 pub fn degrade(status: &mut Status) {
     status.tunnel.connected = false;
     status.tunnel.handshake_age_s = None;
+    status.tunnel.up_for_s = None;
 }
 
-/// The services band's two rows. Yutani is up when the daemon answered;
-/// WireGuard is up on exactly the header's "Connected" (link up and a fresh
-/// handshake), and its note says which of the red states it is in.
-fn services(status: Option<&Status>, connected: bool, offline: OfflineTunnel) -> [Service; 2] {
-    let yutani = Service { name: "Yutani", up: status.is_some(), note: if status.is_some() { "running" } else { "not running" } };
-    let wireguard = match status {
-        Some(s) => {
-            let t = &s.tunnel;
-            let note = if connected {
-                "connected"
-            } else if !t.installed {
-                "not installed"
-            } else if t.failed {
-                "failed"
-            } else if t.connected {
-                "no handshake"
-            } else {
-                "disconnected"
-            };
-            Service { name: "WireGuard", up: connected, note }
-        }
-        None => Service {
-            name: "WireGuard",
-            up: offline.link_up,
-            note: if offline.link_up {
-                "connected"
-            } else if offline.installed {
-                "disconnected"
-            } else {
-                "not installed"
-            },
-        },
+/// The accounts card's footer hint, from the real bound prefix and the
+/// real client count — never hardcoded. With nothing running the digits
+/// are the whole range the shortcuts are installed for.
+pub fn hotkey_hint(hint: Option<&ShortcutHint>, clients: usize) -> String {
+    let Some(h) = hint else { return "hotkeys active".to_string() };
+    let digits = match clients {
+        0 => "1…9".to_string(),
+        1 => "1".to_string(),
+        n => format!("1…{}", n.min(9)),
     };
-    [yutani, wireguard]
+    format!("{p}+{digits} · {p}+{prev}/{next}", p = h.prefix, prev = h.prev, next = h.next)
 }
 
-pub fn display(status: Option<&Status>, rates: Rates, offline: OfflineTunnel) -> Display {
+/// The popover for `status` (`None` = the service is stopped), the live
+/// rates, and the graph's bars.
+pub fn popover(status: Option<&Status>, rates: Rates, bars: Vec<(f32, f32)>) -> Popover {
     let Some(s) = status else {
-        return Display {
-            online: false,
-            services: services(None, false, offline),
-            connected: false,
-            status_text: "Disconnected",
-            location: DASH.to_string(),
-            iface: crate::tunnel::IFACE.to_string(),
-            accounts: 0,
-            accounts_label: format::accounts_label(0),
-            address: DASH.to_string(),
-            handshake: format::handshake(None),
-            up_total: format::bytes(0),
-            up_rate: format::rate(0.0),
-            down_total: format::bytes(0),
-            down_rate: format::rate(0.0),
-            hidden: false,
-            installed: false,
+        // Stopping the service takes the tunnel idle with it: no part of
+        // the popover may claim traffic is flowing while the overlay is
+        // down (handoff invariant), whatever the worker is doing.
+        return Popover {
+            running: false,
+            state_word: "Stopped",
+            accounts: Vec::new(),
+            count: "0".to_string(),
+            hint: "hotkeys inactive".to_string(),
+            thumbs: ThumbsButton::Off,
+            tunnel: TunnelLine { on: false, location: DASH.to_string(), uptime: "idle".to_string() },
+            throughput: Throughput {
+                up: format::rate_parts(0.0),
+                down: format::rate_parts(0.0),
+                bars,
+                sent: format::bytes(0),
+                received: format::bytes(0),
+            },
+            tiles: [("ENDPOINT", DASH.to_string()), ("PEER", crate::tunnel::IFACE.to_string())],
+            primary: Primary::Inert("Start Yutani to route traffic"),
         };
     };
     let t = &s.tunnel;
-    // "Connected" is link-up *and* a fresh handshake (spec §4.1); a link
-    // that is up but stale reads Disconnected while the panel icon shows
-    // the attention badge.
-    let connected = t.connected && t.handshake_age_s.is_some_and(|age| age < HANDSHAKE_STALE_S);
-    let live = |r: f64| if t.connected { format::rate(r) } else { format::rate(0.0) };
-    Display {
-        online: true,
-        services: services(status, connected, offline),
-        connected,
-        status_text: if connected { "Connected" } else { "Disconnected" },
-        location: t.location.clone(),
-        iface: t.iface.clone(),
-        accounts: s.clients.len(),
-        accounts_label: format::accounts_label(s.clients.len()),
-        // Spec §4.2's "tunnel IP" is the address the world sees EVE at, so
-        // the public exit address wins whenever the worker has one. The
-        // internal 10.2.0.2 is the fallback — it is at least *an* answer
-        // while the first lookup is in flight, or against a daemon too old
-        // to send the exit address at all.
-        address: match (t.connected, t.exit_address.as_deref().or(t.address.as_deref())) {
-            (true, Some(addr)) => addr.to_string(),
-            _ => DASH.to_string(),
+    let fresh = t.connected && t.handshake_age_s.is_some_and(|age| age < HANDSHAKE_STALE_S);
+    let live = |r: f64| if t.connected { r } else { 0.0 };
+    let accounts = s
+        .clients
+        .iter()
+        .enumerate()
+        .map(|(i, c)| AccountRow { index: i + 1, name: c.name.clone(), focused: c.active })
+        .collect::<Vec<_>>();
+    let endpoint = if t.connected {
+        t.exit_address
+            .clone()
+            .or_else(|| t.endpoint.as_ref().map(|e| e.rsplit_once(':').map_or(e.as_str(), |(host, _)| host).to_string()))
+            .unwrap_or_else(|| DASH.to_string())
+    } else {
+        DASH.to_string()
+    };
+    Popover {
+        running: true,
+        state_word: "Running",
+        count: accounts.len().to_string(),
+        hint: hotkey_hint(s.shortcuts.as_ref(), accounts.len()),
+        accounts,
+        thumbs: if s.hidden { ThumbsButton::Show } else { ThumbsButton::Hide },
+        tunnel: TunnelLine {
+            on: fresh,
+            location: t.location.clone(),
+            uptime: if t.connected {
+                t.up_for_s.map_or_else(|| DASH.to_string(), format::uptime)
+            } else {
+                "idle".to_string()
+            },
         },
-        handshake: format::handshake(if t.connected { t.handshake_age_s } else { None }),
-        up_total: format::bytes(t.tx_bytes),
-        up_rate: live(rates.tx),
-        down_total: format::bytes(t.rx_bytes),
-        down_rate: live(rates.rx),
-        hidden: s.hidden,
-        installed: t.installed,
+        throughput: Throughput {
+            up: format::rate_parts(live(rates.tx)),
+            down: format::rate_parts(live(rates.rx)),
+            bars,
+            sent: format::bytes(t.tx_bytes),
+            received: format::bytes(t.rx_bytes),
+        },
+        tiles: [("ENDPOINT", endpoint), ("PEER", t.iface.clone())],
+        primary: if !t.installed {
+            Primary::Inert("No tunnel installed")
+        } else if t.connected {
+            Primary::Standard("Disconnect tunnel", Action::Disconnect)
+        } else {
+            Primary::Accent("Connect tunnel", Action::Connect)
+        },
     }
 }
 
@@ -163,11 +219,13 @@ mod tests {
     use crate::applet::rate::Rates;
     use crate::tunnel::status::{ClientStatus, Status, TunnelStatus};
 
+    fn hint() -> ShortcutHint {
+        ShortcutHint { prefix: "Ctrl+Alt".into(), next: "→".into(), prev: "←".into() }
+    }
+
     fn status(connected: bool, handshake_age_s: Option<u64>, clients: usize) -> Status {
         Status {
-            clients: (0..clients)
-                .map(|i| ClientStatus { name: format!("Pilot{i}"), active: i == 0 })
-                .collect(),
+            clients: (0..clients).map(|i| ClientStatus { name: format!("Pilot{i}"), active: i == 1 }).collect(),
             hidden: false,
             tunnel: TunnelStatus {
                 installed: true,
@@ -177,155 +235,123 @@ mod tests {
                 address: Some("10.2.0.2".into()),
                 endpoint: Some("198.51.100.10:51820".into()),
                 handshake_age_s,
-                up_for_s: None,
+                up_for_s: connected.then_some(742),
                 failed: false,
-                exit_address: None,
+                exit_address: connected.then(|| "203.0.113.42".to_string()),
                 rx_bytes: 413_100_000,
                 tx_bytes: 2_790_000_000,
             },
+            shortcuts: Some(hint()),
         }
     }
 
+    fn flat() -> Vec<(f32, f32)> {
+        vec![(0.0, 0.0); 34]
+    }
+
     #[test]
-    fn a_healthy_tunnel_shows_everything_the_handoff_asks_for() {
+    fn a_running_service_with_a_healthy_tunnel_fills_every_section() {
         let s = status(true, Some(21), 3);
-        let d = display(Some(&s), Rates { rx: 222_000.0, tx: 41_000.0 }, OfflineTunnel::default());
-        assert!(d.online && d.connected && d.installed);
-        assert_eq!(d.status_text, "Connected");
-        assert_eq!(d.location, "London");
-        assert_eq!(d.iface, "yutani0");
-        assert_eq!((d.accounts, d.accounts_label), (3, "Accounts connected"));
-        assert_eq!(d.address, "10.2.0.2");
-        assert_eq!(d.handshake, "hs 21s ago");
-        assert_eq!((d.up_total.as_str(), d.up_rate.as_str()), ("2.79 GB", "41 KB/s"));
-        assert_eq!((d.down_total.as_str(), d.down_rate.as_str()), ("413.1 MB", "222 KB/s"));
-        assert!(!d.hidden);
+        let p = popover(Some(&s), Rates { rx: 222_000.0, tx: 41_000.0 }, flat());
+        assert!(p.running);
+        assert_eq!(p.state_word, "Running");
+        assert_eq!(p.accounts.len(), 3);
+        assert_eq!(p.accounts[1], AccountRow { index: 2, name: "Pilot1".into(), focused: true });
+        assert!(!p.accounts[0].focused && !p.accounts[2].focused);
+        assert_eq!(p.count, "3");
+        assert_eq!(p.hint, "Ctrl+Alt+1…3 · Ctrl+Alt+←/→");
+        assert_eq!(p.thumbs, ThumbsButton::Hide);
+        assert_eq!(p.tunnel, TunnelLine { on: true, location: "London".into(), uptime: "12m 22s".into() });
+        assert_eq!(p.throughput.up, ("41".to_string(), "KB/s"));
+        assert_eq!(p.throughput.down, ("222".to_string(), "KB/s"));
+        assert_eq!((p.throughput.sent.as_str(), p.throughput.received.as_str()), ("2.79 GB", "413.1 MB"));
+        assert_eq!(p.throughput.bars.len(), 34);
+        assert_eq!(p.tiles[0], ("ENDPOINT", "203.0.113.42".to_string()));
+        assert_eq!(p.tiles[1], ("PEER", "yutani0".to_string()));
+        assert_eq!(p.primary, Primary::Standard("Disconnect tunnel", Action::Disconnect));
     }
 
-    /// The band's right column is the *public* exit address when there is
-    /// one: 10.2.0.2 is an implementation detail of the tunnel, not the IP
-    /// the user is asking about.
+    /// The handoff's invariant: a stopped service takes the tunnel idle
+    /// with it — dot off, uptime "idle", rates 0, tiles `—`, the primary
+    /// button inert, and no claim of traffic anywhere.
     #[test]
-    fn the_band_prefers_the_public_exit_address_over_the_internal_one() {
-        let mut s = status(true, Some(21), 1);
-        s.tunnel.exit_address = Some("198.51.100.10".into());
-        assert_eq!(display(Some(&s), Rates::default(), OfflineTunnel::default()).address, "198.51.100.10");
-
-        // No lookup yet (or an older daemon): the internal address is still
-        // better than a dash.
-        s.tunnel.exit_address = None;
-        assert_eq!(display(Some(&s), Rates::default(), OfflineTunnel::default()).address, "10.2.0.2");
-
-        // Neither: a dash, not an empty gap.
-        s.tunnel.address = None;
-        assert_eq!(display(Some(&s), Rates::default(), OfflineTunnel::default()).address, DASH);
-
-        // Nothing is up, so neither address is shown.
-        let mut down = status(false, None, 1);
-        down.tunnel.exit_address = Some("198.51.100.10".into());
-        assert_eq!(display(Some(&down), Rates::default(), OfflineTunnel::default()).address, DASH);
-    }
-
-    #[test]
-    fn one_account_is_singular() {
-        let s = status(true, Some(1), 1);
-        assert_eq!(display(Some(&s), Rates::default(), OfflineTunnel::default()).accounts_label, "Account connected");
+    fn a_stopped_service_reads_idle_everywhere() {
+        let p = popover(None, Rates { rx: 999.0, tx: 999.0 }, flat());
+        assert!(!p.running);
+        assert_eq!(p.state_word, "Stopped");
+        assert!(p.accounts.is_empty());
+        assert_eq!((p.count.as_str(), p.hint.as_str()), ("0", "hotkeys inactive"));
+        assert_eq!(p.thumbs, ThumbsButton::Off);
+        assert_eq!(p.thumbs.action(), None);
+        assert_eq!(p.tunnel, TunnelLine { on: false, location: DASH.into(), uptime: "idle".into() });
+        assert_eq!(p.throughput.up, ("0".to_string(), "KB/s"));
+        assert_eq!(p.tiles[0].1, DASH);
+        assert_eq!(p.tiles[1].1, "yutani0");
+        assert_eq!(p.primary, Primary::Inert("Start Yutani to route traffic"));
+        assert_eq!(p.primary.action(), None);
     }
 
     #[test]
-    fn disconnecting_freezes_the_totals_and_zeroes_everything_live() {
-        let s = status(false, None, 2);
-        let d = display(Some(&s), Rates { rx: 999_000.0, tx: 999_000.0 }, OfflineTunnel::default());
-        assert!(d.online && !d.connected);
-        assert_eq!(d.status_text, "Disconnected");
-        assert_eq!(d.address, "—");
-        assert_eq!(d.handshake, "hs —");
+    fn a_disconnected_tunnel_offers_connect_in_the_accent_and_shows_no_endpoint() {
+        let s = status(false, None, 1);
+        let p = popover(Some(&s), Rates { rx: 5.0, tx: 5.0 }, flat());
+        assert_eq!(p.primary, Primary::Accent("Connect tunnel", Action::Connect));
+        assert_eq!(p.tunnel.uptime, "idle");
+        assert!(!p.tunnel.on);
+        assert_eq!(p.tiles[0].1, DASH);
+        assert_eq!(p.throughput.up, ("0".to_string(), "KB/s"), "rates are zero while down");
         // Counters, not gauges: the totals stay where they stopped.
-        assert_eq!((d.up_total.as_str(), d.down_total.as_str()), ("2.79 GB", "413.1 MB"));
-        assert_eq!((d.up_rate.as_str(), d.down_rate.as_str()), ("0 KB/s", "0 KB/s"));
+        assert_eq!(p.throughput.sent, "2.79 GB");
+        assert_eq!(p.hint, "Ctrl+Alt+1 · Ctrl+Alt+←/→");
+    }
+
+    /// Up but silent: the link is there (Disconnect is offered, the uptime
+    /// counts) but the dot is off — the header's "Connected" needs a fresh
+    /// handshake.
+    #[test]
+    fn a_stale_handshake_keeps_the_link_but_turns_the_dot_off() {
+        let s = status(true, Some(180), 1);
+        let p = popover(Some(&s), Rates::default(), flat());
+        assert!(!p.tunnel.on);
+        assert_eq!(p.tunnel.uptime, "12m 22s");
+        assert_eq!(p.primary, Primary::Standard("Disconnect tunnel", Action::Disconnect));
     }
 
     #[test]
-    fn a_stale_handshake_reads_as_disconnected_even_though_the_link_is_up() {
-        let s = status(true, Some(180), 1);
-        let d = display(Some(&s), Rates::default(), OfflineTunnel::default());
-        assert!(!d.connected);
-        assert_eq!(d.status_text, "Disconnected");
-        assert_eq!(d.handshake, "hs 180s ago");
-        // The link really is up, so the address still shows.
-        assert_eq!(d.address, "10.2.0.2");
+    fn an_uninstalled_tunnel_has_an_inert_primary_button() {
+        let mut s = status(false, None, 0);
+        s.tunnel.installed = false;
+        let p = popover(Some(&s), Rates::default(), flat());
+        assert_eq!(p.primary, Primary::Inert("No tunnel installed"));
+        assert_eq!(p.hint, "Ctrl+Alt+1…9 · Ctrl+Alt+←/→", "no clients: the whole installed range");
     }
 
-    /// Spec §7: a poll that fails after a success leaves the last reply on
-    /// screen, but that reply is now stale — it must not keep claiming a
-    /// live tunnel with live rates.
+    #[test]
+    fn the_endpoint_tile_falls_back_to_the_peers_host_and_the_hint_to_a_generic_line() {
+        let mut s = status(true, Some(2), 12);
+        s.tunnel.exit_address = None;
+        s.shortcuts = None;
+        let p = popover(Some(&s), Rates::default(), flat());
+        assert_eq!(p.tiles[0].1, "198.51.100.10");
+        assert_eq!(p.hint, "hotkeys active", "an older daemon sends no prefix");
+        s.shortcuts = Some(hint());
+        assert_eq!(popover(Some(&s), Rates::default(), flat()).hint, "Ctrl+Alt+1…9 · Ctrl+Alt+←/→", "capped at 9");
+        s.hidden = true;
+        assert_eq!(popover(Some(&s), Rates::default(), flat()).thumbs, ThumbsButton::Show);
+    }
+
     #[test]
     fn a_failed_poll_degrades_the_last_reply_to_disconnected() {
         let mut s = status(true, Some(21), 3);
         degrade(&mut s);
-        let d = display(Some(&s), Rates { rx: 222_000.0, tx: 41_000.0 }, OfflineTunnel::default());
-        // The daemon still answered once, so this is not the offline state.
-        assert!(d.online && !d.connected);
-        assert_eq!(d.status_text, "Disconnected");
-        assert_eq!((d.address.as_str(), d.handshake.as_str()), ("—", "hs —"));
-        assert_eq!((d.up_rate.as_str(), d.down_rate.as_str()), ("0 KB/s", "0 KB/s"));
-        // Counters, not gauges: the totals stay where the last good poll
-        // left them, as do the accounts and the location.
-        assert_eq!((d.up_total.as_str(), d.down_total.as_str()), ("2.79 GB", "413.1 MB"));
-        assert_eq!((d.accounts, d.location.as_str()), (3, "London"));
-        assert!(d.installed);
-    }
-
-    /// Degrading twice is degrading once — `update` calls it on every failed
-    /// poll, not only the first.
-    #[test]
-    fn degrading_is_idempotent() {
-        let mut once = status(true, Some(21), 1);
-        degrade(&mut once);
-        let mut twice = once.clone();
+        let p = popover(Some(&s), Rates { rx: 222_000.0, tx: 41_000.0 }, flat());
+        assert!(p.running && !p.tunnel.on);
+        assert_eq!(p.tunnel.uptime, "idle");
+        assert_eq!(p.throughput.up, ("0".to_string(), "KB/s"));
+        assert_eq!(p.throughput.sent, "2.79 GB");
+        assert_eq!(p.accounts.len(), 3);
+        let mut twice = s.clone();
         degrade(&mut twice);
-        assert_eq!(once, twice);
-    }
-
-    /// 2026-09-14 spec §1: two dots, green or red, with the reason in a
-    /// note. WireGuard is green on exactly the header's "Connected".
-    #[test]
-    fn the_services_band_says_which_of_the_two_is_up_and_why_not() {
-        let svc = |s: &Status| display(Some(s), Rates::default(), OfflineTunnel::default()).services;
-        let up = |name, note| Service { name, up: true, note };
-        let down = |name, note| Service { name, up: false, note };
-
-        assert_eq!(svc(&status(true, Some(21), 1)), [up("Yutani", "running"), up("WireGuard", "connected")]);
-        assert_eq!(svc(&status(true, Some(180), 1)), [up("Yutani", "running"), down("WireGuard", "no handshake")]);
-        assert_eq!(svc(&status(false, None, 1)), [up("Yutani", "running"), down("WireGuard", "disconnected")]);
-        let mut failed = status(false, None, 1);
-        failed.tunnel.failed = true;
-        assert_eq!(svc(&failed)[1], down("WireGuard", "failed"));
-        let mut missing = status(false, None, 1);
-        missing.tunnel.installed = false;
-        missing.tunnel.failed = true;
-        assert_eq!(svc(&missing)[1], down("WireGuard", "not installed"), "not installed outranks failed");
-
-        // Offline: Yutani is red, and WireGuard is read off the worker's
-        // own file and the unit file, since there is no daemon to ask.
-        let off = |o| display(None, Rates::default(), o).services;
-        assert_eq!(
-            off(OfflineTunnel { link_up: true, installed: true }),
-            [down("Yutani", "not running"), up("WireGuard", "connected")]
-        );
-        assert_eq!(off(OfflineTunnel { link_up: false, installed: true })[1], down("WireGuard", "disconnected"));
-        assert_eq!(off(OfflineTunnel { link_up: false, installed: false })[1], down("WireGuard", "not installed"));
-    }
-
-    #[test]
-    fn the_offline_state_shows_dashes_and_zeroes() {
-        let d = display(None, Rates { rx: 5.0, tx: 5.0 }, OfflineTunnel::default());
-        assert!(!d.online && !d.connected && !d.installed);
-        assert_eq!(d.status_text, "Disconnected");
-        assert_eq!((d.location.as_str(), d.iface.as_str()), ("—", "yutani0"));
-        assert_eq!((d.accounts, d.accounts_label), (0, "Accounts connected"));
-        assert_eq!((d.address.as_str(), d.handshake.as_str()), ("—", "hs —"));
-        assert_eq!((d.up_total.as_str(), d.down_total.as_str()), ("0 KB", "0 KB"));
-        assert_eq!((d.up_rate.as_str(), d.down_rate.as_str()), ("0 KB/s", "0 KB/s"));
+        assert_eq!(s, twice, "degrading is idempotent");
     }
 }

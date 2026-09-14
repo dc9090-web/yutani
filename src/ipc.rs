@@ -79,6 +79,8 @@ pub enum Request {
     Layout(String),
     Layouts,
     Settings,
+    /// Open the settings window on a named page (`settings layouts`).
+    SettingsPage(String),
     Quit,
     Status,
     TunnelConnect,
@@ -118,6 +120,7 @@ impl Request {
             ("layout", None) => Err("layout needs a name".into()),
             ("layouts", None) => Ok(Request::Layouts),
             ("settings", None) => Ok(Request::Settings),
+            ("settings", Some(page)) => Ok(Request::SettingsPage(page.to_string())),
             ("quit", None) => Ok(Request::Quit),
             ("status", None) => Ok(Request::Status),
             ("tunnel", Some("connect")) => Ok(Request::TunnelConnect),
@@ -125,7 +128,7 @@ impl Request {
             ("tunnel", _) => Err("tunnel needs connect or disconnect".into()),
             ("", _) => Err("empty request".into()),
             (cmd, Some(_))
-                if matches!(cmd, "next" | "prev" | "show" | "hide" | "toggle" | "layouts" | "settings" | "quit" | "status") =>
+                if matches!(cmd, "next" | "prev" | "show" | "hide" | "toggle" | "layouts" | "quit" | "status") =>
             {
                 Err(format!("{cmd} takes no argument"))
             }
@@ -144,6 +147,7 @@ impl Request {
             Request::Layout(name) => format!("layout {name}\n"),
             Request::Layouts => "layouts\n".into(),
             Request::Settings => "settings\n".into(),
+            Request::SettingsPage(page) => format!("settings {page}\n"),
             Request::Quit => "quit\n".into(),
             Request::Status => "status\n".into(),
             Request::TunnelConnect => "tunnel connect\n".into(),
@@ -195,6 +199,7 @@ mod tests {
         assert_eq!(Request::parse("toggle"), Ok(Request::Toggle));
         assert_eq!(Request::parse("layout pvp fleet"), Ok(Request::Layout("pvp fleet".into())));
         assert_eq!(Request::parse("settings"), Ok(Request::Settings));
+        assert_eq!(Request::parse("settings layouts"), Ok(Request::SettingsPage("layouts".into())));
         assert_eq!(Request::parse("quit"), Ok(Request::Quit));
         assert_eq!(Request::parse("status"), Ok(Request::Status));
         assert_eq!(Request::parse("tunnel connect"), Ok(Request::TunnelConnect));
@@ -234,6 +239,7 @@ mod tests {
             Request::Layout("a b".into()),
             Request::Layouts,
             Request::Settings,
+            Request::SettingsPage("layouts".into()),
             Request::Quit,
             Request::Status,
             Request::TunnelConnect,

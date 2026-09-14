@@ -191,6 +191,7 @@ mod tests {
         Status {
             clients: vec![ClientStatus { name: "KestrelVance".into(), active: true }],
             hidden: false,
+            shortcuts: None,
             tunnel: TunnelStatus {
                 installed: true,
                 connected: true,

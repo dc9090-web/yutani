@@ -95,6 +95,15 @@ pub struct ClientStatus {
     pub active: bool,
 }
 
+/// The hotkeys the daemon's shortcuts are bound to, as the popup prints
+/// them (redesign spec §2): `Ctrl+Alt`, `→`, `←`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ShortcutHint {
+    pub prefix: String,
+    pub next: String,
+    pub prev: String,
+}
+
 /// Reply body of the IPC `status` request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
@@ -102,6 +111,9 @@ pub struct Status {
     pub clients: Vec<ClientStatus>,
     pub hidden: bool,
     pub tunnel: TunnelStatus,
+    /// `serde(default)`: `None` from a daemon older than this field.
+    #[serde(default)]
+    pub shortcuts: Option<ShortcutHint>,
 }
 
 /// Combine the worker's file, whether `/sys/class/net/yutani0` exists,
@@ -314,6 +326,7 @@ mod tests {
                 active: true,
             }],
             hidden: false,
+            shortcuts: None,
             tunnel: assemble(Some(&file()), true, Some((1, 2)), true, false, "London", 1021),
         };
         let json = serde_json::to_string(&st).unwrap();

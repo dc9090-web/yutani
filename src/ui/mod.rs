@@ -516,6 +516,10 @@ impl App {
                 Err(e) => (Reply::Now(Err(format!("layouts: {e}"))), Task::none()),
             },
             Request::Settings => (Reply::Now(Ok(None)), self.open_settings()),
+            Request::SettingsPage(page) => match settings::Page::from_name(&page) {
+                Some(page) => (Reply::Now(Ok(None)), self.open_settings_at(Some(page))),
+                None => (Reply::Now(Err(format!("unknown settings page {page:?}"))), Task::none()),
+            },
             // Quitting takes the tunnel with it (applet spec §4.5). The
             // client is answered `ok` before anything slow happens: a
             // `systemctl stop` can take the unit's whole TimeoutStopSec
@@ -546,6 +550,11 @@ impl App {
                     .collect();
                 let hidden = self.hidden;
                 let location = self.config.tunnel.location.clone();
+                let shortcuts = Some(crate::tunnel::status::ShortcutHint {
+                    prefix: self.config.shortcuts.prefix_label(),
+                    next: crate::model::config::key_symbol(&self.config.shortcuts.next),
+                    prev: crate::model::config::key_symbol(&self.config.shortcuts.prev),
+                });
                 let reply = reply.clone();
                 let task = cosmic::iced::Task::perform(
                     async move {
@@ -553,7 +562,7 @@ impl App {
                             tokio::task::spawn_blocking(move || crate::tunnel::control::current_tunnel_status(&location))
                                 .await
                                 .map_err(|e| format!("status task failed: {e}"))?;
-                        let status = crate::tunnel::status::Status { clients, hidden, tunnel };
+                        let status = crate::tunnel::status::Status { clients, hidden, tunnel, shortcuts };
                         serde_json::to_string(&status).map(Some).map_err(|e| format!("status: {e}"))
                     },
                     move |result| cosmic::Action::App(Msg::IpcReplyLater(reply, result)),
@@ -1304,7 +1313,17 @@ impl App {
     /// Open the settings window, or raise the one already open (spec §6: a
     /// second `settings` request focuses it).
     fn open_settings(&mut self) -> Task<cosmic::Action<Msg>> {
-        if let Some(state) = &self.settings {
+        self.open_settings_at(None)
+    }
+
+    /// Open (or raise) the settings window, on `page` if one is asked for
+    /// — the applet's "Layouts & characters…" lands on Layouts.
+    fn open_settings_at(&mut self, page: Option<settings::Page>) -> Task<cosmic::Action<Msg>> {
+        let position = page.and_then(settings::page_index);
+        if let Some(state) = &mut self.settings {
+            if let Some(i) = position {
+                state.pages.activate_position(i as u16);
+            }
             // `window::gain_focus` does nothing on Wayland; raising a
             // window is an xdg-activation token handed back to the
             // compositor (the same dance libcosmic does for `Activate`).
@@ -1314,6 +1333,9 @@ impl App {
         }
         let (id, open) = cosmic::iced::window::open(settings::window_settings(Self::APP_ID));
         let mut state = settings::State::new(id, &self.config);
+        if let Some(i) = position {
+            state.pages.activate_position(i as u16);
+        }
         // A tunnel action outlives the window it was started from.
         state.tunnel.busy = self.tunnel_in_flight.is_some();
         self.settings = Some(state);

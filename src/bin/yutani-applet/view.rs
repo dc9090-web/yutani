@@ -1,124 +1,99 @@
-//! Rendering. Every colour and size comes from `yutani::applet::theme`;
-//! every string comes from `yutani::applet::display::Display`.
+//! Rendering (redesign spec §2, handoff "Screen 1"). Every size comes from
+//! `yutani::applet::theme`, every colour from the COSMIC theme through it,
+//! and every string from `yutani::applet::display::Popover`.
 
+use cosmic::iced::alignment::{Horizontal, Vertical};
 use cosmic::iced::font::Weight;
 use cosmic::iced::{Alignment, Color, Length};
 use cosmic::widget::{self, Column, Row};
 use cosmic::{Element, theme as cosmic_theme};
 
-use yutani::applet::display::{Display, Service};
+use yutani::applet::display::{AccountRow, Popover, Primary, ThumbsButton};
 use yutani::applet::icon::icon_state;
-use yutani::applet::menu::{MenuRow, RowKind};
+use yutani::applet::menu::MenuRow;
 use yutani::applet::theme;
-use yutani::assets;
 
 use crate::app::{Applet, Msg, Note, close_popup_message, open_popup_message};
 
-/// The handoff's "500" weight (Space Grotesk / JetBrains Mono Medium) for
-/// the title, the accounts count and the tile labels.
-fn medium(font: cosmic::font::Font) -> cosmic::font::Font {
-    cosmic::font::Font { weight: Weight::Medium, ..font }
+// ---- text helpers ---------------------------------------------------------
+
+/// The colour roles text takes, resolved against the COSMIC theme inside
+/// the widget's style (`Text::Custom` takes a plain `fn`, hence an enum
+/// rather than a closure).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    Ink,
+    Secondary,
+    Tertiary,
+    Success,
+    Download,
+    Destructive,
+    /// The state colour: success when on, muted ink when idle.
+    State(bool),
 }
 
-/// UI-font text in one of the handoff's colours.
-fn ui<'a>(
-    content: impl Into<std::borrow::Cow<'a, str>> + 'a,
-    size: f32,
-    color: Color,
-) -> Element<'a, Msg> {
-    widget::text(content)
-        .size(size)
-        .line_height(theme::LINE_HEIGHT)
-        .class(cosmic_theme::Text::Color(color))
-        .into()
+fn text_style(color: Color) -> cosmic::iced::widget::text::Style {
+    cosmic::iced::widget::text::Style { color: Some(color), ..Default::default() }
 }
 
-/// A menu row's label. Unlike [`ui`], it clips rather than wraps: a client
-/// name is arbitrary user text, and a header like "Accounts…" is fixed
-/// English that never needs a second line either — so no row label should
-/// ever grow the popup's height by wrapping. It clips instead, at whatever
-/// width the trailing hint/count leaves it.
-fn row_label<'a>(content: impl Into<std::borrow::Cow<'a, str>> + 'a, color: Color) -> Element<'a, Msg> {
-    widget::text(content)
-        .size(theme::MENU_SIZE)
-        .line_height(theme::LINE_HEIGHT)
-        .class(cosmic_theme::Text::Color(color))
-        .wrapping(cosmic::iced::widget::text::Wrapping::None)
-        .into()
+impl Role {
+    fn class(self) -> cosmic_theme::Text {
+        cosmic_theme::Text::Custom(match self {
+            Role::Ink => |t| text_style(theme::ink(t.cosmic())),
+            Role::Secondary => |t| text_style(theme::secondary(t.cosmic())),
+            Role::Tertiary => |t| text_style(theme::tertiary(t.cosmic())),
+            Role::Success => |t| text_style(theme::success(t.cosmic())),
+            Role::Download => |t| text_style(theme::download(t.cosmic())),
+            Role::Destructive => |t| text_style(theme::destructive(t.cosmic())),
+            Role::State(true) => |t| text_style(theme::state_color(t.cosmic(), true)),
+            Role::State(false) => |t| text_style(theme::state_color(t.cosmic(), false)),
+        })
+    }
 }
 
-/// UI-font text at the handoff's 500 weight.
-fn ui_medium<'a>(
-    content: impl Into<std::borrow::Cow<'a, str>> + 'a,
-    size: f32,
-    color: Color,
-) -> Element<'a, Msg> {
-    widget::text(content)
-        .size(size)
-        .line_height(theme::LINE_HEIGHT)
-        .font(medium(cosmic::font::default()))
-        .class(cosmic_theme::Text::Color(color))
-        .into()
+fn weighted(font: cosmic::font::Font, weight: Weight) -> cosmic::font::Font {
+    cosmic::font::Font { weight, ..font }
 }
 
-/// Monospace, tabular text — every number, id and rate (handoff: critical,
-/// live counters must not jitter).
-fn mono<'a>(
-    content: impl Into<std::borrow::Cow<'a, str>> + 'a,
-    size: f32,
-    color: Color,
-) -> Element<'a, Msg> {
-    widget::text::monotext(content)
-        .size(size)
-        .line_height(theme::LINE_HEIGHT)
-        .class(cosmic_theme::Text::Color(color))
-        .into()
+/// UI text in a theme role.
+fn ui<'a>(content: impl Into<std::borrow::Cow<'a, str>> + 'a, size: f32, weight: Weight, role: Role) -> Element<'a, Msg> {
+    widget::text(content).size(size).font(weighted(cosmic::font::default(), weight)).class(role.class()).into()
 }
 
-/// The accounts count: mono, 500, line-height 1.
-fn count<'a>(content: String, color: Color) -> Element<'a, Msg> {
-    widget::text::monotext(content)
-        .size(theme::COUNT_SIZE)
-        .line_height(theme::LINE_HEIGHT_TIGHT)
-        .font(medium(cosmic::font::mono()))
-        .class(cosmic_theme::Text::Color(color))
-        .into()
+/// Mono text — every number, so digits do not jitter between ticks.
+fn mono<'a>(content: impl Into<std::borrow::Cow<'a, str>> + 'a, size: f32, weight: Weight, role: Role) -> Element<'a, Msg> {
+    widget::text(content).size(size).font(weighted(cosmic::font::mono(), weight)).class(role.class()).into()
 }
 
-/// A round status dot. It glows only where the handoff says it does — the
-/// header while connected — so the menu's account dots stay quiet.
-fn dot<'a>(color: Color, glow: bool) -> Element<'a, Msg> {
-    widget::container(
-        widget::space()
-            .width(Length::Fixed(theme::DOT_PX))
-            .height(Length::Fixed(theme::DOT_PX)),
-    )
-    .class(theme::dot_class(color, glow))
-    .into()
+/// Text in a fixed colour (the violet).
+fn fixed<'a>(content: impl Into<std::borrow::Cow<'a, str>> + 'a, size: f32, weight: Weight, mono_font: bool, color: Color) -> Element<'a, Msg> {
+    let font = if mono_font { cosmic::font::mono() } else { cosmic::font::default() };
+    widget::text(content).size(size).font(weighted(font, weight)).class(cosmic_theme::Text::Color(color)).into()
 }
 
-fn glyph<'a>(bytes: &'static [u8], w: u16, h: u16) -> Element<'a, Msg> {
-    widget::icon(widget::icon::from_svg_bytes(bytes))
-        .width(Length::Fixed(f32::from(w)))
-        .height(Length::Fixed(f32::from(h)))
-        .into()
+/// A section label: 10.5 / 600, uppercase, secondary.
+fn section_label<'a>(text: &str) -> Element<'a, Msg> {
+    ui(text.to_uppercase(), theme::SECTION_LABEL_SIZE, Weight::Semibold, Role::Secondary)
 }
 
-/// A hairline rule with the handoff's margins. `theme::hairline` fills its
-/// container, so the container has to be told to fill the popup.
-fn divider<'a>(padding: cosmic::iced::Padding) -> Element<'a, Msg> {
-    widget::container(theme::hairline::<Msg>())
+fn hairline<'a>(padding: cosmic::iced::Padding) -> Element<'a, Msg> {
+    widget::container(widget::container(widget::space().width(Length::Fill).height(Length::Fixed(1.0))).class(theme::hairline_class()))
         .width(Length::Fill)
         .padding(padding)
         .into()
 }
 
-/// The Y mark in the panel: the state's icon, tinted pure white on a dark
-/// panel and the theme's ink on a light one (`symbolic(true)` +
-/// `theme::mark_class`), dimmed to 38 % when there is no daemon or no
-/// tunnel. The Active state is the same
-/// tinted mark with a blue dot laid over its bottom-right corner
-/// (`IconState::badge`): the Y stays the panel's ink, the dot is the news.
+fn card<'a>(content: impl Into<Element<'a, Msg>>) -> Element<'a, Msg> {
+    widget::container(widget::container(content).width(Length::Fill).class(theme::card_class()))
+        .width(Length::Fill)
+        .padding(theme::CARD_MARGIN)
+        .into()
+}
+
+// ---- panel button ---------------------------------------------------------
+
+/// The panel button: the mark, tinted by the panel, with the state's badge
+/// over its bottom-right corner (`IconState::badge`).
 pub fn panel_button(state: &Applet) -> Element<'_, Msg> {
     let clients = state.status.as_ref().map_or(0, |s| s.clients.len());
     let icon = icon_state(state.status.as_ref().map(|s| &s.tunnel), clients, state.pending());
@@ -129,19 +104,12 @@ pub fn panel_button(state: &Applet) -> Element<'_, Msg> {
         .height(Length::Fixed(f32::from(h)))
         .opacity(icon.opacity());
     let content: Element<'_, Msg> = if let Some(badge) = icon.badge() {
-        // The stack takes the mark's size; the badge layer fills it and
-        // parks the dot in the corner.
         let d = theme::badge_px(f32::from(h));
         let badge = widget::container(widget::space().width(Length::Fixed(d)).height(Length::Fixed(d)))
             .class(theme::badge_class(d, badge));
         cosmic::iced::widget::stack([
             mark.into(),
-            widget::container(badge)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(cosmic::iced::alignment::Horizontal::Right)
-                .align_y(cosmic::iced::alignment::Vertical::Bottom)
-                .into(),
+            widget::container(badge).width(Length::Fill).height(Length::Fill).align_x(Horizontal::Right).align_y(Vertical::Bottom).into(),
         ])
         .into()
     } else {
@@ -159,97 +127,28 @@ pub fn panel_button(state: &Applet) -> Element<'_, Msg> {
         .into()
 }
 
-/// Header: Y mark, "WireGuard", the status dot + text + location, and the
-/// interface chip.
-///
-/// Every string is cloned rather than borrowed: `Display` is built inside
-/// `popup`, so a borrowed `Element` could not outlive it. Do not "optimise"
-/// these clones away — they are what makes the returned element `'a`-free.
-fn header<'a>(d: &Display) -> Element<'a, Msg> {
-    let dot_color = if d.connected { theme::ACCENT_UP } else { theme::TEXT_MUTED };
-    let status_row = Row::new()
-        .spacing(theme::STATUS_GAP)
-        .align_y(Alignment::Center)
-        // The dot only glows while connected (handoff: no glow when down).
-        .push(dot(dot_color, d.connected))
-        .push(mono(d.status_text, theme::STATUS_SIZE, dot_color))
-        .push(mono(theme::MIDDOT, theme::STATUS_SIZE, theme::SEPARATOR))
-        .push(glyph(assets::PIN, theme::PIN_W, theme::PIN_H))
-        .push(mono(d.location.clone(), theme::STATUS_SIZE, theme::TEXT_SECONDARY));
+// ---- 1. header --------------------------------------------------------------
 
-    let titles = Column::new()
-        .spacing(theme::HEADER_COLUMN_GAP)
-        .push(ui_medium(theme::TITLE, theme::TITLE_SIZE, theme::TEXT_PRIMARY))
-        .push(status_row);
-
-    let chip = widget::container(mono(d.iface.clone(), theme::CHIP_SIZE, theme::TEXT_FAINT))
-        .padding(theme::CHIP_PAD)
-        .class(theme::chip_class());
-
-    Row::new()
-        .width(Length::Fill)
+fn header<'a>(p: &Popover) -> Element<'a, Msg> {
+    let badge = widget::container(fixed("Y", theme::BADGE_GLYPH_SIZE, Weight::Semibold, true, theme::VIOLET))
+        .width(Length::Fixed(theme::BADGE_PX))
+        .height(Length::Fixed(theme::BADGE_PX))
+        .align_x(Horizontal::Center)
+        .align_y(Vertical::Center)
+        .class(theme::plate_class());
+    let left = Row::new()
         .spacing(theme::HEADER_GAP)
         .align_y(Alignment::Center)
+        .push(badge)
+        .push(ui("Yutani", theme::TITLE_SIZE, Weight::Semibold, Role::Ink));
+    let right = Row::new()
+        .spacing(7)
+        .align_y(Alignment::Center)
+        .push(ui(p.state_word, theme::STATE_WORD_SIZE, Weight::Medium, Role::State(p.running)))
+        .push(widget::toggler(p.running).on_toggle(Msg::ToggleService).size(theme::TOGGLE_PX));
+    Row::new()
+        .width(Length::Fill)
         .padding(theme::HEADER_PAD)
-        // Explicit `#E6E8EC`, not `symbolic(true)`: the mark sits on the
-        // popup's own dark surface, so it must not follow the COSMIC
-        // theme's icon colour the way the panel button does.
-        .push(
-            widget::icon(widget::icon::from_svg_bytes(assets::YUTANI_SYMBOLIC))
-                .class(theme::svg_class(theme::TEXT_ON_SURFACE))
-                .width(Length::Fixed(f32::from(theme::MARK_PX)))
-                .height(Length::Fixed(f32::from(theme::MARK_PX))),
-        )
-        .push(titles)
-        .push(widget::space().width(Length::Fill))
-        .push(chip)
-        .into()
-}
-
-/// One row of the services band: dot, name, and the note against the far
-/// edge. Green or red, no glow — the header's dot keeps the glow.
-fn service_row<'a>(s: Service) -> Element<'a, Msg> {
-    let color = if s.up { theme::SERVICE_UP } else { theme::SERVICE_DOWN };
-    Row::new()
-        .width(Length::Fill)
-        .spacing(theme::MENU_ROW_GAP)
-        .align_y(Alignment::Center)
-        .push(dot(color, false))
-        .push(ui(s.name, theme::SERVICE_LABEL_SIZE, theme::TEXT_ON_SURFACE))
-        .push(widget::space().width(Length::Fill))
-        .push(mono(s.note, theme::MENU_HINT_SIZE, color))
-        .into()
-}
-
-/// Services band: Yutani and WireGuard, each with its dot (2026-09-14
-/// spec §1). Shown in every state — offline is exactly when "Yutani: not
-/// running" is the news.
-fn services_band<'a>(d: &Display) -> Element<'a, Msg> {
-    Column::new()
-        .width(Length::Fill)
-        .spacing(theme::SERVICES_ROW_GAP)
-        .padding(theme::SERVICES_PAD)
-        .push(service_row(d.services[0]))
-        .push(service_row(d.services[1]))
-        .into()
-}
-
-/// Accounts band: the count and its label on the left, the tunnel IP and
-/// the handshake age on the right.
-fn accounts_band<'a>(d: &Display) -> Element<'a, Msg> {
-    let left = Row::new()
-        .spacing(theme::COUNT_GAP)
-        .align_y(Alignment::Center)
-        .push(count(d.accounts.to_string(), theme::TEXT_PRIMARY))
-        .push(ui(d.accounts_label, theme::COUNT_LABEL_SIZE, theme::TEXT_SECONDARY));
-    let right = Column::new()
-        .spacing(theme::BAND_COLUMN_GAP)
-        .align_x(Alignment::End)
-        .push(mono(d.address.clone(), theme::BAND_RIGHT_SIZE, theme::TEXT_FAINT))
-        .push(mono(d.handshake.clone(), theme::BAND_RIGHT_SIZE, theme::TEXT_FAINT));
-    Row::new()
-        .width(Length::Fill)
-        .padding(theme::BAND_PAD)
         .align_y(Alignment::Center)
         .push(left)
         .push(widget::space().width(Length::Fill))
@@ -257,206 +156,286 @@ fn accounts_band<'a>(d: &Display) -> Element<'a, Msg> {
         .into()
 }
 
-/// One traffic tile. No hover state — these are display only.
-fn tile<'a>(
-    label: &'static str,
-    arrow: &'static [u8],
-    accent: Color,
-    total: String,
-    rate: String,
-) -> Element<'a, Msg> {
-    let label_row = Row::new()
-        .spacing(theme::TILE_LABEL_GAP)
-        .align_y(Alignment::Center)
-        .push(glyph(arrow, theme::GLYPH_PX, theme::GLYPH_PX))
-        .push(ui_medium(label, theme::TILE_LABEL_SIZE, theme::TEXT_FAINT));
-    widget::container(
-        Column::new()
-            .spacing(theme::TILE_COLUMN_GAP)
-            .push(label_row)
-            .push(mono(total, theme::TILE_TOTAL_SIZE, theme::TEXT_PRIMARY))
-            .push(mono(rate, theme::TILE_RATE_SIZE, accent)),
-    )
-    .padding(theme::TILE_PAD)
-    .width(Length::FillPortion(1))
-    .class(theme::tile_class())
-    .into()
-}
+// ---- 2. accounts card -------------------------------------------------------
 
-fn tiles<'a>(d: &Display) -> Element<'a, Msg> {
-    Row::new()
+fn account_row<'a>(row: &AccountRow) -> Element<'a, Msg> {
+    let chip = widget::container(fixed_or_ink_index(row))
+        .width(Length::Fixed(theme::INDEX_CHIP_WIDTH))
+        .padding([2, 0])
+        .align_x(Horizontal::Center)
+        .class(theme::index_chip_class(row.focused));
+    let mut content = Row::new()
         .width(Length::Fill)
-        .spacing(theme::TILE_GAP)
-        .padding(theme::TILES_PAD)
-        .push(tile(
-            theme::UPLOAD_LABEL,
-            assets::ARROW_UP,
-            theme::ACCENT_UP,
-            d.up_total.clone(),
-            d.up_rate.clone(),
-        ))
-        .push(tile(
-            theme::DOWNLOAD_LABEL,
-            assets::ARROW_DOWN,
-            theme::ACCENT_DOWN,
-            d.down_total.clone(),
-            d.down_rate.clone(),
-        ))
+        .spacing(theme::ACCOUNT_ROW_GAP)
+        .align_y(Alignment::Center)
+        .push(chip)
+        .push(widget::container(ui(row.name.clone(), theme::ACCOUNT_NAME_SIZE, Weight::Normal, Role::Ink)).width(Length::Fill).clip(true));
+    if row.focused {
+        content = content.push(fixed("focused", theme::FOCUSED_SIZE, Weight::Normal, true, theme::VIOLET));
+    }
+    widget::button::custom(content)
+        .width(Length::Fill)
+        .height(Length::Fixed(theme::ACCOUNT_ROW_HEIGHT))
+        .padding(theme::ACCOUNT_ROW_PAD)
+        .class(theme::account_row_class(row.focused))
+        .on_press(Msg::Press(yutani::applet::Action::Focus(row.index)))
         .into()
 }
 
-/// One menu row. It is taken by value: its strings become the element's, so
-/// nothing borrows the list `menu` built them from.
-///
-/// A row with no action gets no message, which is what makes libcosmic
-/// treat the button as disabled — but every label here carries an explicit
-/// colour, so libcosmic's `disabled` text style never reaches it and the
-/// row has to be dimmed here as well as declared inert.
-fn menu_row<'a>(row: MenuRow) -> Element<'a, Msg> {
-    let (ink, hover, pressed) = match row.kind {
-        RowKind::Danger => (theme::DANGER_TEXT, theme::DANGER_HOVER, theme::DANGER_HOVER),
-        _ => (theme::TEXT_ON_SURFACE, theme::HAIRLINE, theme::ACTIVE_FILL),
-    };
-    let (label_ink, hint_ink) = if row.disabled() {
-        (theme::dimmed(ink), theme::dimmed(theme::TEXT_FAINT))
-    } else {
-        (ink, theme::TEXT_FAINT)
-    };
+/// The index chip's digit: accent-tinted on the focused row, secondary
+/// otherwise.
+fn fixed_or_ink_index<'a>(row: &AccountRow) -> Element<'a, Msg> {
+    let role = if row.focused { Role::Ink } else { Role::Secondary };
+    mono(row.index.to_string(), theme::INDEX_SIZE, Weight::Normal, role)
+}
 
+fn accounts_card<'a>(p: &Popover) -> Element<'a, Msg> {
+    let header = Row::new()
+        .width(Length::Fill)
+        .padding(theme::CARD_HEADER_PAD)
+        .align_y(Alignment::End)
+        .push(section_label("Accounts connected"))
+        .push(widget::space().width(Length::Fill))
+        .push(mono(p.count.clone(), theme::COUNT_SIZE, Weight::Normal, Role::State(p.running)));
+    let body: Element<'a, Msg> = if p.running {
+        Column::with_children(p.accounts.iter().map(account_row).collect::<Vec<_>>())
+            .width(Length::Fill)
+            .padding(theme::ACCOUNT_LIST_PAD)
+            .into()
+    } else {
+        Column::new()
+            .width(Length::Fill)
+            .spacing(3)
+            .padding(theme::STOPPED_PAD)
+            .push(ui("Service stopped", theme::STOPPED_SIZE, Weight::Normal, Role::Secondary))
+            .push(ui("Thumbnails, hotkeys and tunnel routing are inactive.", theme::STOPPED_HELP_SIZE, Weight::Normal, Role::Tertiary))
+            .into()
+    };
+    let thumbs = widget::button::custom(ui(p.thumbs.label(), theme::SMALL_BUTTON_SIZE, Weight::Normal, Role::Ink))
+        .padding(theme::SMALL_BUTTON_PAD)
+        .class(theme::small_button_class(p.thumbs == ThumbsButton::Hide))
+        .on_press_maybe(p.thumbs.action().map(Msg::Press));
+    let footer = Row::new()
+        .width(Length::Fill)
+        .padding(theme::CARD_FOOTER_PAD)
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .push(mono(p.hint.clone(), theme::HINT_SIZE, Weight::Normal, Role::Tertiary))
+        .push(widget::space().width(Length::Fill))
+        .push(thumbs);
+    card(Column::new().width(Length::Fill).push(header).push(body).push(hairline([0, 0].into())).push(footer))
+}
+
+// ---- 3–4. tunnel section -----------------------------------------------------
+
+fn tunnel_section<'a>(p: &Popover) -> Element<'a, Msg> {
+    let label = Row::new()
+        .width(Length::Fill)
+        .padding(theme::SECTION_LABEL_PAD)
+        .align_y(Alignment::End)
+        .push(section_label("WireGuard tunnel"))
+        .push(widget::space().width(Length::Fill))
+        .push(ui("EVE traffic only", theme::EVE_ONLY_SIZE, Weight::Normal, Role::Tertiary));
+    let dot = widget::container(
+        widget::container(widget::space().width(Length::Fixed(theme::STATUS_DOT_PX)).height(Length::Fixed(theme::STATUS_DOT_PX)))
+            .class(theme::dot_class(p.tunnel.on)),
+    )
+    .padding(theme::STATUS_GLOW_PX)
+    .class(theme::glow_class(p.tunnel.on));
+    let left = Row::new()
+        .spacing(theme::STATUS_GAP)
+        .align_y(Alignment::Center)
+        .push(dot)
+        .push(ui("WireGuard", theme::TUNNEL_NAME_SIZE, Weight::Semibold, Role::Ink))
+        .push(ui(p.tunnel.location.clone(), theme::LOCATION_SIZE, Weight::Normal, Role::Secondary));
+    let line = Row::new()
+        .width(Length::Fill)
+        .padding(theme::TUNNEL_LINE_PAD)
+        .align_y(Alignment::Center)
+        .push(left)
+        .push(widget::space().width(Length::Fill))
+        .push(mono(p.tunnel.uptime.clone(), theme::UPTIME_SIZE, Weight::Normal, Role::State(p.tunnel.on)));
+    Column::new().width(Length::Fill).push(hairline(theme::DIVIDER_PAD)).push(label).push(line).into()
+}
+
+// ---- 5. throughput card ------------------------------------------------------
+
+fn rate_block<'a>(label: &'static str, upload: bool, rate: &(String, &'static str)) -> Element<'a, Msg> {
+    let series = if upload { Role::Success } else { Role::Download };
+    let numbers = Row::new()
+        .spacing(3)
+        .align_y(Alignment::End)
+        .push(mono(rate.0.clone(), theme::RATE_SIZE, Weight::Medium, Role::Ink))
+        .push(mono(rate.1, theme::RATE_UNIT_SIZE, Weight::Normal, Role::Tertiary));
+    Column::new()
+        .spacing(3)
+        .align_x(if upload { Alignment::Start } else { Alignment::End })
+        .push(ui(label, theme::RATE_LABEL_SIZE, Weight::Semibold, series))
+        .push(numbers)
+        .into()
+}
+
+fn bar<'a>(value: f32, upload: bool) -> Element<'a, Msg> {
+    let h = (value * theme::GRAPH_HALF).round().max(1.0);
+    widget::container(widget::space().width(Length::Fill).height(Length::Fixed(h))).width(Length::Fill).class(theme::bar_class(upload)).into()
+}
+
+fn graph<'a>(bars: &[(f32, f32)]) -> Element<'a, Msg> {
+    let columns = bars.iter().map(|(up, down)| {
+        Column::new()
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .push(widget::container(bar(*up, true)).width(Length::Fill).height(Length::Fill).align_y(Vertical::Bottom))
+            .push(widget::container(widget::space().width(Length::Fill).height(Length::Fixed(1.0))).class(theme::axis_class()))
+            .push(widget::container(bar(*down, false)).width(Length::Fill).height(Length::Fill).align_y(Vertical::Top))
+            .into()
+    });
+    Row::with_children(columns.collect::<Vec<Element<'a, Msg>>>())
+        .width(Length::Fill)
+        .height(Length::Fixed(theme::GRAPH_HEIGHT))
+        .spacing(theme::GRAPH_GAP)
+        .into()
+}
+
+fn throughput_card<'a>(p: &Popover) -> Element<'a, Msg> {
+    let t = &p.throughput;
+    let header = Row::new()
+        .width(Length::Fill)
+        .padding(theme::GRAPH_HEADER_PAD)
+        .align_y(Alignment::Start)
+        .push(rate_block("↑ Upload", true, &t.up))
+        .push(widget::space().width(Length::Fill))
+        .push(rate_block("↓ Download", false, &t.down));
+    let footer = Row::new()
+        .width(Length::Fill)
+        .padding(theme::GRAPH_FOOTER_PAD)
+        .push(mono(format!("{} sent", t.sent), theme::GRAPH_FOOTER_SIZE, Weight::Normal, Role::Tertiary))
+        .push(widget::space().width(Length::Fill))
+        .push(mono("60 s", theme::GRAPH_FOOTER_SIZE, Weight::Normal, Role::Tertiary))
+        .push(widget::space().width(Length::Fill))
+        .push(mono(format!("{} received", t.received), theme::GRAPH_FOOTER_SIZE, Weight::Normal, Role::Tertiary));
+    card(
+        Column::new()
+            .width(Length::Fill)
+            .push(header)
+            .push(widget::container(graph(&t.bars)).width(Length::Fill).padding(theme::GRAPH_PAD))
+            .push(footer),
+    )
+}
+
+// ---- 6. fact tiles -----------------------------------------------------------
+
+fn tiles<'a>(p: &Popover) -> Element<'a, Msg> {
+    let tile = |label: &'static str, value: String| {
+        widget::container(
+            Column::new()
+                .spacing(3)
+                .push(section_label(label))
+                .push(widget::container(mono(value, theme::TILE_VALUE_SIZE, Weight::Normal, Role::Ink)).width(Length::Fill).clip(true)),
+        )
+        .width(Length::FillPortion(1))
+        .padding(theme::TILE_PAD)
+        .class(theme::tile_class())
+    };
+    let [(l0, v0), (l1, v1)] = &p.tiles;
+    widget::container(Row::new().width(Length::Fill).spacing(theme::TILE_GAP).push(tile(l0, v0.clone())).push(tile(l1, v1.clone())))
+        .width(Length::Fill)
+        .padding(theme::CARD_MARGIN)
+        .into()
+}
+
+// ---- 7. action row -----------------------------------------------------------
+
+fn action_row<'a>(p: &Popover, menu_open: bool) -> Element<'a, Msg> {
+    let label = ui(p.primary.label(), theme::PRIMARY_SIZE, Weight::Semibold, Role::Ink);
+    let primary = match p.primary {
+        Primary::Inert(_) => widget::button::custom(widget::container(label).width(Length::Fill).align_x(Horizontal::Center))
+            .class(theme::inert_primary_class()),
+        Primary::Standard(..) => widget::button::custom(widget::container(label).width(Length::Fill).align_x(Horizontal::Center))
+            .class(cosmic_theme::Button::Standard),
+        Primary::Accent(..) => {
+            // The suggested button paints its own on-accent text.
+            let label = widget::text(p.primary.label()).size(theme::PRIMARY_SIZE).font(weighted(cosmic::font::default(), Weight::Semibold));
+            widget::button::custom(widget::container(label).width(Length::Fill).align_x(Horizontal::Center))
+                .class(cosmic_theme::Button::Suggested)
+        }
+    }
+    .width(Length::Fill)
+    .height(Length::Fixed(theme::PRIMARY_HEIGHT))
+    .on_press_maybe(p.primary.action().map(Msg::Press));
+    let overflow = widget::button::custom(
+        widget::container(mono("⋯", theme::OVERFLOW_SIZE, Weight::Normal, Role::Ink)).width(Length::Fill).align_x(Horizontal::Center),
+    )
+    .width(Length::Fixed(theme::OVERFLOW_PX))
+    .height(Length::Fixed(theme::OVERFLOW_PX))
+    .class(theme::overflow_class(menu_open))
+    .on_press(Msg::ToggleMenu);
+    widget::container(Row::new().width(Length::Fill).spacing(theme::ACTION_GAP).push(primary).push(overflow))
+        .width(Length::Fill)
+        .padding(theme::CARD_MARGIN)
+        .into()
+}
+
+fn note_line<'a>(note: &Note) -> Element<'a, Msg> {
+    let role = if note.progress { Role::Tertiary } else { Role::Destructive };
+    widget::container(mono(note.text.clone(), theme::NOTE_SIZE, Weight::Normal, role)).width(Length::Fill).padding(theme::NOTE_PAD).into()
+}
+
+// ---- 8. menu -----------------------------------------------------------------
+
+fn menu_row<'a>(row: &MenuRow) -> Element<'a, Msg> {
+    let role = if row.danger { Role::Destructive } else { Role::Ink };
     let mut content = Row::new()
         .width(Length::Fill)
-        .spacing(theme::MENU_ROW_GAP)
-        .align_y(Alignment::Center);
-    if let RowKind::Account { active } = row.kind {
-        // The focused account's dot is the accent; the others are muted.
-        // No glow — that belongs to the header's connected state alone.
-        let marker = if active { theme::ACCENT_UP } else { theme::TEXT_MUTED };
-        content = content.push(dot(marker, false));
-    }
-    content = content
-        .push(row_label(row.label, label_ink))
-        // Hints and counts are right-aligned against the row's far edge.
+        .spacing(10)
+        .align_y(Alignment::Center)
+        .push(ui(row.label, theme::MENU_SIZE, Weight::Normal, role))
         .push(widget::space().width(Length::Fill));
-    if let Some(hint) = row.hint {
-        content = content.push(mono(hint, theme::MENU_HINT_SIZE, hint_ink));
+    if let Some(hint) = &row.hint {
+        content = content.push(mono(hint.clone(), theme::MENU_HINT_SIZE, Weight::Normal, Role::Tertiary));
     }
-    if let Some(trailing) = row.trailing {
-        content = content.push(mono(trailing, theme::MENU_HINT_SIZE, hint_ink));
-    }
-
-    // Character rows are indented a step; the action rows keep the
-    // header's left edge.
-    let padding = if matches!(row.kind, RowKind::Account { .. }) {
-        theme::MENU_ACCOUNT_PAD
-    } else {
-        theme::MENU_ROW_PAD
-    };
     widget::button::custom(content)
         .width(Length::Fill)
-        .padding(padding)
-        .class(theme::menu_row_class(ink, hover, pressed))
+        .height(Length::Fixed(theme::MENU_ROW_HEIGHT))
+        .padding(theme::MENU_ROW_PAD)
+        .class(theme::menu_row_class(row.danger))
         .on_press_maybe(row.action.map(Msg::Press))
         .into()
 }
 
-/// The last `err …` reply as a one-line note, in the danger ink at the hint
-/// size so it reads as an aside rather than another row — or, muted, what
-/// a slow action is still doing.
-fn note_line<'a>(note: &Note) -> Element<'a, Msg> {
-    let ink = if note.progress { theme::TEXT_MUTED } else { theme::DANGER_TEXT };
-    widget::container(mono(note.text.clone(), theme::MENU_HINT_SIZE, ink))
+fn menu<'a>(running: bool) -> Element<'a, Msg> {
+    let rows = yutani::applet::menu::rows(running);
+    Column::new()
         .width(Length::Fill)
-        .padding(theme::NOTE_PAD)
+        .push(hairline([0, 0].into()))
+        .push(
+            Column::with_children(rows.iter().map(menu_row).collect::<Vec<_>>())
+                .width(Length::Fill)
+                .padding(theme::MENU_PAD),
+        )
         .into()
 }
 
-/// The expanded client rows, in their own scroll area.
-///
-/// `popup_container` caps the popup at 1000 px and caps it by *clipping*:
-/// without this, a long enough account list would push Preferences…, the
-/// thumbnails row and Quit straight off the bottom of the popup with no
-/// way to reach them. Only the client rows scroll — the Accounts… header
-/// stays outside, so what is scrolling is always labelled.
-fn accounts_list(rows: Vec<Element<'_, Msg>>) -> Element<'_, Msg> {
-    widget::container(widget::scrollable(
-        Column::with_children(rows).width(Length::Fill).spacing(theme::MENU_GAP),
-    ))
-    .width(Length::Fill)
-    .max_height(theme::ACCOUNTS_LIST_MAX_PX)
-    .into()
-}
+// ---- the popover ----------------------------------------------------------
 
-/// The menu group: the rows for the current state, the hairline the handoff
-/// puts above Quit, and the error note under whichever row earned it
-/// (spec §7). A note from a failed poll belongs to no row — it goes above
-/// the Quit divider, at the foot of the ordinary rows, rather than under
-/// the danger row it has nothing to do with. (If there is no Quit row to
-/// anchor to — the offline state — it falls back to the very end.)
-///
-/// The expanded client rows are a contiguous run in the middle of that
-/// list, and they are collected into [`accounts_list`] rather than pushed
-/// into the group — everything else keeps its place around them.
-fn menu(state: &Applet) -> Element<'_, Msg> {
-    let rows = yutani::applet::menu::rows(state.status.as_ref());
-    let note = state.visible_note();
-    let mut group: Vec<Element<'_, Msg>> = Vec::new();
-    let mut clients: Vec<Element<'_, Msg>> = Vec::new();
-    let mut placed = false;
-    for row in rows {
-        let is_client = matches!(row.kind, RowKind::Account { .. });
-        // The run has ended: fold it into the group before this row.
-        if !is_client && !clients.is_empty() {
-            group.push(accounts_list(std::mem::take(&mut clients)));
-        }
-        if row.kind == RowKind::Danger {
-            if let Some(note) = note.filter(|n| n.action.is_none()) {
-                group.push(note_line(note));
-                placed = true;
-            }
-            group.push(divider(theme::DIVIDER_ABOVE_MENU));
-        }
-        let owns_note = note.is_some_and(|n| n.action.is_some() && n.action == row.action);
-        let target = if is_client { &mut clients } else { &mut group };
-        target.push(menu_row(row));
-        if let Some(note) = note.filter(|_| owns_note) {
-            target.push(note_line(note));
-            placed = true;
-        }
-    }
-    if !clients.is_empty() {
-        group.push(accounts_list(std::mem::take(&mut clients)));
-    }
-    if let Some(note) = note.filter(|_| !placed) {
-        group.push(note_line(note));
-    }
-    Column::with_children(group).width(Length::Fill).spacing(theme::MENU_GAP).into()
-}
-
-/// The popup's contents, on the handoff's own surface.
-///
-/// libcosmic's `popup_container` supplies the shell surface, the blur and
-/// the shadow, but it paints the *COSMIC theme's* background — which under
-/// a light theme would leave this dark-only palette unreadable. So the
-/// content sits on `popup_surface_class()`, which covers it.
+/// The popover's contents. libcosmic's `popup_container` supplies the
+/// surface, its theme background, blur and shadow; everything here sits on
+/// the theme's own colours, so a light COSMIC theme gets a light popover.
 pub fn popup(state: &Applet) -> Element<'_, Msg> {
-    let d = state.display();
+    let p = state.popover();
     let mut content = Column::new()
         .width(Length::Fill)
-        .spacing(theme::POPUP_PADDING)
-        .padding(theme::POPUP_PADDING)
-        .push(header(&d))
-        .push(divider(theme::DIVIDER_ABOVE_BAND))
-        .push(services_band(&d));
-    // With no daemon there is nothing more to read: the services band has
-    // just said so, then straight to the single "Start Yutani" row. The
-    // accounts band and the tiles would be a screenful of dashes and zeroes.
-    if d.online {
-        content = content
-            .push(divider(theme::DIVIDER_ABOVE_BAND))
-            .push(accounts_band(&d))
-            .push(divider(theme::DIVIDER_ABOVE_TILES))
-            .push(tiles(&d));
+        .push(header(&p))
+        .push(accounts_card(&p))
+        .push(tunnel_section(&p))
+        .push(throughput_card(&p))
+        .push(tiles(&p))
+        .push(action_row(&p, state.menu_open));
+    if let Some(note) = state.visible_note() {
+        content = content.push(note_line(note));
     }
-    content = content.push(divider(theme::DIVIDER_ABOVE_MENU)).push(menu(state));
-    widget::container(content).width(Length::Fill).class(theme::popup_surface_class()).into()
+    if state.menu_open {
+        content = content.push(menu(p.running));
+    }
+    widget::container(content).width(Length::Fixed(theme::POPOVER_WIDTH as f32)).into()
 }
