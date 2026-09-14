@@ -1542,6 +1542,11 @@ impl App {
                 return Task::batch([cosmic::iced::clipboard::write(line), reset]);
             }
             S::ChangeProfileDir => return self.browse_profile_dir(),
+            S::CentreVertically => {
+                let (note, task) = self.centre_vertically();
+                self.settings_note(note);
+                return task;
+            }
             // The window's own drop target answered: the Wayland route
             // into the same handler the X11 window event uses.
             S::FilesDropped(paths) => {
@@ -1661,6 +1666,59 @@ impl App {
             },
             |path| cosmic::Action::App(Msg::Settings(settings::Msg::ProfileDirChosen(path))),
         )
+    }
+
+    /// Layouts page: shift the floating thumbnails on each output so the
+    /// group is centred vertically (opacity-and-centre spec §2.2). Per
+    /// output, the shown thumbnails form one group whose top is the
+    /// smallest `y` and bottom the largest `y + height` (unzoomed); every
+    /// thumbnail on that output moves by the same `dy`, so the arrangement
+    /// keeps its shape. `x` is untouched. Returns the note (one clause per
+    /// output, in output order) and the surface moves.
+    fn centre_vertically(&mut self) -> (String, Task<cosmic::Action<Msg>>) {
+        if self.config.mode == Mode::Dock {
+            return ("the dock is already centred along its edge".to_string(), Task::none());
+        }
+        let outputs: Vec<(String, i32)> = self.outputs.iter().map(|o| (o.name.clone(), o.logical_size.1)).collect();
+        let mut tasks = Vec::new();
+        let mut clauses = Vec::new();
+        for (name, height) in outputs {
+            // An output whose size is not known yet cannot be centred on.
+            if height <= 0 {
+                continue;
+            }
+            let members: Vec<(Handle, i32, i32)> = self
+                .clients
+                .iter()
+                .filter(|(_, c)| c.surface.is_some() && c.output == name)
+                .map(|(h, c)| {
+                    let (_, thumb_h) = thumbnail::zoomed_size(&self.config, c.image.as_ref(), false);
+                    (h.clone(), c.position.1, c.position.1.saturating_add(thumb_h as i32))
+                })
+                .collect();
+            let (Some(top), Some(bottom)) = (members.iter().map(|m| m.1).min(), members.iter().map(|m| m.2).max()) else {
+                continue;
+            };
+            let dy = layout::centre_shift(top, bottom, height);
+            for (h, ..) in &members {
+                let (surface, position) = {
+                    let c = self.clients.get_mut(h).unwrap();
+                    c.position.1 = c.position.1.saturating_add(dy);
+                    c.placed = true;
+                    (c.surface, c.position)
+                };
+                // A drag canvas keeps its margin; `leave_canvas` applies the
+                // new position at drag end (as `reposition_to_layout` does).
+                if let Some(id) = surface.filter(|id| !self.in_canvas(*id)) {
+                    tasks.push(set_margin(id, position.1, 0, 0, position.0));
+                }
+                self.persist_position(h);
+            }
+            let n = members.len();
+            clauses.push(format!("centred {n} thumbnail{} on {name}", if n == 1 { "" } else { "s" }));
+        }
+        let note = if clauses.is_empty() { "nothing to centre".to_string() } else { clauses.join("; ") };
+        (note, Task::batch(tasks))
     }
 
     /// Layouts page: save the current arrangement under the typed name.
@@ -2372,7 +2430,8 @@ impl Application for App {
     fn view_window(&self, id: SurfaceId) -> Element<'_, Msg> {
         if let Some(state) = self.settings.as_ref().filter(|s| s.window == id) {
             let focused = self.core.focused_window() == Some(id);
-            return settings::view(state, &self.config, focused, !self.clients.is_empty());
+            let thumbs_shown = self.clients.values().any(|c| c.surface.is_some());
+            return settings::view(state, &self.config, focused, !self.clients.is_empty(), thumbs_shown);
         }
         let Some((_, client)) = self.clients.iter().find(|(_, c)| c.surface == Some(id)) else {
             return widget::text("").into();
@@ -2506,6 +2565,51 @@ mod tests {
         let (how, _task) = app.handle_request(&crate::ipc::Request::Status, &reply);
         assert!(matches!(how, Reply::Later), "answered on the update thread");
         assert!(rx.try_recv().is_err(), "the reply must come from the task, not from this call");
+    }
+
+    /// Opacity-and-centre spec §2.2/§2.5: each output is its own group
+    /// (independent shifts), the group keeps its shape, `x` is untouched, a
+    /// client without a surface is ignored, and the note names each output
+    /// in output order — or says there was nothing to centre.
+    #[test]
+    fn centre_vertically_shifts_each_outputs_group_by_its_own_dy() {
+        let fake = Fake::new();
+        let mut app = app(Config { visibility: Visibility::Always, mode: Mode::Floating, ..Config::default() });
+        let dp1 = add_output(&mut app, &fake, "DP-1");
+        let dp2 = add_output(&mut app, &fake, "DP-2");
+        let (a, b, c) = (fake.handle(), fake.handle(), fake.handle());
+        let _ = app.on_backend(Event::ClientAdded(a.clone(), info(true, vec![dp1.clone()])));
+        let _ = app.on_backend(Event::ClientAdded(b.clone(), info(false, vec![dp1.clone()])));
+        let _ = app.on_backend(Event::ClientAdded(c.clone(), info(false, vec![dp2.clone()])));
+        assert!(surface_of(&app, &a).is_some() && surface_of(&app, &b).is_some() && surface_of(&app, &c).is_some());
+        // Default thumbnails are 480 wide, no border, 16:9 → 270 tall.
+        let place = |app: &mut App, h: &Handle, output: &str, x: i32, y: i32| {
+            let cl = app.clients.get_mut(h).unwrap();
+            cl.output = output.to_string();
+            cl.position = (x, y);
+        };
+        place(&mut app, &a, "DP-1", 40, 100);
+        place(&mut app, &b, "DP-1", 600, 500);
+        place(&mut app, &c, "DP-2", 20, 0);
+        let (note, _task) = app.centre_vertically();
+        // DP-1: span 100..770 (670 tall) on 1440 → top at 385 → dy 285.
+        assert_eq!(app.clients[&a].position, (40, 385));
+        assert_eq!(app.clients[&b].position, (600, 785), "same shift, x untouched");
+        // DP-2: span 0..270 → top at 585.
+        assert_eq!(app.clients[&c].position, (20, 585));
+        assert_eq!(note, "centred 2 thumbnails on DP-1; centred 1 thumbnail on DP-2");
+        // Already centred: nothing moves, and it still counts as centred.
+        let (note, _task) = app.centre_vertically();
+        assert_eq!(app.clients[&a].position, (40, 385));
+        assert_eq!(note, "centred 2 thumbnails on DP-1; centred 1 thumbnail on DP-2");
+        // Hidden thumbnails have no surface and are left alone.
+        let _ = app.set_hidden(true);
+        let (note, _task) = app.centre_vertically();
+        assert_eq!(note, "nothing to centre");
+        assert_eq!(app.clients[&a].position, (40, 385));
+        // The dock is centred by its own layout.
+        app.config.mode = Mode::Dock;
+        assert_eq!(app.centre_vertically().0, "the dock is already centred along its edge");
     }
 
     /// [I6] The first layer surface we create is the permanent keepalive,

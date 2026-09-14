@@ -430,6 +430,20 @@ pub enum Msg {
     LayoutCancel,
     /// Layouts: the confirmed delete.
     Delete(String),
+    /// Layouts: centre the floating thumbnails on each monitor.
+    CentreVertically,
+}
+
+/// Why *Centre vertically* is disabled, or `None` (opacity-and-centre
+/// spec §2.1).
+pub fn centre_blocker(mode: Mode, thumbs_shown: bool) -> Option<&'static str> {
+    if mode == Mode::Dock {
+        Some("The dock is already centred along its edge.")
+    } else if !thumbs_shown {
+        Some("No thumbnails are showing.")
+    } else {
+        None
+    }
 }
 
 /// The four things the Tunnel page can ask the daemon to do. Each runs the
@@ -550,11 +564,12 @@ pub fn view<'a>(
     config: &'a Config,
     focused: bool,
     clients_running: bool,
+    thumbs_shown: bool,
 ) -> Element<'a, super::Msg> {
     let page = state.page();
     let body: Element<'a, Msg> = match (page, &state.config_error) {
         // Layout files are not `config.ron`; this page works either way.
-        (Page::Layouts, _) => layouts_page(state),
+        (Page::Layouts, _) => layouts_page(state, config, thumbs_shown),
         // Nor does the Steam page read or write anything: it is a fixed
         // string and a Copy button, and it is exactly the page someone
         // whose config is broken may still need.
@@ -974,8 +989,16 @@ fn layout_row<'a>(state: &'a State, summary: &'a layout::LayoutSummary) -> Eleme
     widget::container(col).width(Length::Fill).class(class).into()
 }
 
-fn layouts_page(state: &State) -> Element<'_, Msg> {
-    let mut sections: Vec<Element<'_, Msg>> = Vec::new();
+fn layouts_page<'a>(state: &'a State, config: &'a Config, thumbs_shown: bool) -> Element<'a, Msg> {
+    let mut sections: Vec<Element<'a, Msg>> = Vec::new();
+    // Arrange (opacity-and-centre spec §2): one button, with its blocker as
+    // the help line when it cannot act.
+    let blocker = centre_blocker(config.mode, thumbs_shown);
+    let help = blocker.unwrap_or("Moves the floating thumbnails on each monitor so the group sits in the middle of the screen. Left-right positions are kept.");
+    sections.push(ui::section(
+        "Arrange",
+        ui::card(vec![ui::row("Centre vertically", Some(help), ui::standard_button("Centre vertically", blocker.is_none().then_some(Msg::CentreVertically)))]),
+    ));
     if let Some(error) = state.layout_error.as_deref() {
         sections.push(ui::panel(
             ui::Tint::Destructive,
@@ -1450,9 +1473,18 @@ mod tests {
         assert_eq!(c.eve_settings_dir.as_deref(), Some("/mnt/eve/settings_Default"));
         assert_eq!(apply_config_field(&mut c, &Msg::ProfileDirChosen(None)), Ok(false));
         // Transient UI messages are not config fields.
-        for m in [Msg::AskCopy, Msg::CancelCopy, Msg::AskUninstall, Msg::CancelUninstall, Msg::CopyReset, Msg::SteamFullPath(true), Msg::LayoutMenu("x".into()), Msg::LayoutCancel] {
+        for m in [Msg::AskCopy, Msg::CancelCopy, Msg::AskUninstall, Msg::CancelUninstall, Msg::CopyReset, Msg::SteamFullPath(true), Msg::LayoutMenu("x".into()), Msg::LayoutCancel, Msg::CentreVertically] {
             assert_eq!(apply_config_field(&mut c, &m), Ok(false));
         }
+    }
+
+    /// Spec §2.1: disabled, with the reason, in dock mode and with nothing
+    /// shown.
+    #[test]
+    fn centre_vertically_is_disabled_in_dock_mode_and_with_nothing_shown() {
+        assert_eq!(centre_blocker(Mode::Dock, true), Some("The dock is already centred along its edge."));
+        assert_eq!(centre_blocker(Mode::Floating, false), Some("No thumbnails are showing."));
+        assert_eq!(centre_blocker(Mode::Floating, true), None);
     }
 
     /// libcosmic draws the header bar itself, so the toplevel must be

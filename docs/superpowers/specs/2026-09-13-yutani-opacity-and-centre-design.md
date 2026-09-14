@@ -2,8 +2,10 @@
 
 **Status:** requested by Daniel 2026-09-13 ("add a transparency slider to
 the Thumbnails section … under Display" and "a button in settings to center
-the thumbnail vertically"); design approved the same day. Plan:
-`docs/superpowers/plans/2026-09-13-yutani-opacity-and-centre.md`.
+the thumbnail vertically"); design approved the same day. §1 built
+2026-09-14 (ca7ac2c), §2 built 2026-09-14 as an *Arrange* section on the
+redesigned Layouts pane (the button, its blocker as the row's help line,
+the note at the header's end).
 
 ## 1. Thumbnail opacity
 

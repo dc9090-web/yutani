@@ -104,6 +104,22 @@ pub fn summaries() -> Vec<LayoutSummary> {
     summaries_in(&layouts_dir())
 }
 
+/// The vertical shift that centres a group spanning `top..bottom` on a
+/// screen `height` tall (opacity-and-centre spec §2.2). An odd leftover
+/// pixel goes to the top. A group taller than the screen is pinned to the
+/// top (shift so `top` is 0), never pushed off the bottom. An empty or
+/// inverted span moves nothing.
+pub fn centre_shift(top: i32, bottom: i32, height: i32) -> i32 {
+    if bottom <= top {
+        return 0;
+    }
+    let span = bottom - top;
+    if span >= height {
+        return -top;
+    }
+    (height - span) / 2 - top
+}
+
 /// A name for a duplicate of `name` that no saved layout has yet:
 /// `<name> copy`, then `<name> copy 2`, …
 pub fn duplicate_name(name: &str, taken: &[String]) -> String {
@@ -530,6 +546,20 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spec §2.5: already centred → 0; a 200-tall group at the top of a
+    /// 1440 screen → 620; an odd leftover pixel goes to the top; a group
+    /// taller than the screen is pinned to the top; an empty span is 0.
+    #[test]
+    fn centre_shift_centres_a_group_and_pins_a_tall_one_to_the_top() {
+        assert_eq!(centre_shift(620, 820, 1440), 0);
+        assert_eq!(centre_shift(0, 200, 1440), 620);
+        assert_eq!(centre_shift(100, 301, 1440), 519, "1440 - 201 = 1239, halved rounds down: the extra pixel is at the top");
+        assert_eq!(centre_shift(50, 2000, 1440), -50);
+        assert_eq!(centre_shift(0, 1440, 1440), 0);
+        assert_eq!(centre_shift(300, 300, 1440), 0);
+        assert_eq!(centre_shift(300, 100, 1440), 0);
+    }
 
     /// The settings window's Layouts list: counts from the file, the save
     /// time from its mtime, and a duplicate name that is free.
