@@ -150,10 +150,11 @@ running the teardown for whatever was already created.
 
 **Up**, in order:
 
-0. **slice** — if `/sys/fs/cgroup/<cgroup path>` does not exist, `env
-   XDG_RUNTIME_DIR=/run/user/<uid> systemctl --user --no-ask-password
-   start yutani-eve.slice` (root reaches the user's manager over its
-   private socket, which accepts uid 0; 5 s bound). nft compiles the
+0. **slice** — if `/sys/fs/cgroup/<cgroup path>` does not exist,
+   `systemctl --user --machine=<uid>@.host --no-ask-password start
+   yutani-eve.slice` (systemd's route from root to another user's manager;
+   the private-socket route is refused to root on systemd 261 — found on
+   the first live run; 5 s bound). nft compiles the
    `socket cgroupv2` path to a cgroup *id* at load time and refuses a path
    that is not there, so this must precede step 8. Fails the start, in
    plain words ("is that user logged in?"), if the slice cannot be

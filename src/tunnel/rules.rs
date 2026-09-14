@@ -36,15 +36,15 @@ pub fn cgroup_dir(uid: u32) -> std::path::PathBuf {
 /// there — and after a reboot nothing has created it until the first
 /// `yutani launch` or adoption, which normally comes after the tunnel.
 ///
-/// With `XDG_RUNTIME_DIR` pointing at the user's runtime directory,
-/// `systemctl --user` talks to that manager over its private socket
-/// (`/run/user/<uid>/systemd/private`), which the manager accepts from its
-/// own uid and from root — no user switch, no D-Bus session bus, no
-/// `--machine` transport. Starting a slice that is already active is a
-/// no-op; a started slice stays active, and its cgroup stays put, after
-/// every scope under it has exited.
+/// `--machine=<uid>@.host --user` is systemd's own route from root to
+/// another user's manager (systemd ≥ 248; verified on 261, where root on
+/// the user's private socket is refused with "Operation not permitted
+/// (consider using --machine=<user>@.host --user)"). A bare uid is
+/// accepted for the user part, which is all the conf records. Starting a
+/// slice that is already active is a no-op; a started slice stays active,
+/// and its cgroup stays put, after every scope under it has exited.
 pub fn slice_start_command(uid: u32) -> Vec<String> {
-    argv(&["env", &format!("XDG_RUNTIME_DIR=/run/user/{uid}"), "systemctl", "--user", "--no-ask-password", "start", SLICE])
+    argv(&["systemctl", "--user", &format!("--machine={uid}@.host"), "--no-ask-password", "start", SLICE])
 }
 
 /// `dns_servers` are the resolvers `systemd-resolved` is pointed at for
@@ -277,15 +277,16 @@ mod tests {
         .unwrap()
     }
 
-    /// Root starts the slice on the user's own manager over its private
-    /// socket: `systemctl --user` with only `XDG_RUNTIME_DIR` set, no user
-    /// switch. A missing cgroup is what made every post-reboot connect
-    /// fail with "Could not parse cgroupsv2 path" (2026-09-14).
+    /// Root starts the slice on the user's own manager through systemd's
+    /// `--machine=<uid>@.host --user` transport (the private-socket route
+    /// is refused to root on systemd 261). A missing cgroup is what made
+    /// every post-reboot connect fail with "Could not parse cgroupsv2
+    /// path" (2026-09-14).
     #[test]
-    fn the_slice_is_started_on_the_users_manager_over_its_private_socket() {
+    fn the_slice_is_started_on_the_users_manager_through_the_machine_transport() {
         assert_eq!(
             slice_start_command(1000),
-            ["env", "XDG_RUNTIME_DIR=/run/user/1000", "systemctl", "--user", "--no-ask-password", "start", "yutani-eve.slice"]
+            ["systemctl", "--user", "--machine=1000@.host", "--no-ask-password", "start", "yutani-eve.slice"]
         );
         assert_eq!(cgroup_dir(1000).to_str().unwrap(), "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice");
     }

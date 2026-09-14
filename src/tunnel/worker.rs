@@ -1220,7 +1220,7 @@ mod tests {
         assert!(out.contains("resolvectl domain yutani0 ~eveonline.com ~ccpgames.com ~evetech.net"));
         assert!(out.contains("resolvectl default-route yutani0 false"));
         assert!(out.contains("resolvectl revert yutani0"));
-        assert!(out.contains("env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user --no-ask-password start yutani-eve.slice"));
+        assert!(out.contains("systemctl --user --machine=1000@.host --no-ask-password start yutani-eve.slice"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
