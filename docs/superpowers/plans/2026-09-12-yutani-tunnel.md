@@ -791,13 +791,13 @@ mod tests {
 
     #[test]
     fn polkit_text_authorises_one_unit_for_one_user() {
-        let p = polkit_text("daniel");
+        let p = polkit_text("alice");
         assert!(p.contains(r#"action.id == "org.freedesktop.systemd1.manage-units""#));
         assert!(p.contains(r#"action.lookup("unit") == "yutani-tunnel.service""#));
         assert!(p.contains(r#"action.lookup("verb") == "start""#));
         assert!(p.contains(r#"action.lookup("verb") == "stop""#));
         assert!(p.contains(r#"action.lookup("verb") == "restart""#));
-        assert!(p.contains(r#"subject.user == "daniel""#));
+        assert!(p.contains(r#"subject.user == "alice""#));
         assert!(p.contains("polkit.Result.YES"));
         assert!(!p.contains("polkit.Result.NO"));
     }
@@ -1670,8 +1670,8 @@ fn run(patterns: &Vec<String>) -> iced::futures::stream::BoxStream<'static, Adop
 ```bash
 ./target/debug/yutani launch -- /bin/sh -c 'cat /proc/self/cgroup'    # 0::/user.slice/user-1000.slice/user@1000.service/yutani.slice/yutani-eve.slice/run-….scope
 systemctl --user list-units 'yutani-eve*' --all | head -5
-(RUST_LOG=yutani=info setsid nohup ./target/debug/yutani >/tmp/claude-1000/-home-user-Yutani/eb30ce00-6f26-46d7-ad81-bfd5bce301f6/scratchpad/yutani_adopt.log 2>&1 &); sleep 6
-sed 's/\x1b\[[0-9;]*m//g' /tmp/claude-1000/-home-user-Yutani/eb30ce00-6f26-46d7-ad81-bfd5bce301f6/scratchpad/yutani_adopt.log | grep -E 'adopt|panic|error'   # "adopted into yutani-eve.slice pid=… name=exefile.exe"
+(RUST_LOG=yutani=info setsid nohup ./target/debug/yutani >/tmp/yutani-dev/yutani_adopt.log 2>&1 &); sleep 6
+sed 's/\x1b\[[0-9;]*m//g' /tmp/yutani-dev/yutani_adopt.log | grep -E 'adopt|panic|error'   # "adopted into yutani-eve.slice pid=… name=exefile.exe"
 cat /proc/$(pgrep -f exefile.exe | head -1)/cgroup                       # …/yutani-eve.slice/yutani-eve-adopt-<pid>.scope
 systemctl --user status yutani-eve.slice --no-pager | head -8
 ./target/debug/yutani quit

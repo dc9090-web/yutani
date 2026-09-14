@@ -638,13 +638,13 @@ mod tests {
 
     #[test]
     fn polkit_text_authorises_one_unit_for_one_user() {
-        let p = polkit_text("daniel");
+        let p = polkit_text("alice");
         assert!(p.contains(r#"action.id == "org.freedesktop.systemd1.manage-units""#));
         assert!(p.contains(r#"action.lookup("unit") == "yutani-tunnel.service""#));
         assert!(p.contains(r#"action.lookup("verb") == "start""#));
         assert!(p.contains(r#"action.lookup("verb") == "stop""#));
         assert!(p.contains(r#"action.lookup("verb") == "restart""#));
-        assert!(p.contains(r#"subject.user == "daniel""#));
+        assert!(p.contains(r#"subject.user == "alice""#));
         assert!(p.contains("polkit.Result.YES"));
         assert!(!p.contains("polkit.Result.NO"));
     }
@@ -672,13 +672,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("EVE.conf");
         std::fs::write(&conf, "[Interface]\nPrivateKey = U0VDUkVU\nAddress = 10.2.0.2/32\n[Peer]\nPublicKey = p=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n").unwrap();
-        let report = install_root(&conf, 1000, "daniel", "/opt/yutani/yutani", &servers(), &domains(), true).unwrap();
+        let report = install_root(&conf, 1000, "alice", "/opt/yutani/yutani", &servers(), &domains(), true).unwrap();
         assert!(report.contains("# yutani: dns_servers = 1.1.1.1 9.9.9.9"), "{report}");
         assert!(report.contains("# yutani: dns_domains = eveonline.com ccpgames.com evetech.net"), "{report}");
 
         // Empty lists (an `install-root` run by hand) get the defaults, not
         // a conf that says "no DNS in the tunnel".
-        let report = install_root(&conf, 1000, "daniel", "/opt/yutani/yutani", &[], &[], true).unwrap();
+        let report = install_root(&conf, 1000, "alice", "/opt/yutani/yutani", &[], &[], true).unwrap();
         assert!(report.contains("# yutani: dns_servers = 1.1.1.1 9.9.9.9"), "{report}");
         assert!(report.contains("# yutani: dns_domains = eveonline.com ccpgames.com evetech.net"), "{report}");
         std::fs::remove_dir_all(&dir).unwrap();
@@ -696,10 +696,10 @@ mod tests {
         let conf = dir.join("EVE.conf");
         std::fs::write(&conf, "[Interface]\nPrivateKey = U0VDUkVU\nAddress = 10.2.0.2/32\n[Peer]\nPublicKey = p=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n").unwrap();
         let forged = vec!["eveonline.com\n# yutani: uid = 0".to_string()];
-        let e = install_root(&conf, 1000, "daniel", "/opt/y", &servers(), &forged, true).unwrap_err().to_string();
+        let e = install_root(&conf, 1000, "alice", "/opt/y", &servers(), &forged, true).unwrap_err().to_string();
         assert!(e.contains("host name"), "expected a clear message, got {e}");
         let spaced = vec!["eve online.com".to_string()];
-        assert!(install_root(&conf, 1000, "daniel", "/opt/y", &servers(), &spaced, true).is_err());
+        assert!(install_root(&conf, 1000, "alice", "/opt/y", &servers(), &spaced, true).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -715,7 +715,7 @@ mod tests {
         let dir = temp_dir("inst-forge");
         let conf = dir.join("x\n# yutani: uid = 0\n# yutani: dns_servers = 10.0.0.1.conf");
         std::fs::write(&conf, "[Interface]\nPrivateKey = U0VDUkVU\nAddress = 10.2.0.2/32\n[Peer]\nPublicKey = p=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n").unwrap();
-        let report = install_root(&conf, 1000, "daniel", "/opt/yutani/yutani", &servers(), &domains(), true).unwrap();
+        let report = install_root(&conf, 1000, "alice", "/opt/yutani/yutani", &servers(), &domains(), true).unwrap();
         assert!(!report.contains("# yutani: label"), "the label line is dead and must not be written: {report}");
         let first = |key: &str| {
             let prefix = format!("# yutani: {key} =");
@@ -738,11 +738,11 @@ mod tests {
         std::fs::write(&conf, GOOD_CONF).unwrap();
         for bad in ["192.168.1.1", "10.0.0.1", "127.0.0.53", "169.254.1.1", "0.0.0.0"] {
             let servers = vec![bad.parse().unwrap(), "8.8.8.8".parse().unwrap()];
-            let e = install_root(&conf, 1000, "daniel", "/opt/y", &servers, &domains(), true).unwrap_err().to_string();
+            let e = install_root(&conf, 1000, "alice", "/opt/y", &servers, &domains(), true).unwrap_err().to_string();
             assert!(e.contains(bad), "the message must name the address, got {e}");
             assert!(e.contains("exit node"), "got {e}");
         }
-        assert!(install_root(&conf, 1000, "daniel", "/opt/y", &["8.8.8.8".parse().unwrap()], &domains(), true).is_ok());
+        assert!(install_root(&conf, 1000, "alice", "/opt/y", &["8.8.8.8".parse().unwrap()], &domains(), true).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -759,15 +759,15 @@ mod tests {
         std::fs::write(&real, GOOD_CONF).unwrap();
         let link = dir.join("link.conf");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let e = install_root(&link, 1000, "daniel", "/opt/y", &servers(), &domains(), true).unwrap_err().to_string();
+        let e = install_root(&link, 1000, "alice", "/opt/y", &servers(), &domains(), true).unwrap_err().to_string();
         assert!(e.contains("symlink"), "got {e}");
-        let e = install_root(Path::new("/dev/null"), 1000, "daniel", "/opt/y", &servers(), &domains(), true).unwrap_err().to_string();
+        let e = install_root(Path::new("/dev/null"), 1000, "alice", "/opt/y", &servers(), &domains(), true).unwrap_err().to_string();
         assert!(e.contains("regular file"), "got {e}");
         let big = dir.join("big.conf");
         std::fs::write(&big, format!("{GOOD_CONF}# {}\n", "x".repeat(CONF_MAX_LEN as usize))).unwrap();
-        let e = install_root(&big, 1000, "daniel", "/opt/y", &servers(), &domains(), true).unwrap_err().to_string();
+        let e = install_root(&big, 1000, "alice", "/opt/y", &servers(), &domains(), true).unwrap_err().to_string();
         assert!(e.contains("KiB"), "got {e}");
-        assert!(install_root(&real, 1000, "daniel", "/opt/y", &servers(), &domains(), true).is_ok());
+        assert!(install_root(&real, 1000, "alice", "/opt/y", &servers(), &domains(), true).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -841,12 +841,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("EVE-UK-455.conf");
         std::fs::write(&conf, "[Interface]\nPrivateKey = U0VDUkVU\nAddress = 10.2.0.2/32\nDNS = 10.2.0.1\n[Peer]\n# UK#455\nPublicKey = p=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n").unwrap();
-        let report = install_root(&conf, 1000, "daniel", "/opt/yutani/yutani", &servers(), &domains(), true).unwrap();
+        let report = install_root(&conf, 1000, "alice", "/opt/yutani/yutani", &servers(), &domains(), true).unwrap();
         assert!(report.contains("# yutani: uid = 1000"));
         assert!(report.contains("PrivateKey = <redacted>"));
         assert!(!report.contains("U0VDUkVU"));
         assert!(report.contains("ExecStart=/opt/yutani/yutani tunnel run"));
-        assert!(report.contains(r#"subject.user == "daniel""#));
+        assert!(report.contains(r#"subject.user == "alice""#));
         assert_eq!(Path::new(CONF_PATH).exists(), existed, "a dry run must not touch {CONF_PATH}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -870,7 +870,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("EVE.conf");
         std::fs::write(&conf, "[Interface]\nprivatekey = U0VDUkVU\nAddress = 10.2.0.2/32\nDNS = 10.2.0.1\n[Peer]\n# UK#455\nPublicKey = p=\nPRESHAREDKEY = UFNLU0VDUkVU\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n").unwrap();
-        let report = install_root(&conf, 1000, "daniel", "/opt/yutani/yutani", &servers(), &domains(), true).unwrap();
+        let report = install_root(&conf, 1000, "alice", "/opt/yutani/yutani", &servers(), &domains(), true).unwrap();
         assert!(!report.contains("U0VDUkVU"), "the private key leaked into the report: {report}");
         assert!(!report.contains("UFNLU0VDUkVU"), "the preshared key leaked into the report");
         assert!(report.contains("privatekey = <redacted>"));
@@ -886,13 +886,13 @@ mod tests {
         std::fs::write(&conf, "[Interface]\nPrivateKey = U0VDUkVU\nAddress = 10.2.0.2/32\n[Peer]\nPublicKey = p=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 1.2.3.4:51820\n").unwrap();
         let e = install_root(&conf, 1000, "a\"b", "/opt/y", &servers(), &domains(), true).unwrap_err().to_string();
         assert!(e.contains("user name"), "expected a clear message, got {e}");
-        assert!(install_root(&conf, 1000, "daniel_2-x", "/opt/y", &servers(), &domains(), true).is_ok());
+        assert!(install_root(&conf, 1000, "alice_2-x", "/opt/y", &servers(), &domains(), true).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn user_names_follow_the_posix_portable_set() {
-        for ok in ["daniel", "_svc", "a-b_c", "eve$", "u0"] {
+        for ok in ["alice", "_svc", "a-b_c", "eve$", "u0"] {
             assert!(valid_username(ok), "{ok} should be accepted");
         }
         for bad in ["", "Daniel", "0day", "a\"b", "a b", "a;b", "root\\", "hé"] {
@@ -998,7 +998,7 @@ mod tests {
         std::fs::write(&conf, GOOD_CONF).unwrap();
         let exe = dir.join("yutani");
         std::fs::write(&exe, "#!/bin/true\n").unwrap();
-        let e = install_root(&conf, 1000, "daniel", exe.to_str().unwrap(), &servers(), &domains(), false).unwrap_err().to_string();
+        let e = install_root(&conf, 1000, "alice", exe.to_str().unwrap(), &servers(), &domains(), false).unwrap_err().to_string();
         assert!(e.contains("refusing"), "got {e}");
         assert!(e.contains("sudo install -o root -g root -m 0755"), "got {e}");
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1011,7 +1011,7 @@ mod tests {
         std::fs::write(&conf, GOOD_CONF).unwrap();
         let exe = dir.join("yutani");
         std::fs::write(&exe, "#!/bin/true\n").unwrap();
-        let r = install_root(&conf, 1000, "daniel", exe.to_str().unwrap(), &servers(), &domains(), true).unwrap();
+        let r = install_root(&conf, 1000, "alice", exe.to_str().unwrap(), &servers(), &domains(), true).unwrap();
         assert!(r.contains("refusing"), "the dry run must report the refusal: {r}");
         assert!(r.contains("sudo install -o root -g root -m 0755"));
         assert!(r.contains("ExecStart="), "the dry run must still print the rest: {r}");
@@ -1066,7 +1066,7 @@ mod tests {
         // The temp dir is owned by the test user, so the real install would
         // still refuse this — but the dry run must report the *resolved*
         // path, not the symlink path it was handed.
-        let r = install_root(&conf, 1000, "daniel", link.to_str().unwrap(), &servers(), &domains(), true).unwrap();
+        let r = install_root(&conf, 1000, "alice", link.to_str().unwrap(), &servers(), &domains(), true).unwrap();
         assert!(r.contains("refusing"), "a user-owned exe must still be refused: {r}");
         assert!(
             r.contains(&format!("ExecStart={} tunnel run", resolved_target.display())),
@@ -1084,11 +1084,11 @@ mod tests {
 
     #[test]
     fn the_root_side_refuses_a_user_name_that_is_not_the_uids_own() {
-        assert!(check_username(1000, "daniel", Some("daniel")).is_ok());
-        let e = check_username(1000, "root", Some("daniel")).unwrap_err().to_string();
+        assert!(check_username(1000, "alice", Some("alice")).is_ok());
+        let e = check_username(1000, "root", Some("alice")).unwrap_err().to_string();
         assert!(e.contains("uid 1000"), "got {e}");
-        assert!(e.contains("daniel") && e.contains("root"), "got {e}");
-        let e = check_username(4242, "daniel", None).unwrap_err().to_string();
+        assert!(e.contains("alice") && e.contains("root"), "got {e}");
+        let e = check_username(4242, "alice", None).unwrap_err().to_string();
         assert!(e.contains("4242"), "got {e}");
     }
 

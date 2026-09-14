@@ -729,7 +729,7 @@ Run: `cargo build -q 2>&1 | grep -E '^(warning|error)' -A6; cargo test -q 2>&1 |
 - [ ] **Step 4: Smoke (EVE running, no yutani running)**
 
 ```bash
-LOG=/tmp/claude-1000/-home-user-Yutani/eb30ce00-6f26-46d7-ad81-bfd5bce301f6/scratchpad/yutani_ipc.log
+LOG=/tmp/yutani-dev/yutani_ipc.log
 (RUST_LOG=yutani=debug setsid nohup ./target/debug/yutani >$LOG 2>&1 &); sleep 4
 ls -la $XDG_RUNTIME_DIR/yutani.sock                      # srw------- 
 ./target/debug/yutani; echo "exit=$?"                     # yutani is already running / exit=1
@@ -1165,7 +1165,7 @@ cp -n $P $P.bak 2>/dev/null || echo "(no pre-existing custom file)"
 ./target/debug/yutani shortcuts install && cat $P
 ./target/debug/yutani shortcuts install && grep -c 'yutani' $P     # idempotent: still 11
 ```
-Then start the app (`(RUST_LOG=yutani=info setsid nohup ./target/debug/yutani >/tmp/claude-1000/-home-user-Yutani/eb30ce00-6f26-46d7-ad81-bfd5bce301f6/scratchpad/yutani_sc.log 2>&1 &)`), and **ask Daniel** to press `Ctrl+Alt+1` with a non-EVE window focused: EVE must come to the front; `Ctrl+Alt+Right`/`Left` cycle (one client → stays). Then:
+Then start the app (`(RUST_LOG=yutani=info setsid nohup ./target/debug/yutani >/tmp/yutani-dev/yutani_sc.log 2>&1 &)`), and **ask Daniel** to press `Ctrl+Alt+1` with a non-EVE window focused: EVE must come to the front; `Ctrl+Alt+Right`/`Left` cycle (one client → stays). Then:
 ```bash
 ./target/debug/yutani shortcuts uninstall && cat $P               # {} or only foreign entries
 ./target/debug/yutani quit

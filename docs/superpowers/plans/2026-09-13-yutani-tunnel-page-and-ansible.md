@@ -582,7 +582,7 @@ yutani_packages:
 localhost ansible_connection=local
 
 [yutani_hosts:vars]
-yutani_user=daniel
+yutani_user=alice
 ```
 
 `ansible.cfg`: `[defaults] inventory = inventory.example.ini`, `roles_path = roles`, `interpreter_python = auto_silent`.
@@ -600,7 +600,7 @@ Root `README.md`: one paragraph on what Yutani is (live thumbnails, hotkeys, pan
 ```bash
 cd deploy/ansible && ansible-playbook --syntax-check playbook.yml
 which ansible-lint && ansible-lint playbook.yml roles/ || echo "ansible-lint not installed"
-ansible-playbook --check --diff playbook.yml -e yutani_user=daniel -e yutani_manage_packages=false 2>&1 | tail -20
+ansible-playbook --check --diff playbook.yml -e yutani_user=alice -e yutani_manage_packages=false 2>&1 | tail -20
 ```
 (the check run will skip `command` tasks; that is expected — report what it did). Do NOT run the playbook for real: it needs the become password, and the controller will run it.
 

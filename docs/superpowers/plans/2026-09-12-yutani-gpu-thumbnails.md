@@ -1252,14 +1252,14 @@ Expected: clean; `ok. 57 passed`.
 
 ```bash
 pkill -f target/debug/yutani; sleep 0.5
-LOG=/tmp/claude-1000/-home-user-Yutani/eb30ce00-6f26-46d7-ad81-bfd5bce301f6/scratchpad/yutani.log
+LOG=/tmp/yutani-dev/yutani.log
 (RUST_LOG=yutani=debug setsid nohup ./target/debug/yutani >$LOG 2>&1 &); sleep 5
 sed 's/\x1b\[[0-9;]*m//g' $LOG | grep -E 'GL|gl |create_surface|panic|error|warn' | cut -c1-160
 ```
 Expected: `create_surface … width=484 height=274`, `GL thumbnail pass ready (…)`, no warnings/errors. Then:
 
 ```bash
-cd /tmp/claude-1000/-home-user-Yutani/eb30ce00-6f26-46d7-ad81-bfd5bce301f6/scratchpad
+cd /tmp/yutani-dev
 timeout 15 cosmic-screenshot --interactive=false --modal=false --notify=false -s "$PWD" >/dev/null
 python3 - <<'EOF'
 from PIL import Image; import glob
