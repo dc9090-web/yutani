@@ -11,6 +11,7 @@ Native Wayland. No middleware, no X11 layer, no injected DLLs. Just the latest C
 [![Wayland](https://img.shields.io/badge/Wayland-native-7c3aed)](https://wayland.freedesktop.org/)
 [![Arch / CachyOS](https://img.shields.io/badge/Arch%20%2F%20CachyOS-pacman%20package-1793d1?logo=archlinux&logoColor=white)](packaging/PKGBUILD)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-green)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/dc9090-web/yutani?label=Download&color=e11d48)](https://github.com/dc9090-web/yutani/releases/latest)
 
 <img src="docs/screenshots/thumbnail-fullscreen.jpg" alt="A full-screen EVE client with a live thumbnail of the second account pinned at the top of the screen" width="900">
 
@@ -131,7 +132,13 @@ Set the overview, window positions and chat layout up once on one character, the
 
 ### The package (recommended)
 
-`packaging/PKGBUILD` builds Yutani from this checkout into a pacman package that owns the binaries in `/usr/bin`, the icons, both desktop entries and the daemon's systemd user unit, with every runtime dependency declared.
+**Prebuilt:** grab the `.pkg.tar.zst` from the [latest release](https://github.com/dc9090-web/yutani/releases/latest) and install it:
+
+```bash
+sudo pacman -U yutani-*.pkg.tar.zst
+```
+
+**Or build it yourself.** `packaging/PKGBUILD` builds Yutani from this checkout into a pacman package that owns the binaries in `/usr/bin`, the icons, both desktop entries and the daemon's systemd user unit, with every runtime dependency declared.
 
 ```bash
 git clone https://github.com/dc9090-web/yutani.git
