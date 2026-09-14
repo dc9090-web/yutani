@@ -169,6 +169,9 @@ pub fn accent(c: &Cosmic) -> Color {
 pub fn destructive(c: &Cosmic) -> Color {
     c.destructive_color().into()
 }
+pub fn warning(c: &Cosmic) -> Color {
+    c.warning_color().into()
+}
 /// The download series: accent-adjacent — the accent itself here.
 pub fn download(c: &Cosmic) -> Color {
     accent(c)

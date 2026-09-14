@@ -28,6 +28,8 @@ enum Role {
     Success,
     Download,
     Destructive,
+    /// Set-up news the user must act on (the Steam notice).
+    Warning,
     /// Text on the accent surface (the suggested primary button).
     OnAccent,
     /// A disabled control's label.
@@ -49,6 +51,7 @@ impl Role {
             Role::Success => |t| text_style(theme::success(t.cosmic())),
             Role::Download => |t| text_style(theme::download(t.cosmic())),
             Role::Destructive => |t| text_style(theme::destructive(t.cosmic())),
+            Role::Warning => |t| text_style(theme::warning(t.cosmic())),
             Role::OnAccent => |t| text_style(t.cosmic().on_accent_color().into()),
             Role::Disabled => |t| text_style(theme::dimmed(theme::ink(t.cosmic()))),
             Role::State(true) => |t| text_style(theme::state_color(t.cosmic(), true)),
@@ -109,7 +112,8 @@ fn card<'a>(content: impl Into<Element<'a, Msg>>) -> Element<'a, Msg> {
 /// over its bottom-right corner (`IconState::badge`).
 pub fn panel_button(state: &Applet) -> Element<'_, Msg> {
     let clients = state.status.as_ref().map_or(0, |s| s.clients.len());
-    let icon = icon_state(state.status.as_ref().map(|s| &s.tunnel), clients, state.pending());
+    let steam_problem = state.status.as_ref().is_some_and(|s| !s.steam.is_empty());
+    let icon = icon_state(state.status.as_ref().map(|s| &s.tunnel), clients, state.pending(), steam_problem);
     let (w, h) = state.core.applet.suggested_size(true);
     let mark = widget::icon(widget::icon::from_svg_bytes(icon.bytes(h)).symbolic(true))
         .class(theme::mark_class())
@@ -366,6 +370,11 @@ fn tiles<'a>(p: &Popover) -> Element<'a, Msg> {
 
 // ---- 7. action row -----------------------------------------------------------
 
+/// The Steam notice: one warning line above the primary action.
+fn notice_line<'a>(text: &str) -> Element<'a, Msg> {
+    widget::container(mono(text.to_string(), theme::NOTE_SIZE, Weight::Normal, Role::Warning)).width(Length::Fill).padding(theme::NOTE_PAD).into()
+}
+
 fn action_row<'a>(p: &Popover, menu_open: bool) -> Element<'a, Msg> {
     let label_role = if p.primary.action().is_some() { Role::Ink } else { Role::Disabled };
     let label = ui(p.primary.label(), theme::PRIMARY_SIZE, Weight::Semibold, label_role);
@@ -446,7 +455,11 @@ pub fn popup(state: &Applet) -> Element<'_, Msg> {
     if p.graph {
         content = content.push(throughput_card(&p));
     }
-    content = content.push(tiles(&p)).push(action_row(&p, state.menu_open));
+    content = content.push(tiles(&p));
+    if let Some(notice) = &p.notice {
+        content = content.push(notice_line(notice));
+    }
+    content = content.push(action_row(&p, state.menu_open));
     if let Some(note) = state.visible_note() {
         content = content.push(note_line(note));
     }

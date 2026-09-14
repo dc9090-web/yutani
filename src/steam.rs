@@ -4,8 +4,10 @@
 //! applet and the settings window. Yutani only ever *reads* Steam's files.
 //! See docs/superpowers/specs/2026-09-14-steam-launch-check-design.md.
 
+use cosmic::iced::{self, Subscription};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// EVE Online's Steam app id.
 pub const EVE_APP_ID: &str = "8500";
@@ -242,9 +244,6 @@ pub fn first_message(findings: &[Finding]) -> Option<String> {
     findings.iter().find_map(|f| f.verdict.message())
 }
 
-use cosmic::iced::{self, Subscription};
-use std::time::Duration;
-
 /// How often the daemon re-reads Steam's files. Steam rewrites
 /// `localconfig.vdf` when Properties closes and when it exits, so a fix
 /// made in Steam's UI shows up within this.
@@ -259,16 +258,23 @@ pub fn subscription() -> Subscription<Vec<Finding>> {
 }
 
 fn run() -> impl iced::futures::Stream<Item = Vec<Finding>> {
-    iced::futures::stream::unfold(None::<Vec<Finding>>, |mut last| async move {
+    iced::futures::stream::unfold((false, None::<Vec<Finding>>), |(mut started, last)| async move {
         loop {
-            if last.is_some() {
+            if started {
                 futures_timer::Delay::new(PERIOD).await;
             }
-            let now = tokio::task::spawn_blocking(problems).await.unwrap_or_default();
+            let attempt = tokio::task::spawn_blocking(problems).await;
+            started = true;
+            let now = match attempt {
+                Err(e) => {
+                    tracing::warn!("steam scan task failed: {e}");
+                    continue;
+                }
+                Ok(now) => now,
+            };
             if last.as_ref() != Some(&now) {
-                return Some((now.clone(), Some(now)));
+                return Some((now.clone(), (started, Some(now))));
             }
-            last = Some(now);
         }
     })
 }

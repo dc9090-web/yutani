@@ -113,30 +113,39 @@ pub struct Popover {
     /// `ENDPOINT` and `PEER`.
     pub tiles: [(&'static str, String); 2],
     pub primary: Primary,
+    /// One line of set-up news above the primary action — a Steam launch
+    /// line that will fail or bypass the tunnel — `None` when there is
+    /// nothing to say.
+    pub notice: Option<String>,
 }
 
+/// The notice row's height in the estimate: `theme::NOTE_SIZE` text plus
+/// `theme::NOTE_PAD`'s 10 px below it.
+pub const NOTICE_ROW_PX: i32 = 26;
+
 /// The popover's height in logical pixels, estimated from the handoff's
-/// section sizes, for `accounts` rows, with or without the menu and the
-/// graph card. Estimates, not measurements: iced does not lay the popup
-/// out before it opens, and a few pixels either way only matter right at
-/// the threshold.
-pub fn popover_height(accounts: usize, menu_open: bool, graph: bool) -> i32 {
+/// section sizes, for `accounts` rows, with or without the menu, the
+/// graph card and the Steam notice. Estimates, not measurements: iced does
+/// not lay the popup out before it opens, and a few pixels either way only
+/// matter right at the threshold.
+pub fn popover_height(accounts: usize, menu_open: bool, graph: bool, notice: bool) -> i32 {
     let header = 50;
     let rows = if accounts == 0 { 44 } else { 30 * accounts as i32 };
     let accounts_card = 36 + rows + 44 + 12;
     let tunnel = 12 + 26 + 32;
     let graph_card = if graph { 172 + 12 } else { 0 };
     let tiles = 60 + 12;
+    let notice = if notice { NOTICE_ROW_PX } else { 0 };
     let action = 38 + 12;
     let menu = if menu_open { 8 + 3 * 31 + 8 } else { 0 };
-    header + accounts_card + tunnel + graph_card + tiles + action + menu
+    header + accounts_card + tunnel + graph_card + tiles + notice + action + menu
 }
 
 /// Whether the graph card fits in `available` pixels (`None`: unknown, so
 /// it is kept). The handoff's invariant: the popover never exceeds the
 /// panel work area, and the graph card is the first thing to drop.
-pub fn graph_fits(available: Option<i32>, accounts: usize, menu_open: bool) -> bool {
-    available.is_none_or(|h| popover_height(accounts, menu_open, true) <= h)
+pub fn graph_fits(available: Option<i32>, accounts: usize, menu_open: bool, notice: bool) -> bool {
+    available.is_none_or(|h| popover_height(accounts, menu_open, true, notice) <= h)
 }
 
 /// Stale the last good reply so it presents as disconnected (spec §7).
@@ -187,9 +196,10 @@ pub fn popover(status: Option<&Status>, rates: Rates, bars: Vec<(f32, f32)>, ava
                 sent: format::bytes(0),
                 received: format::bytes(0),
             },
-            graph: graph_fits(available, 0, menu_open),
+            graph: graph_fits(available, 0, menu_open, false),
             tiles: [("ENDPOINT", DASH.to_string()), ("PEER", crate::tunnel::IFACE.to_string())],
             primary: Primary::Inert("Start Yutani to route traffic"),
+            notice: None,
         };
     };
     let t = &s.tunnel;
@@ -210,6 +220,7 @@ pub fn popover(status: Option<&Status>, rates: Rates, bars: Vec<(f32, f32)>, ava
         DASH.to_string()
     };
     let n = accounts.len();
+    let notice = crate::steam::first_message(&s.steam).map(|m| format!("{m} Open Settings → Steam."));
     Popover {
         running: true,
         state_word: "Running",
@@ -233,7 +244,7 @@ pub fn popover(status: Option<&Status>, rates: Rates, bars: Vec<(f32, f32)>, ava
             sent: format::bytes(t.tx_bytes),
             received: format::bytes(t.rx_bytes),
         },
-        graph: graph_fits(available, n, menu_open),
+        graph: graph_fits(available, n, menu_open, notice.is_some()),
         tiles: [("ENDPOINT", endpoint), ("PEER", t.iface.clone())],
         primary: if !t.installed {
             Primary::Inert("No tunnel installed")
@@ -242,6 +253,7 @@ pub fn popover(status: Option<&Status>, rates: Rates, bars: Vec<(f32, f32)>, ava
         } else {
             Primary::Accent("Connect tunnel", Action::Connect)
         },
+        notice,
     }
 }
 
@@ -281,6 +293,11 @@ mod tests {
 
     fn flat() -> Vec<(f32, f32)> {
         vec![(0.0, 0.0); 34]
+    }
+
+    fn with_steam(mut s: Status, verdict: crate::steam::Verdict) -> Status {
+        s.steam = vec![crate::steam::Finding { verdict, file: "/h/localconfig.vdf".into() }];
+        s
     }
 
     #[test]
@@ -381,14 +398,14 @@ mod tests {
         let s = status(true, Some(21), 3);
         assert!(popover(Some(&s), Rates::default(), flat(), None, false).graph, "unknown height keeps it");
         assert!(popover(Some(&s), Rates::default(), flat(), Some(1360), false).graph, "a 1440 screen");
-        let full = popover_height(3, false, true);
-        let without = popover_height(3, false, false);
+        let full = popover_height(3, false, true, false);
+        let without = popover_height(3, false, false, false);
         assert_eq!(full - without, 184, "the card and its margin");
         assert!(popover(Some(&s), Rates::default(), flat(), Some(full), false).graph, "exactly fits");
         assert!(!popover(Some(&s), Rates::default(), flat(), Some(full - 1), false).graph, "one pixel short");
         // Opening the menu adds to the estimate; more rows too.
-        assert!(popover_height(3, true, true) > full);
-        assert!(popover_height(9, false, true) > full);
+        assert!(popover_height(3, true, true, false) > full);
+        assert!(popover_height(9, false, true, false) > full);
         assert!(!popover(None, Rates::default(), flat(), Some(200), false).graph, "stopped and short: gone");
     }
 
@@ -405,5 +422,32 @@ mod tests {
         let mut twice = s.clone();
         degrade(&mut twice);
         assert_eq!(s, twice, "degrading is idempotent");
+    }
+
+    #[test]
+    fn a_steam_problem_is_one_notice_line_and_a_healthy_steam_none() {
+        let s = status(true, Some(21), 3);
+        assert_eq!(popover(Some(&s), Rates::default(), flat(), None, false).notice, None);
+        let broken = with_steam(status(true, Some(21), 3), crate::steam::Verdict::Broken { path: "/usr/local/bin/yutani".into() });
+        assert_eq!(
+            popover(Some(&broken), Rates::default(), flat(), None, false).notice.as_deref(),
+            Some("Steam launches EVE through /usr/local/bin/yutani, which is missing. Open Settings → Steam.")
+        );
+        let bare = with_steam(status(false, None, 0), crate::steam::Verdict::NoWrapper);
+        assert_eq!(
+            popover(Some(&bare), Rates::default(), flat(), None, false).notice.as_deref(),
+            Some("Steam launches EVE without yutani, so it runs outside the tunnel. Open Settings → Steam.")
+        );
+        assert_eq!(popover(None, Rates::default(), flat(), None, false).notice, None, "stopped: nothing to say");
+    }
+
+    #[test]
+    fn the_notice_row_counts_toward_the_height() {
+        assert_eq!(popover_height(3, false, true, true) - popover_height(3, false, true, false), NOTICE_ROW_PX);
+        // With the notice taking its row, the graph drops one row sooner.
+        let full = popover_height(3, false, true, false);
+        let broken = with_steam(status(true, Some(21), 3), crate::steam::Verdict::NoWrapper);
+        assert!(popover(Some(&broken), Rates::default(), flat(), Some(full + NOTICE_ROW_PX), false).graph);
+        assert!(!popover(Some(&broken), Rates::default(), flat(), Some(full), false).graph);
     }
 }
