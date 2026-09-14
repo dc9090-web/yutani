@@ -337,7 +337,7 @@ pub fn judge(launch_options: &str, resolves: &dyn Fn(&str) -> bool) -> Verdict {
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --lib steam::`
-Expected: `test result: ok. 14 passed`.
+Expected: `test result: ok. 13 passed`.
 
 Run: `cargo clippy --all-targets`
 Expected: no warnings from `src/steam.rs`. (If clippy objects to `let` chains on this toolchain, rewrite the `_ =>` arm as `if depth == 1 { if let Some(value) = … { return Some(value); } }`.)
@@ -568,7 +568,7 @@ Move the `use std::path::{Path, PathBuf};` line up to sit with `use serde::…` 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --lib steam::`
-Expected: `test result: ok. 19 passed`.
+Expected: `test result: ok. 18 passed`.
 
 - [ ] **Step 5: Commit**
 
