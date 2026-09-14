@@ -119,23 +119,28 @@ pub struct Popover {
     pub notice: Option<String>,
 }
 
-/// The notice row's height in the estimate: `theme::NOTE_SIZE` text plus
-/// `theme::NOTE_PAD`'s 10 px below it.
-pub const NOTICE_ROW_PX: i32 = 26;
+/// The notice's height in the estimate, for its wrapped text: `theme::
+/// NOTE_PAD`'s 10 px below it plus 14 px (`theme::NOTE_SIZE` mono) per
+/// line, wrapping at roughly 49 characters — the popover is `theme::
+/// POPOVER_WIDTH` (360 px) minus `NOTE_PAD`'s 16 px each side, in 11 px
+/// mono. An estimate, not a measurement, like the rest of `popover_height`.
+pub fn notice_px(text: &str) -> i32 {
+    10 + 14 * (text.chars().count().div_ceil(49).max(1) as i32)
+}
 
 /// The popover's height in logical pixels, estimated from the handoff's
 /// section sizes, for `accounts` rows, with or without the menu, the
-/// graph card and the Steam notice. Estimates, not measurements: iced does
-/// not lay the popup out before it opens, and a few pixels either way only
-/// matter right at the threshold.
-pub fn popover_height(accounts: usize, menu_open: bool, graph: bool, notice: bool) -> i32 {
+/// graph card and the Steam notice's text. Estimates, not measurements:
+/// iced does not lay the popup out before it opens, and a few pixels
+/// either way only matter right at the threshold.
+pub fn popover_height(accounts: usize, menu_open: bool, graph: bool, notice: Option<&str>) -> i32 {
     let header = 50;
     let rows = if accounts == 0 { 44 } else { 30 * accounts as i32 };
     let accounts_card = 36 + rows + 44 + 12;
     let tunnel = 12 + 26 + 32;
     let graph_card = if graph { 172 + 12 } else { 0 };
     let tiles = 60 + 12;
-    let notice = if notice { NOTICE_ROW_PX } else { 0 };
+    let notice = notice.map_or(0, notice_px);
     let action = 38 + 12;
     let menu = if menu_open { 8 + 3 * 31 + 8 } else { 0 };
     header + accounts_card + tunnel + graph_card + tiles + notice + action + menu
@@ -144,8 +149,8 @@ pub fn popover_height(accounts: usize, menu_open: bool, graph: bool, notice: boo
 /// Whether the graph card fits in `available` pixels (`None`: unknown, so
 /// it is kept). The handoff's invariant: the popover never exceeds the
 /// panel work area, and the graph card is the first thing to drop. The
-/// estimate includes the Steam notice row when there is one.
-pub fn graph_fits(available: Option<i32>, accounts: usize, menu_open: bool, notice: bool) -> bool {
+/// estimate includes the Steam notice's wrapped height when there is one.
+pub fn graph_fits(available: Option<i32>, accounts: usize, menu_open: bool, notice: Option<&str>) -> bool {
     available.is_none_or(|h| popover_height(accounts, menu_open, true, notice) <= h)
 }
 
@@ -197,7 +202,7 @@ pub fn popover(status: Option<&Status>, rates: Rates, bars: Vec<(f32, f32)>, ava
                 sent: format::bytes(0),
                 received: format::bytes(0),
             },
-            graph: graph_fits(available, 0, menu_open, false),
+            graph: graph_fits(available, 0, menu_open, None),
             tiles: [("ENDPOINT", DASH.to_string()), ("PEER", crate::tunnel::IFACE.to_string())],
             primary: Primary::Inert("Start Yutani to route traffic"),
             notice: None,
@@ -245,7 +250,7 @@ pub fn popover(status: Option<&Status>, rates: Rates, bars: Vec<(f32, f32)>, ava
             sent: format::bytes(t.tx_bytes),
             received: format::bytes(t.rx_bytes),
         },
-        graph: graph_fits(available, n, menu_open, notice.is_some()),
+        graph: graph_fits(available, n, menu_open, notice.as_deref()),
         tiles: [("ENDPOINT", endpoint), ("PEER", t.iface.clone())],
         primary: if !t.installed {
             Primary::Inert("No tunnel installed")
@@ -399,14 +404,14 @@ mod tests {
         let s = status(true, Some(21), 3);
         assert!(popover(Some(&s), Rates::default(), flat(), None, false).graph, "unknown height keeps it");
         assert!(popover(Some(&s), Rates::default(), flat(), Some(1360), false).graph, "a 1440 screen");
-        let full = popover_height(3, false, true, false);
-        let without = popover_height(3, false, false, false);
+        let full = popover_height(3, false, true, None);
+        let without = popover_height(3, false, false, None);
         assert_eq!(full - without, 184, "the card and its margin");
         assert!(popover(Some(&s), Rates::default(), flat(), Some(full), false).graph, "exactly fits");
         assert!(!popover(Some(&s), Rates::default(), flat(), Some(full - 1), false).graph, "one pixel short");
         // Opening the menu adds to the estimate; more rows too.
-        assert!(popover_height(3, true, true, false) > full);
-        assert!(popover_height(9, false, true, false) > full);
+        assert!(popover_height(3, true, true, None) > full);
+        assert!(popover_height(9, false, true, None) > full);
         assert!(!popover(None, Rates::default(), flat(), Some(200), false).graph, "stopped and short: gone");
     }
 
@@ -444,11 +449,23 @@ mod tests {
 
     #[test]
     fn the_notice_row_counts_toward_the_height() {
-        assert_eq!(popover_height(3, false, true, true) - popover_height(3, false, true, false), NOTICE_ROW_PX);
-        // With the notice taking its row, the graph drops one row sooner.
-        let full = popover_height(3, false, true, false);
-        let broken = with_steam(status(true, Some(21), 3), crate::steam::Verdict::NoWrapper);
-        assert!(popover(Some(&broken), Rates::default(), flat(), Some(full + NOTICE_ROW_PX), false).graph);
-        assert!(!popover(Some(&broken), Rates::default(), flat(), Some(full), false).graph);
+        assert_eq!(notice_px("x"), 24, "one short line");
+        assert_eq!(notice_px(&"x".repeat(49)), 24, "still fits on one line");
+        assert_eq!(notice_px(&"x".repeat(50)), 38, "wraps to two lines");
+        assert_eq!(notice_px(&"x".repeat(98)), 38, "still fits on two lines");
+        assert_eq!(notice_px(&"x".repeat(99)), 52, "wraps to three lines");
+
+        // The real Broken sentence wraps; the estimate follows its length.
+        let broken = with_steam(status(true, Some(21), 3), crate::steam::Verdict::Broken { path: "/usr/local/bin/yutani".into() });
+        let msg = popover(Some(&broken), Rates::default(), flat(), None, false).notice.unwrap();
+        assert_eq!(popover_height(3, false, true, Some(&msg)) - popover_height(3, false, true, None), notice_px(&msg));
+
+        // With the notice taking its wrapped height, the graph drops right
+        // at that threshold — no sooner, no later.
+        let full = popover_height(3, false, true, None);
+        let bare = with_steam(status(true, Some(21), 3), crate::steam::Verdict::NoWrapper);
+        let notice = popover(Some(&bare), Rates::default(), flat(), None, false).notice.unwrap();
+        assert!(popover(Some(&bare), Rates::default(), flat(), Some(full + notice_px(&notice)), false).graph);
+        assert!(!popover(Some(&bare), Rates::default(), flat(), Some(full + notice_px(&notice) - 1), false).graph);
     }
 }

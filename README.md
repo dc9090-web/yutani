@@ -153,16 +153,16 @@ Upgrading is `makepkg -si` again. Every command above is idempotent; re-run them
 
 ### Build from source
 
-The package *is* the source build: `makepkg` runs `cargo build --release --locked` on your checkout. To hack on Yutani without installing:
+The package *is* the source build: `makepkg` runs `cargo build --frozen --release` on your checkout. To hack on Yutani without installing:
 
 ```bash
-cargo build --release --locked
+cargo build --frozen --release
 target/release/yutani doctor        # check the compositor
 target/release/yutani start         # run the daemon from the tree
 cargo test                          # the suite
 ```
 
-If you hand-copy `target/release/yutani` somewhere other than `/usr/bin`, use the settings window's **Steam** page: it prints the launch line with the running binary's real path.
+If you hand-copy `target/release/yutani` somewhere other than `/usr/bin`, use the settings window's **Steam** page: with its "Steam can't find yutani" toggle on, it prints the launch line with the running binary's real path.
 
 ### Steam
 
@@ -186,7 +186,7 @@ PROTON_ENABLE_WAYLAND=1 WINE_NO_WM_DECORATION=1 yutani launch -- %command%
 | `yutani layouts`, `yutani layout <name>` | List and apply saved layouts. |
 | `yutani settings [page]` | Open the settings window. |
 | `yutani tunnel connect` / `disconnect` / `status` | Drive the tunnel. |
-| `yutani status` | The daemon's state (clients, visibility, tunnel) as JSON. |
+| `yutani status` | The daemon's state (clients, visibility, tunnel, Steam launch check) as JSON. |
 | `yutani doctor` | Check the compositor for everything Yutani needs. |
 | `yutani quit` | Ask the running daemon to exit. |
 

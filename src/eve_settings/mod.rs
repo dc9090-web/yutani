@@ -82,11 +82,7 @@ pub fn steam_libraries(vdf: &str) -> Vec<PathBuf> {
 /// Where Steam keeps `libraryfolders.vdf`: native (both the XDG path and the
 /// legacy `~/.steam` symlink tree) and the Flatpak.
 pub fn steam_vdf_candidates(home: &Path) -> [PathBuf; 3] {
-    [
-        home.join(".local/share/Steam/config/libraryfolders.vdf"),
-        home.join(".steam/steam/config/libraryfolders.vdf"),
-        home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam/config/libraryfolders.vdf"),
-    ]
+    crate::steam::steam_roots(home).map(|r| r.join("config/libraryfolders.vdf"))
 }
 
 /// The profile directory inside one Steam library, if EVE is installed
