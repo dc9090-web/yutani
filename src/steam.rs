@@ -13,18 +13,22 @@ pub const EVE_APP_ID: &str = "8500";
 ///
 /// The file is Valve's KeyValues text, nested
 /// `UserLocalConfigStore → Software → Valve → Steam → apps → "8500" →
-/// "LaunchOptions"`. A line walker is enough: the EVE block is the first
-/// line that is exactly `"8500"` and is followed by `{` (the `apptickets`
+/// "LaunchOptions"`. A line walker is enough: an EVE block is any line
+/// that is exactly `"8500"` and is followed by `{` (the `apptickets`
 /// section also has an `"8500"` key, but as a one-line pair, so it is
-/// skipped), and the launch line is the `LaunchOptions` pair that is a
-/// direct child of that block.
+/// skipped). There can be more than one such block — Steam also keeps a
+/// second `"8500"` block under a top-level `UserLocalConfigStore → apps`
+/// section, holding only the overlay setting — so the walk takes the
+/// first block that has a direct-child `LaunchOptions`, not the first
+/// block, and remembers any block it walks past without one.
 ///
-/// `None`: no EVE block at all. `Some("")`: a block without the key —
-/// Steam stores no key for an empty field, so that is what "never set"
-/// looks like.
+/// `None`: no EVE block at all. `Some("")`: every EVE block seen had no
+/// `LaunchOptions` key — Steam stores no key for an empty field, so that
+/// is what "never set" looks like.
 pub fn launch_options(localconfig: &str) -> Option<String> {
     let key = format!("\"{EVE_APP_ID}\"");
     let mut lines = localconfig.lines().map(str::trim).peekable();
+    let mut empty_block_seen = false;
     while let Some(line) = lines.next() {
         if line != key {
             continue;
@@ -37,13 +41,16 @@ pub fn launch_options(localconfig: &str) -> Option<String> {
         }
         lines.next();
         let mut depth = 1usize;
+        let mut closed = false;
         for line in lines.by_ref() {
             match line {
                 "{" => depth += 1,
                 "}" => {
                     depth -= 1;
                     if depth == 0 {
-                        return Some(String::new());
+                        empty_block_seen = true;
+                        closed = true;
+                        break;
                     }
                 }
                 _ => {
@@ -55,16 +62,18 @@ pub fn launch_options(localconfig: &str) -> Option<String> {
                 }
             }
         }
-        // The block never closed: a truncated file. Nothing to judge.
-        return None;
+        if !closed {
+            // The block never closed: a truncated file. Nothing to judge.
+            return None;
+        }
     }
-    None
+    if empty_block_seen { Some(String::new()) } else { None }
 }
 
 /// `"Key"   "value"` → the value, when the key is `key`.
 fn quoted_pair(line: &str, key: &str) -> Option<String> {
     let (k, rest) = quoted(line)?;
-    if k != key {
+    if !k.eq_ignore_ascii_case(key) {
         return None;
     }
     let (v, _) = quoted(rest.trim_start())?;
@@ -96,14 +105,18 @@ fn quoted(s: &str) -> Option<(String, &str)> {
 
 /// The `yutani` the launch line runs the game through: the token right
 /// before `launch --`, when it is `yutani` or a path ending in `/yutani`.
-/// Tokens are split on whitespace; a quoted path with spaces is not
-/// supported, and the README never suggests one.
+/// Tokens are split on whitespace, and a token wrapped in double quotes
+/// is unquoted before the check; a path containing spaces is still
+/// unsupported, and the README never suggests one.
 pub fn wrapper_path(launch_options: &str) -> Option<&str> {
     let tokens: Vec<&str> = launch_options.split_whitespace().collect();
     tokens
         .windows(3)
-        .find(|w| w[1] == "launch" && w[2] == "--" && (w[0] == "yutani" || w[0].ends_with("/yutani")))
-        .map(|w| w[0])
+        .find(|w| {
+            let p = w[0].trim_matches('"');
+            w[1] == "launch" && w[2] == "--" && (p == "yutani" || p.ends_with("/yutani"))
+        })
+        .map(|w| w[0].trim_matches('"'))
 }
 
 /// What the launch line means for the next press of Play.
@@ -158,12 +171,35 @@ mod tests {
             launch_options(REAL).as_deref(),
             Some("PROTON_ENABLE_WAYLAND=1 WINE_NO_WM_DECORATION=1 /usr/local/bin/yutani launch -- %command%")
         );
+        assert_eq!(
+            launch_options(&REAL.replace("\"LaunchOptions\"", "\"launchoptions\"")).as_deref(),
+            Some("PROTON_ENABLE_WAYLAND=1 WINE_NO_WM_DECORATION=1 /usr/local/bin/yutani launch -- %command%")
+        );
     }
 
     #[test]
     fn a_neighbouring_app_is_never_mistaken_for_eve() {
         let only_neighbour = REAL.replace("\"8500\"\n", "\"8501\"\n");
         assert_eq!(launch_options(&only_neighbour), None);
+    }
+
+    #[test]
+    fn a_second_eve_block_before_the_real_one_is_walked_past() {
+        // A real localconfig.vdf has a second "8500" block under a
+        // top-level UserLocalConfigStore -> apps section: the overlay
+        // setting, not EVE's launch options.
+        let decoy = "\"apps\"\n{\n\t\"8500\"\n\t{\n\t\t\"OverlayAppEnable\"\t\t\"0\"\n\t}\n}\n";
+        let with_decoy = format!("{decoy}{REAL}");
+        assert_eq!(
+            launch_options(&with_decoy).as_deref(),
+            Some("PROTON_ENABLE_WAYLAND=1 WINE_NO_WM_DECORATION=1 /usr/local/bin/yutani launch -- %command%")
+        );
+    }
+
+    #[test]
+    fn a_lone_overlay_block_is_an_empty_line() {
+        let decoy = "\"apps\"\n{\n\t\"8500\"\n\t{\n\t\t\"OverlayAppEnable\"\t\t\"0\"\n\t}\n}\n";
+        assert_eq!(launch_options(decoy).as_deref(), Some(""));
     }
 
     #[test]
@@ -216,6 +252,7 @@ mod tests {
         assert_eq!(wrapper_path("A=1 yutani launch -- %command%"), Some("yutani"));
         assert_eq!(wrapper_path("A=1 /usr/bin/yutani launch -- %command%"), Some("/usr/bin/yutani"));
         assert_eq!(wrapper_path("/home/d/Yutani/target/release/yutani launch -- %command%"), Some("/home/d/Yutani/target/release/yutani"));
+        assert_eq!(wrapper_path("A=1 \"/opt/yutani\" launch -- %command%"), Some("/opt/yutani"));
         assert_eq!(wrapper_path("A=1 %command%"), None);
         assert_eq!(wrapper_path(""), None);
         // `launch` alone, or a different wrapper, is not ours.
