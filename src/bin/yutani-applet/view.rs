@@ -6,7 +6,7 @@ use cosmic::iced::{Alignment, Color, Length};
 use cosmic::widget::{self, Column, Row};
 use cosmic::{Element, theme as cosmic_theme};
 
-use yutani::applet::display::Display;
+use yutani::applet::display::{Display, Service};
 use yutani::applet::icon::icon_state;
 use yutani::applet::menu::{MenuRow, RowKind};
 use yutani::applet::theme;
@@ -206,6 +206,34 @@ fn header<'a>(d: &Display) -> Element<'a, Msg> {
         .into()
 }
 
+/// One row of the services band: dot, name, and the note against the far
+/// edge. Green or red, no glow — the header's dot keeps the glow.
+fn service_row<'a>(s: Service) -> Element<'a, Msg> {
+    let color = if s.up { theme::SERVICE_UP } else { theme::SERVICE_DOWN };
+    Row::new()
+        .width(Length::Fill)
+        .spacing(theme::MENU_ROW_GAP)
+        .align_y(Alignment::Center)
+        .push(dot(color, false))
+        .push(ui(s.name, theme::SERVICE_LABEL_SIZE, theme::TEXT_ON_SURFACE))
+        .push(widget::space().width(Length::Fill))
+        .push(mono(s.note, theme::MENU_HINT_SIZE, color))
+        .into()
+}
+
+/// Services band: Yutani and WireGuard, each with its dot (2026-09-14
+/// spec §1). Shown in every state — offline is exactly when "Yutani: not
+/// running" is the news.
+fn services_band<'a>(d: &Display) -> Element<'a, Msg> {
+    Column::new()
+        .width(Length::Fill)
+        .spacing(theme::SERVICES_ROW_GAP)
+        .padding(theme::SERVICES_PAD)
+        .push(service_row(d.services[0]))
+        .push(service_row(d.services[1]))
+        .into()
+}
+
 /// Accounts band: the count and its label on the left, the tunnel IP and
 /// the handshake age on the right.
 fn accounts_band<'a>(d: &Display) -> Element<'a, Msg> {
@@ -284,7 +312,7 @@ fn tiles<'a>(d: &Display) -> Element<'a, Msg> {
 /// treat the button as disabled — but every label here carries an explicit
 /// colour, so libcosmic's `disabled` text style never reaches it and the
 /// row has to be dimmed here as well as declared inert.
-fn menu_row<'a>(row: MenuRow, held: bool) -> Element<'a, Msg> {
+fn menu_row<'a>(row: MenuRow) -> Element<'a, Msg> {
     let (ink, hover, pressed) = match row.kind {
         RowKind::Danger => (theme::DANGER_TEXT, theme::DANGER_HOVER, theme::DANGER_HOVER),
         _ => (theme::TEXT_ON_SURFACE, theme::HAIRLINE, theme::ACTIVE_FILL),
@@ -316,20 +344,18 @@ fn menu_row<'a>(row: MenuRow, held: bool) -> Element<'a, Msg> {
         content = content.push(mono(trailing, theme::MENU_HINT_SIZE, hint_ink));
     }
 
-    // Client rows are indented under their header; everything else keeps
-    // the header's left edge.
+    // Character rows are indented a step; the action rows keep the
+    // header's left edge.
     let padding = if matches!(row.kind, RowKind::Account { .. }) {
         theme::MENU_ACCOUNT_PAD
     } else {
         theme::MENU_ROW_PAD
     };
-    let message =
-        if row.toggles_accounts { Some(Msg::ToggleAccounts) } else { row.action.map(Msg::Press) };
     widget::button::custom(content)
         .width(Length::Fill)
         .padding(padding)
-        .class(theme::menu_row_class(ink, hover, pressed, held))
-        .on_press_maybe(message)
+        .class(theme::menu_row_class(ink, hover, pressed))
+        .on_press_maybe(row.action.map(Msg::Press))
         .into()
 }
 
@@ -371,7 +397,7 @@ fn accounts_list(rows: Vec<Element<'_, Msg>>) -> Element<'_, Msg> {
 /// list, and they are collected into [`accounts_list`] rather than pushed
 /// into the group — everything else keeps its place around them.
 fn menu(state: &Applet) -> Element<'_, Msg> {
-    let rows = yutani::applet::menu::rows(state.status.as_ref(), state.accounts_open);
+    let rows = yutani::applet::menu::rows(state.status.as_ref());
     let note = state.visible_note();
     let mut group: Vec<Element<'_, Msg>> = Vec::new();
     let mut clients: Vec<Element<'_, Msg>> = Vec::new();
@@ -389,11 +415,9 @@ fn menu(state: &Applet) -> Element<'_, Msg> {
             }
             group.push(divider(theme::DIVIDER_ABOVE_MENU));
         }
-        // The Accounts… header stays lit while its list is open.
-        let held = row.toggles_accounts && state.accounts_open;
         let owns_note = note.is_some_and(|n| n.action.is_some() && n.action == row.action);
         let target = if is_client { &mut clients } else { &mut group };
-        target.push(menu_row(row, held));
+        target.push(menu_row(row));
         if let Some(note) = note.filter(|_| owns_note) {
             target.push(note_line(note));
             placed = true;
@@ -420,10 +444,12 @@ pub fn popup(state: &Applet) -> Element<'_, Msg> {
         .width(Length::Fill)
         .spacing(theme::POPUP_PADDING)
         .padding(theme::POPUP_PADDING)
-        .push(header(&d));
-    // With no daemon there is nothing to read: the header still identifies
-    // the applet, then straight to the single "Start Yutani" row. The band
-    // and the tiles would be a screenful of dashes and zeroes.
+        .push(header(&d))
+        .push(divider(theme::DIVIDER_ABOVE_BAND))
+        .push(services_band(&d));
+    // With no daemon there is nothing more to read: the services band has
+    // just said so, then straight to the single "Start Yutani" row. The
+    // accounts band and the tiles would be a screenful of dashes and zeroes.
     if d.online {
         content = content
             .push(divider(theme::DIVIDER_ABOVE_BAND))

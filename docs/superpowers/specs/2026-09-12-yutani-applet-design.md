@@ -155,7 +155,10 @@ Vertical order and copy exactly as the handoff; data sources:
    - `Disconnect tunnel` / `Connect tunnel` (hint `wg-quick` in the handoff
      → we show `systemd`, the truthful hint) → `tunnel disconnect|connect`.
      Disabled with hint `not installed` when `tunnel.installed` is false.
-   - `Accounts…` (trailing count) → expands in place to one row per client:
+   - *Superseded 2026-09-14 by `2026-09-14-yutani-applet-services-and-characters-design.md`:
+     the characters are a flat, always-visible list ahead of the tunnel
+     row, and a services band (Yutani / WireGuard dots) sits under the
+     header.* Originally: `Accounts…` (trailing count) → expands in place to one row per client:
      name, active dot; click → `focus <n>` where `n` is the row's 1-based
      index in the daemon's layout order (the `status` reply lists clients in
      that order). A second click on the header collapses it.

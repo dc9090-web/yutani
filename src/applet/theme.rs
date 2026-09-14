@@ -49,13 +49,6 @@ pub const HAIRLINE: Color = rgba(0xFF, 0xFF, 0xFF, 0x12 as f32 / 255.0);
 pub const ACTIVE_FILL: Color = rgba(0xFF, 0xFF, 0xFF, 0x1F as f32 / 255.0);
 /// `#FFFFFF29` — **derived: one step above the handoff's active fill.**
 ///
-/// The handoff has no token for this because it has no row that is held
-/// *and* hovered. Ours does: the Accounts… header wears [`ACTIVE_FILL`] at
-/// rest for as long as its list is open, so handing it the ordinary
-/// [`HAIRLINE`] hover would make it go visibly *darker* as the pointer
-/// arrived. Hover must always brighten, so it continues the ladder
-/// (`0x12 → 0x1F → 0x29`) by the same step the handoff took to get there.
-pub const HELD_HOVER_FILL: Color = rgba(0xFF, 0xFF, 0xFF, 0x29 as f32 / 255.0);
 /// `#1A1D21F5` — the popup's own surface.
 ///
 /// The handoff is a dark-only design: every colour above it is light ink on
@@ -118,6 +111,15 @@ pub const MENU_ROW_GAP: u16 = 8;
 pub const DISABLED_ALPHA: f32 = 0.4;
 /// The panel icon's opacity in the daemon-offline / not-installed state.
 pub const DIM_OPACITY: f32 = 0.38;
+/// The services band's dots (2026-09-14 spec §1): the accent when a
+/// service is up, the danger red when it is not — nothing in between.
+pub const SERVICE_UP: Color = ACCENT_UP;
+pub const SERVICE_DOWN: Color = DANGER_TEXT;
+/// A service's name: the accounts band's label size, so the two bands read
+/// as one column of text.
+pub const SERVICE_LABEL_SIZE: f32 = COUNT_LABEL_SIZE;
+/// Between the two service rows.
+pub const SERVICES_ROW_GAP: u16 = 6;
 
 // ---- section geometry (handoff "Screen: applet popup") ----
 // The handoff's per-section `padding` / `margin` shorthands, in its own
@@ -132,6 +134,8 @@ const fn pad(top: f32, right: f32, bottom: f32, left: f32) -> Padding {
 pub const HEADER_PAD: Padding = pad(10.0, 10.0, 2.0, 10.0);
 /// The divider above the accounts band — `6px 10px 2px`.
 pub const DIVIDER_ABOVE_BAND: Padding = pad(6.0, 10.0, 2.0, 10.0);
+/// Services band — `4px 12px`, the accounts band's horizontal inset.
+pub const SERVICES_PAD: Padding = pad(4.0, 12.0, 4.0, 12.0);
 /// Accounts band — `4px 12px 6px`.
 pub const BAND_PAD: Padding = pad(4.0, 12.0, 6.0, 12.0);
 /// The divider above the traffic tiles — `2px 10px 4px`.
@@ -336,27 +340,11 @@ fn row_style(text: Color, fill: Option<Color>) -> button::Style {
     }
 }
 
-/// Which fill a menu row shows under the pointer: [`HELD_HOVER_FILL`] for a
-/// held row, whose rest fill is already the Active fill, and the row's own
-/// hover colour otherwise.
-pub fn hover_fill(hover: Color, held: bool) -> Color {
-    if held { HELD_HOVER_FILL } else { hover }
-}
-
 /// A menu row: radius 8, transparent at rest, `hover` under the pointer,
 /// `pressed` while held, and [`DISABLED_ALPHA`] text when disabled.
-///
-/// `held` paints the *Active fill* (`pressed`) at rest — the expanded
-/// Accounts… header, which stays lit for as long as its list is open. (The
-/// handoff has no chevron glyph, so the fill is the affordance.) It also
-/// lifts the hover to [`HELD_HOVER_FILL`]: hover must brighten a row, and
-/// against a rest fill that is already the Active fill the ordinary hover
-/// colour would darken it instead.
-pub fn menu_row_class(text: Color, hover: Color, pressed: Color, held: bool) -> cosmic::theme::Button {
-    let rest = held.then_some(pressed);
-    let hover = hover_fill(hover, held);
+pub fn menu_row_class(text: Color, hover: Color, pressed: Color) -> cosmic::theme::Button {
     cosmic::theme::Button::Custom {
-        active: Box::new(move |_focused, _theme| row_style(text, rest)),
+        active: Box::new(move |_focused, _theme| row_style(text, None)),
         disabled: Box::new(move |_theme| row_style(dimmed(text), None)),
         hovered: Box::new(move |_focused, _theme| row_style(text, Some(hover))),
         pressed: Box::new(move |_focused, _theme| row_style(text, Some(pressed))),
@@ -401,26 +389,8 @@ mod tests {
         expect(CHIP_FILL, "#FFFFFF0F");
         expect(HAIRLINE, "#FFFFFF12");
         expect(ACTIVE_FILL, "#FFFFFF1F");
-        // Derived: one step above the handoff's active fill. The handoff has
-        // no token for it because it has no held-and-hovered row.
-        expect(HELD_HOVER_FILL, "#FFFFFF29");
         expect(POPUP_SURFACE, "#1A1D21F5");
         expect(POPUP_BORDER, "#FFFFFF1A");
-    }
-
-    /// I1: the held Accounts… header already carries the Active fill at
-    /// rest, so its hover has to be a step *above* it. Feeding it the
-    /// ordinary hover fill made the row go *darker* as the pointer arrived.
-    #[test]
-    fn hovering_a_held_row_brightens_it_instead_of_dimming_it() {
-        assert_eq!(hover_fill(HAIRLINE, false), HAIRLINE);
-        assert_eq!(hover_fill(DANGER_HOVER, false), DANGER_HOVER);
-        assert_eq!(hover_fill(HAIRLINE, true), HELD_HOVER_FILL);
-        // Rest → hover is a strictly brightening ladder for a held row.
-        const { assert!(HAIRLINE.a < ACTIVE_FILL.a, "hover must be above the resting hairline") };
-        const {
-            assert!(ACTIVE_FILL.a < HELD_HOVER_FILL.a, "a held row's hover must be above its own rest")
-        };
     }
 
     /// M1: libcosmic's `popup_container` rounds its outer container to the
@@ -476,6 +446,9 @@ mod tests {
         assert_eq!(HEADER_PAD, pad(10.0, 10.0, 2.0, 10.0));
         assert_eq!(DIVIDER_ABOVE_BAND, pad(6.0, 10.0, 2.0, 10.0));
         assert_eq!(BAND_PAD, pad(4.0, 12.0, 6.0, 12.0));
+        assert_eq!(SERVICES_PAD, pad(4.0, 12.0, 4.0, 12.0));
+        assert_eq!((SERVICES_ROW_GAP, SERVICE_LABEL_SIZE), (6, COUNT_LABEL_SIZE));
+        assert_eq!((SERVICE_UP, SERVICE_DOWN), (ACCENT_UP, DANGER_TEXT));
         assert_eq!(DIVIDER_ABOVE_TILES, pad(2.0, 10.0, 4.0, 10.0));
         assert_eq!(TILES_PAD, pad(2.0, 10.0, 2.0, 10.0));
         assert_eq!(CHIP_PAD, pad(4.0, 8.0, 4.0, 8.0));

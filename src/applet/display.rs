@@ -8,10 +8,30 @@ use crate::applet::rate::Rates;
 use crate::applet::theme::DASH;
 use crate::tunnel::status::Status;
 
+/// One row of the services band (2026-09-14 spec §1): a dot, a name, a
+/// note. `up` is the dot's colour — green or red, nothing in between.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Service {
+    pub name: &'static str,
+    pub up: bool,
+    pub note: &'static str,
+}
+
+/// What the applet can see of the tunnel *without* the daemon: the worker's
+/// status file says whether the link is up, the unit file whether the
+/// tunnel is installed at all. Only consulted in the offline state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OfflineTunnel {
+    pub link_up: bool,
+    pub installed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Display {
     /// The daemon answered.
     pub online: bool,
+    /// The services band: Yutani (the daemon), then WireGuard (the tunnel).
+    pub services: [Service; 2],
     /// The tunnel is up *and* handshaked within the last
     /// [`HANDSHAKE_STALE_S`] seconds — the handoff's "Connected" state,
     /// which drives the dot, its glow, the colours and the menu label.
@@ -46,10 +66,47 @@ pub fn degrade(status: &mut Status) {
     status.tunnel.handshake_age_s = None;
 }
 
-pub fn display(status: Option<&Status>, rates: Rates) -> Display {
+/// The services band's two rows. Yutani is up when the daemon answered;
+/// WireGuard is up on exactly the header's "Connected" (link up and a fresh
+/// handshake), and its note says which of the red states it is in.
+fn services(status: Option<&Status>, connected: bool, offline: OfflineTunnel) -> [Service; 2] {
+    let yutani = Service { name: "Yutani", up: status.is_some(), note: if status.is_some() { "running" } else { "not running" } };
+    let wireguard = match status {
+        Some(s) => {
+            let t = &s.tunnel;
+            let note = if connected {
+                "connected"
+            } else if !t.installed {
+                "not installed"
+            } else if t.failed {
+                "failed"
+            } else if t.connected {
+                "no handshake"
+            } else {
+                "disconnected"
+            };
+            Service { name: "WireGuard", up: connected, note }
+        }
+        None => Service {
+            name: "WireGuard",
+            up: offline.link_up,
+            note: if offline.link_up {
+                "connected"
+            } else if offline.installed {
+                "disconnected"
+            } else {
+                "not installed"
+            },
+        },
+    };
+    [yutani, wireguard]
+}
+
+pub fn display(status: Option<&Status>, rates: Rates, offline: OfflineTunnel) -> Display {
     let Some(s) = status else {
         return Display {
             online: false,
+            services: services(None, false, offline),
             connected: false,
             status_text: "Disconnected",
             location: DASH.to_string(),
@@ -74,6 +131,7 @@ pub fn display(status: Option<&Status>, rates: Rates) -> Display {
     let live = |r: f64| if t.connected { format::rate(r) } else { format::rate(0.0) };
     Display {
         online: true,
+        services: services(status, connected, offline),
         connected,
         status_text: if connected { "Connected" } else { "Disconnected" },
         location: t.location.clone(),
@@ -131,7 +189,7 @@ mod tests {
     #[test]
     fn a_healthy_tunnel_shows_everything_the_handoff_asks_for() {
         let s = status(true, Some(21), 3);
-        let d = display(Some(&s), Rates { rx: 222_000.0, tx: 41_000.0 });
+        let d = display(Some(&s), Rates { rx: 222_000.0, tx: 41_000.0 }, OfflineTunnel::default());
         assert!(d.online && d.connected && d.installed);
         assert_eq!(d.status_text, "Connected");
         assert_eq!(d.location, "London");
@@ -151,33 +209,33 @@ mod tests {
     fn the_band_prefers_the_public_exit_address_over_the_internal_one() {
         let mut s = status(true, Some(21), 1);
         s.tunnel.exit_address = Some("198.51.100.10".into());
-        assert_eq!(display(Some(&s), Rates::default()).address, "198.51.100.10");
+        assert_eq!(display(Some(&s), Rates::default(), OfflineTunnel::default()).address, "198.51.100.10");
 
         // No lookup yet (or an older daemon): the internal address is still
         // better than a dash.
         s.tunnel.exit_address = None;
-        assert_eq!(display(Some(&s), Rates::default()).address, "10.2.0.2");
+        assert_eq!(display(Some(&s), Rates::default(), OfflineTunnel::default()).address, "10.2.0.2");
 
         // Neither: a dash, not an empty gap.
         s.tunnel.address = None;
-        assert_eq!(display(Some(&s), Rates::default()).address, DASH);
+        assert_eq!(display(Some(&s), Rates::default(), OfflineTunnel::default()).address, DASH);
 
         // Nothing is up, so neither address is shown.
         let mut down = status(false, None, 1);
         down.tunnel.exit_address = Some("198.51.100.10".into());
-        assert_eq!(display(Some(&down), Rates::default()).address, DASH);
+        assert_eq!(display(Some(&down), Rates::default(), OfflineTunnel::default()).address, DASH);
     }
 
     #[test]
     fn one_account_is_singular() {
         let s = status(true, Some(1), 1);
-        assert_eq!(display(Some(&s), Rates::default()).accounts_label, "Account connected");
+        assert_eq!(display(Some(&s), Rates::default(), OfflineTunnel::default()).accounts_label, "Account connected");
     }
 
     #[test]
     fn disconnecting_freezes_the_totals_and_zeroes_everything_live() {
         let s = status(false, None, 2);
-        let d = display(Some(&s), Rates { rx: 999_000.0, tx: 999_000.0 });
+        let d = display(Some(&s), Rates { rx: 999_000.0, tx: 999_000.0 }, OfflineTunnel::default());
         assert!(d.online && !d.connected);
         assert_eq!(d.status_text, "Disconnected");
         assert_eq!(d.address, "—");
@@ -190,7 +248,7 @@ mod tests {
     #[test]
     fn a_stale_handshake_reads_as_disconnected_even_though_the_link_is_up() {
         let s = status(true, Some(180), 1);
-        let d = display(Some(&s), Rates::default());
+        let d = display(Some(&s), Rates::default(), OfflineTunnel::default());
         assert!(!d.connected);
         assert_eq!(d.status_text, "Disconnected");
         assert_eq!(d.handshake, "hs 180s ago");
@@ -205,7 +263,7 @@ mod tests {
     fn a_failed_poll_degrades_the_last_reply_to_disconnected() {
         let mut s = status(true, Some(21), 3);
         degrade(&mut s);
-        let d = display(Some(&s), Rates { rx: 222_000.0, tx: 41_000.0 });
+        let d = display(Some(&s), Rates { rx: 222_000.0, tx: 41_000.0 }, OfflineTunnel::default());
         // The daemon still answered once, so this is not the offline state.
         assert!(d.online && !d.connected);
         assert_eq!(d.status_text, "Disconnected");
@@ -229,9 +287,39 @@ mod tests {
         assert_eq!(once, twice);
     }
 
+    /// 2026-09-14 spec §1: two dots, green or red, with the reason in a
+    /// note. WireGuard is green on exactly the header's "Connected".
+    #[test]
+    fn the_services_band_says_which_of_the_two_is_up_and_why_not() {
+        let svc = |s: &Status| display(Some(s), Rates::default(), OfflineTunnel::default()).services;
+        let up = |name, note| Service { name, up: true, note };
+        let down = |name, note| Service { name, up: false, note };
+
+        assert_eq!(svc(&status(true, Some(21), 1)), [up("Yutani", "running"), up("WireGuard", "connected")]);
+        assert_eq!(svc(&status(true, Some(180), 1)), [up("Yutani", "running"), down("WireGuard", "no handshake")]);
+        assert_eq!(svc(&status(false, None, 1)), [up("Yutani", "running"), down("WireGuard", "disconnected")]);
+        let mut failed = status(false, None, 1);
+        failed.tunnel.failed = true;
+        assert_eq!(svc(&failed)[1], down("WireGuard", "failed"));
+        let mut missing = status(false, None, 1);
+        missing.tunnel.installed = false;
+        missing.tunnel.failed = true;
+        assert_eq!(svc(&missing)[1], down("WireGuard", "not installed"), "not installed outranks failed");
+
+        // Offline: Yutani is red, and WireGuard is read off the worker's
+        // own file and the unit file, since there is no daemon to ask.
+        let off = |o| display(None, Rates::default(), o).services;
+        assert_eq!(
+            off(OfflineTunnel { link_up: true, installed: true }),
+            [down("Yutani", "not running"), up("WireGuard", "connected")]
+        );
+        assert_eq!(off(OfflineTunnel { link_up: false, installed: true })[1], down("WireGuard", "disconnected"));
+        assert_eq!(off(OfflineTunnel { link_up: false, installed: false })[1], down("WireGuard", "not installed"));
+    }
+
     #[test]
     fn the_offline_state_shows_dashes_and_zeroes() {
-        let d = display(None, Rates { rx: 5.0, tx: 5.0 });
+        let d = display(None, Rates { rx: 5.0, tx: 5.0 }, OfflineTunnel::default());
         assert!(!d.online && !d.connected && !d.installed);
         assert_eq!(d.status_text, "Disconnected");
         assert_eq!((d.location.as_str(), d.iface.as_str()), ("—", "yutani0"));

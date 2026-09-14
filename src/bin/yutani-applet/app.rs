@@ -14,7 +14,7 @@ use cosmic::iced::{Rectangle, Subscription};
 use cosmic::surface::action::{app_popup, destroy_popup};
 
 use yutani::applet::client::{self, IpcError};
-use yutani::applet::display::{Display, degrade, display};
+use yutani::applet::display::{Display, OfflineTunnel, degrade, display};
 use yutani::applet::rate::{Rates, Sampler};
 use yutani::applet::{
     Action, PENDING_S, Poll, clip_note, note_visible, pending_done, poll_interval, start_command,
@@ -44,7 +44,6 @@ pub struct Applet {
     /// (or this deadline passes) describes a tunnel on its way down, so it
     /// is degraded rather than believed. See `Msg::Done(Action::Quit, ..)`.
     pub quitting: Option<Instant>,
-    pub accounts_open: bool,
     /// The last `err …` reply, shown for 3 s — or what a tunnel action is
     /// still doing, shown until the daemon answers it.
     pub note: Option<Note>,
@@ -73,8 +72,6 @@ pub enum Msg {
     Press(Action),
     /// A pressed action finished.
     Done(Action, Result<(), String>),
-    /// The Accounts… header was pressed: expand or collapse its list.
-    ToggleAccounts,
     /// Popup create/destroy, handled by libcosmic.
     Surface(cosmic::surface::Action<Msg>),
     PopupClosed(Id),
@@ -187,7 +184,16 @@ impl Applet {
     }
 
     pub fn display(&self) -> Display {
-        display(self.status.as_ref(), self.rates)
+        // Offline, the WireGuard row is read off the worker's status file
+        // and the unit file — cheap, unprivileged, and only when there is
+        // no daemon to ask.
+        let offline = if self.status.is_some() {
+            OfflineTunnel::default()
+        } else {
+            use yutani::tunnel::control::{iface_present, installed, read_tunnel_file};
+            OfflineTunnel { link_up: read_tunnel_file().is_some_and(|f| f.up) && iface_present(), installed: installed() }
+        };
+        display(self.status.as_ref(), self.rates, offline)
     }
 
     /// Ask for a `status` now, or — if one is already outstanding — leave
@@ -263,7 +269,6 @@ impl cosmic::Application for Applet {
             pending: None,
             poll: Poll::default(),
             quitting: None,
-            accounts_open: false,
             note: None,
         };
         // Through the guard like every other poll, so the very first reply
@@ -411,10 +416,6 @@ impl cosmic::Application for Applet {
                 self.note(msg, Some(action));
                 self.poll()
             }
-            Msg::ToggleAccounts => {
-                self.accounts_open = !self.accounts_open;
-                Task::none()
-            }
             // Opening the popup polls at once: the timer's first tick after
             // its 5 s → 1 s switch is a full second away, and what it would
             // show meanwhile is up to 5 s old. (`popup` is set by the open
@@ -427,7 +428,6 @@ impl cosmic::Application for Applet {
             Msg::PopupClosed(id) => {
                 if self.popup == Some(id) {
                     self.popup = None;
-                    self.accounts_open = false;
                 }
                 Task::none()
             }
