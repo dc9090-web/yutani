@@ -172,6 +172,12 @@ pub fn launch_command(full_path: bool, exe: &str) -> String {
     }
 }
 
+/// The Steam page's banner: the first problem's sentence, without the
+/// popover's "Open Settings → Steam" tail.
+pub fn steam_banner(findings: &[yutani::steam::Finding]) -> Option<String> {
+    yutani::steam::first_message(findings)
+}
+
 /// The Characters pane's confirmation sentence (handoff: it must name the
 /// source, the count and the scope).
 pub fn copy_confirm_text(source: &str, others: usize, account: bool) -> String {
@@ -244,6 +250,10 @@ pub struct State {
     pub steam_full_path: bool,
     /// This binary's absolute path, for that command.
     pub exe_path: String,
+    /// Steam accounts whose EVE launch line is broken (`yutani::steam`),
+    /// seeded from `App::steam_findings` when the window opens and
+    /// refreshed by `Msg::SteamChecked`.
+    pub steam_findings: Vec<yutani::steam::Finding>,
 }
 
 impl State {
@@ -282,6 +292,7 @@ impl State {
             copied: false,
             steam_full_path: false,
             exe_path,
+            steam_findings: Vec::new(),
         };
         state.refresh();
         state
@@ -1108,14 +1119,13 @@ fn steam_page(state: &State) -> Element<'_, Msg> {
     .class(ui::inner_class());
     let block = widget::container(Column::new().width(Length::Fill).spacing(10).push(code).push(path_toggle)).width(Length::Fill).padding([14, 16]).into();
 
-    pane(
-        "Steam",
-        "One-time setup so Steam launches EVE through Yutani.",
-        vec![
-            ui::card(vec![steps, block]),
-            ui::info_note("Launch each EVE account as usual afterwards — Yutani picks up every client automatically and gives it the next free hotkey."),
-        ],
-    )
+    let mut sections: Vec<Element<'_, Msg>> = Vec::new();
+    if let Some(problem) = steam_banner(&state.steam_findings) {
+        sections.push(ui::warning_note(problem));
+    }
+    sections.push(ui::card(vec![steps, block]));
+    sections.push(ui::info_note("Launch each EVE account as usual afterwards — Yutani picks up every client automatically and gives it the next free hotkey."));
+    pane("Steam", "One-time setup so Steam launches EVE through Yutani.", sections)
 }
 
 #[cfg(test)]
@@ -1146,6 +1156,7 @@ mod tests {
             copied: false,
             steam_full_path: false,
             exe_path: "/usr/local/bin/yutani".to_string(),
+            steam_findings: Vec::new(),
         }
     }
 
@@ -1200,6 +1211,21 @@ mod tests {
         assert!(clears_note(&Msg::Recheck));
         assert!(!clears_note(&Msg::SaveAs));
         assert!(!clears_note(&Msg::Commit));
+    }
+
+    /// The Steam page says the same thing the applet does, minus the
+    /// "open Settings" tail — the reader is already here.
+    #[test]
+    fn the_steam_banner_is_the_first_problem_or_nothing() {
+        assert_eq!(steam_banner(&[]), None);
+        let broken = yutani::steam::Finding {
+            verdict: yutani::steam::Verdict::Broken { path: "/usr/local/bin/yutani".into() },
+            file: "/h/localconfig.vdf".into(),
+        };
+        assert_eq!(
+            steam_banner(&[broken]).as_deref(),
+            Some("Steam launches EVE through /usr/local/bin/yutani, which is missing.")
+        );
     }
 
     /// The one string this page exists to hand over. Pinned exactly: a typo

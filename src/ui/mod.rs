@@ -1353,6 +1353,7 @@ impl App {
         }
         // A tunnel action outlives the window it was started from.
         state.tunnel.busy = self.tunnel_in_flight.is_some();
+        state.steam_findings = self.steam_findings.clone();
         self.settings = Some(state);
         let title = self.set_window_title("Yutani Settings".to_string(), id);
         Task::batch([title, open.map(|_| cosmic::Action::App(Msg::Settings(settings::Msg::Opened)))])
@@ -1408,7 +1409,7 @@ impl App {
                     // EVE's files are outside `State::refresh` (they are not
                     // ours, and the names lookup is a task) — and so is the
                     // tunnel, which is systemd's state, not a file of ours.
-                    return Task::batch([self.refresh_characters(), self.refresh_tunnel()]);
+                    return Task::batch([self.refresh_characters(), self.refresh_tunnel(), self.recheck_steam()]);
                 }
                 S::ActiveBorder(text) => state.active_border_field = text.clone(),
                 S::InactiveBorder(text) => state.inactive_border_field = text.clone(),
@@ -1515,6 +1516,7 @@ impl App {
         // Pages and actions that are not config fields.
         match &msg {
             S::Page(entity) => {
+                let mut to_steam = false;
                 if let Some(state) = self.settings.as_mut() {
                     state.pages.activate(*entity);
                     // The note was about the page being left behind, and so
@@ -1523,8 +1525,9 @@ impl App {
                         state.note = None;
                     }
                     state.clear_transient();
+                    to_steam = state.page() == settings::Page::Steam;
                 }
-                return Task::none();
+                return if to_steam { self.recheck_steam() } else { Task::none() };
             }
             S::SaveAs => {
                 self.settings_save_as();
@@ -2105,6 +2108,17 @@ impl App {
         )
     }
 
+    /// Re-scan Steam's launch lines off the UI thread; the answer comes
+    /// back as `Msg::SteamChecked`. Run when the settings window opens and
+    /// when its Steam page is shown, so a fix made in Steam a moment ago
+    /// is not reported as still broken for up to `steam::PERIOD`.
+    fn recheck_steam(&self) -> Task<cosmic::Action<Msg>> {
+        Task::perform(
+            async { tokio::task::spawn_blocking(yutani::steam::problems).await.unwrap_or_default() },
+            |findings| cosmic::Action::App(Msg::SteamChecked(findings)),
+        )
+    }
+
     /// One tunnel action on the blocking pool; the page is `busy` until the
     /// `TunnelDone` it resolves to. `install` shells out to `pkexec` (the
     /// polkit agent's password prompt) and connect/disconnect to
@@ -2367,7 +2381,10 @@ impl Application for App {
                         tracing::warn!(file = %f.file.display(), "{m}");
                     }
                 }
-                self.steam_findings = findings;
+                self.steam_findings = findings.clone();
+                if let Some(state) = self.settings.as_mut() {
+                    state.steam_findings = findings;
+                }
                 Task::none()
             }
         }

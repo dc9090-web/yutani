@@ -265,6 +265,7 @@ pub enum Tint {
     Accent,
     Success,
     Destructive,
+    Warning,
 }
 
 fn tint_color(c: &Cosmic, tint: Tint) -> Color {
@@ -272,6 +273,7 @@ fn tint_color(c: &Cosmic, tint: Tint) -> Color {
         Tint::Accent => roles::accent(c),
         Tint::Success => roles::success(c),
         Tint::Destructive => roles::destructive(c),
+        Tint::Warning => c.warning_color().into(),
     }
 }
 
@@ -305,6 +307,22 @@ pub fn info_note<'a, M: 'a>(body: &'a str) -> Element<'a, M> {
         .width(Length::Fill)
         .padding(NOTE_PAD)
         .class(panel_class(Tint::Accent, NOTE_RADIUS))
+        .into()
+}
+
+/// The warning note: a warning `!` glyph and a wrapping line, on the
+/// warning tint. Owned text: the sentence names a path read at runtime.
+pub fn warning_note<'a, M: 'a>(body: String) -> Element<'a, M> {
+    let glyph = widget::container(mono("!", NOTE, Weight::Semibold, Role::Warning))
+        .width(Length::Fixed(18.0))
+        .height(Length::Fixed(18.0))
+        .align_x(Horizontal::Center)
+        .align_y(Vertical::Center)
+        .class(chip_class(false));
+    widget::container(Row::new().spacing(9).align_y(Alignment::Start).push(glyph).push(prose(body, NOTE, Role::Ink)))
+        .width(Length::Fill)
+        .padding(NOTE_PAD)
+        .class(panel_class(Tint::Warning, NOTE_RADIUS))
         .into()
 }
 
