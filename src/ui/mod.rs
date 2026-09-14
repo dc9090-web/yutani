@@ -524,7 +524,7 @@ impl App {
                 Err(e) => (Reply::Now(Err(format!("layouts: {e}"))), Task::none()),
             },
             Request::Settings => (Reply::Now(Ok(None)), self.open_settings()),
-            Request::SettingsPage(page) => match settings::Page::from_name(&page) {
+            Request::SettingsPage(page) => match settings::Page::from_name(page) {
                 Some(page) => (Reply::Now(Ok(None)), self.open_settings_at(Some(page))),
                 None => (Reply::Now(Err(format!("unknown settings page {page:?}"))), Task::none()),
             },
@@ -744,7 +744,7 @@ impl App {
         client.output = output_name;
         tracing::info!(?id, x = position.0, y = position.1, width, height, "create_surface");
         self.send_thumb_size(handle, (width, height));
-        let create = get_layer_surface(SctkLayerSurfaceSettings {
+        get_layer_surface(SctkLayerSurfaceSettings {
             id,
             layer: Layer::Overlay,
             keyboard_interactivity: KeyboardInteractivity::None,
@@ -760,8 +760,7 @@ impl App {
             // This pinned iced ignores size_limits for layer surfaces; NONE is harmless.
             size_limits: Limits::NONE,
             ..Default::default()
-        });
-        create
+        })
     }
 
     /// Put up the keepalive surface (see `App::keepalive`) if it is not up
@@ -1385,12 +1384,15 @@ impl App {
                 // …and so is the tunnel: it can have been installed,
                 // connected or torn down from the CLI meanwhile.
                 let tunnel = self.refresh_tunnel();
+                // …and Steam's launch line, possibly onto the Steam page.
+                let steam = self.recheck_steam();
                 // Un-minimize first, then activate: a window the compositor
                 // minimised stays minimised if it is only activated. The
                 // same chain libcosmic's own `Action::Activate` does.
                 return Task::batch([
                     characters,
                     tunnel,
+                    steam,
                     cosmic::iced::window::minimize(window, false)
                         .chain(activation::activate(window, token.clone())),
                 ]);
@@ -2113,10 +2115,10 @@ impl App {
     /// when its Steam page is shown, so a fix made in Steam a moment ago
     /// is not reported as still broken for up to `steam::PERIOD`.
     fn recheck_steam(&self) -> Task<cosmic::Action<Msg>> {
-        Task::perform(
-            async { tokio::task::spawn_blocking(yutani::steam::problems).await.unwrap_or_default() },
-            |findings| cosmic::Action::App(Msg::SteamChecked(findings)),
-        )
+        Task::perform(async { tokio::task::spawn_blocking(yutani::steam::problems).await }, |r| match r {
+            Ok(findings) => cosmic::Action::App(Msg::SteamChecked(findings)),
+            Err(_) => cosmic::Action::None,
+        })
     }
 
     /// One tunnel action on the blocking pool; the page is `busy` until the
@@ -2374,11 +2376,15 @@ impl Application for App {
                 Task::none()
             }
             Msg::SteamChecked(findings) => {
-                // The subscription only emits on change, so this is one
-                // warning per change, not one per tick.
-                for f in &findings {
-                    if let Some(m) = f.verdict.message() {
-                        tracing::warn!(file = %f.file.display(), "{m}");
+                // The subscription emits on change, but the settings
+                // window's re-check on open runs regardless of change; the
+                // comparison below filters that back down to one warning
+                // per change, not one per re-check.
+                if findings != self.steam_findings {
+                    for f in &findings {
+                        if let Some(m) = f.verdict.message() {
+                            tracing::warn!(file = %f.file.display(), "{m}");
+                        }
                     }
                 }
                 self.steam_findings = findings.clone();

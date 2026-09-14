@@ -273,7 +273,7 @@ fn tint_color(c: &Cosmic, tint: Tint) -> Color {
         Tint::Accent => roles::accent(c),
         Tint::Success => roles::success(c),
         Tint::Destructive => roles::destructive(c),
-        Tint::Warning => c.warning_color().into(),
+        Tint::Warning => roles::warning(c),
     }
 }
 
@@ -753,7 +753,7 @@ pub fn sidebar_item<'a, M: Clone + 'a>(name: &'a str, sub: String, selected: boo
         Column::new()
             .spacing(1)
             .width(Length::Fill)
-            .push(text(name, SIDEBAR_NAME, Weight::Medium, if selected { Role::Ink } else { Role::Ink }))
+            .push(text(name, SIDEBAR_NAME, Weight::Medium, Role::Ink))
             .push(text(sub, SIDEBAR_SUB, Weight::Normal, sub_role)),
     )
     .width(Length::Fill)

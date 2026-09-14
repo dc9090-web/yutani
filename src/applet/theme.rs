@@ -241,7 +241,7 @@ pub fn badge_class(diameter: f32, badge: super::icon::Badge) -> cosmic::theme::C
         let panel = panel_bg(c);
         let (fill, ring) = match badge {
             Badge::Connected => (success(c), panel),
-            Badge::Attention => (c.warning_color().into(), panel),
+            Badge::Attention => (warning(c), panel),
             Badge::Sync => (panel, mark_ink(c)),
         };
         container::Style {

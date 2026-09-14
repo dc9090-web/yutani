@@ -143,7 +143,8 @@ pub fn popover_height(accounts: usize, menu_open: bool, graph: bool, notice: boo
 
 /// Whether the graph card fits in `available` pixels (`None`: unknown, so
 /// it is kept). The handoff's invariant: the popover never exceeds the
-/// panel work area, and the graph card is the first thing to drop.
+/// panel work area, and the graph card is the first thing to drop. The
+/// estimate includes the Steam notice row when there is one.
 pub fn graph_fits(available: Option<i32>, accounts: usize, menu_open: bool, notice: bool) -> bool {
     available.is_none_or(|h| popover_height(accounts, menu_open, true, notice) <= h)
 }
