@@ -50,4 +50,9 @@ come first on `PATH`), `yutani applet uninstall` and `yutani service
 uninstall` to drop the per-user copies that would shadow the packaged
 files, re-run `yutani tunnel install <conf>` so the tunnel unit's
 `ExecStart` is `/usr/bin/yutani`, then `systemctl --user daemon-reload &&
-systemctl --user restart yutani` and `pkill -x cosmic-panel`.
+systemctl --user restart yutani` and `pkill -x cosmic-panel`. Finally
+re-check each EVE account's Steam launch options: a line spelling
+`/usr/local/bin/yutani` must change to `/usr/bin/yutani` or bare
+`yutani`, or Play fails silently in `/bin/sh` (this bit on 2026-09-14;
+`docs/superpowers/specs/2026-09-14-steam-launch-check-design.md` is the
+check that now catches it).

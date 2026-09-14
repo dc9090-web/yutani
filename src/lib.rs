@@ -37,6 +37,7 @@ pub const STEAM_LAUNCH_ARGS: &str =
     "PROTON_ENABLE_WAYLAND=1 WINE_NO_WM_DECORATION=1 yutani launch -- %command%";
 
 /// [`STEAM_LAUNCH_ARGS`] with the binary spelled out at the path the
-/// tunnel's install instructions use (`sudo install … /usr/local/bin/yutani`).
+/// package installs it to (`/usr/bin/yutani`; the settings window's
+/// full-path toggle uses the running binary's real path instead).
 pub const STEAM_LAUNCH_ARGS_ABSOLUTE: &str =
-    "PROTON_ENABLE_WAYLAND=1 WINE_NO_WM_DECORATION=1 /usr/local/bin/yutani launch -- %command%";
+    "PROTON_ENABLE_WAYLAND=1 WINE_NO_WM_DECORATION=1 /usr/bin/yutani launch -- %command%";

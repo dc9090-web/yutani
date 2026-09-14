@@ -1155,7 +1155,7 @@ mod tests {
             uninstall_confirm: false,
             copied: false,
             steam_full_path: false,
-            exe_path: "/usr/local/bin/yutani".to_string(),
+            exe_path: "/usr/bin/yutani".to_string(),
             steam_findings: Vec::new(),
         }
     }
@@ -1241,11 +1241,11 @@ mod tests {
         // the same line with the documented install path spelled out.
         assert_eq!(
             yutani::STEAM_LAUNCH_ARGS_ABSOLUTE,
-            "PROTON_ENABLE_WAYLAND=1 WINE_NO_WM_DECORATION=1 /usr/local/bin/yutani launch -- %command%"
+            "PROTON_ENABLE_WAYLAND=1 WINE_NO_WM_DECORATION=1 /usr/bin/yutani launch -- %command%"
         );
         assert_eq!(
             yutani::STEAM_LAUNCH_ARGS_ABSOLUTE,
-            yutani::STEAM_LAUNCH_ARGS.replace(" yutani launch", " /usr/local/bin/yutani launch")
+            yutani::STEAM_LAUNCH_ARGS.replace(" yutani launch", " /usr/bin/yutani launch")
         );
     }
 
