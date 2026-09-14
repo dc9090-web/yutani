@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use cosmic::Element;
-use cosmic::iced::Length;
 use cosmic::widget;
 
 use yutani::eve_settings::copy::{Failure, Report};
@@ -148,15 +147,6 @@ impl State {
             None => String::new(),
         }
     }
-}
-
-pub fn character_label(entry: &Entry, names: &Names, now: SystemTime) -> String {
-    let name = names.get(&entry.id).cloned().unwrap_or_else(|| entry.id.to_string());
-    format!("{name} · {}", relative_age(entry.modified, now))
-}
-
-pub fn account_label(entry: &Entry, now: SystemTime) -> String {
-    format!("account {} · {}", entry.id, relative_age(entry.modified, now))
 }
 
 /// Why the Copy button is disabled, or `None` when it is enabled.
@@ -333,82 +323,193 @@ pub fn blocker_note(blocker: &str) -> String {
     .to_string()
 }
 
-pub fn view(state: &State, clients_running: bool) -> Element<'_, Msg> {
+/// The humanised last-backup line: `13 Sep 2026, 05:38 · before the last
+/// copy or restore`, never the raw timestamp directory.
+pub fn backup_when(dir: &Path) -> String {
+    match std::fs::metadata(dir).and_then(|m| m.modified()) {
+        Ok(t) => format!("{} · before the last copy or restore", crate::model::date::date_time(t)),
+        Err(_) => dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+    }
+}
+
+pub fn view<'a>(settings: &'a super::settings::State, clients_running: bool) -> Element<'a, Msg> {
+    use super::settings::{CopyPhase, Msg as M, copy_confirm_text};
+    use super::settings_ui as ui;
+    use cosmic::iced::font::Weight;
+    use cosmic::iced::{Alignment, Length};
+    use cosmic::widget::{Column, Row};
+
+    let state = &settings.characters;
     let now = SystemTime::now();
-    let mut copy = widget::settings::section().title("Copy interface settings").add(widget::text::caption(
-        "Copies the overview, window positions and sizes, chat setup and UI layout of one character to every \
-         other character in this EVE profile. The files are replaced whole; a backup is taken first.",
-    ));
+
+    // 1 — Copy from
+    let mut sources: Vec<Element<'a, Msg>> = Vec::new();
     if let Some(listing) = state.listing.as_ref() {
-        let characters: Vec<String> = listing.characters.iter().map(|e| character_label(e, &state.names, now)).collect();
-        copy = copy.add(widget::settings::item(
-            "Copy from",
-            widget::dropdown(characters, Some(state.source_character), Msg::SourceCharacter),
-        ));
-        copy = copy.add(widget::settings::item(
-            "Also copy account settings (shortcuts, general, graphics, audio)",
-            widget::toggler(state.copy_account).on_toggle(Msg::CopyAccount),
-        ));
-        if state.copy_account {
-            let accounts: Vec<String> = listing.accounts.iter().map(|e| account_label(e, now)).collect();
-            copy = copy.add(widget::settings::item(
-                "Account to copy from",
-                widget::dropdown(accounts, Some(state.source_account), Msg::SourceAccount),
-            ));
-            if listing.accounts.len() < 2 {
-                copy = copy.add(widget::text::caption("Only one account has settings here; nothing to copy to."));
-            }
-        }
-        if state.fetching {
-            copy = copy.add(widget::text::caption("Looking up character names…"));
-        } else if let Some(e) = state.names_error.as_deref() {
-            copy = copy.add(widget::text::caption(format!("Names unavailable ({e}); ids are shown instead.")));
+        for (i, e) in listing.characters.iter().enumerate() {
+            let name = state.names.get(&e.id).cloned().unwrap_or_else(|| e.id.to_string());
+            let seen = format!("last played {}", relative_age(e.modified, now));
+            sources.push(
+                widget::button::custom(
+                    Column::new()
+                        .spacing(1)
+                        .push(ui::text(name, ui::BODY, Weight::Medium, ui::Role::Ink))
+                        .push(ui::mono(seen, ui::CAPTION, Weight::Normal, ui::Role::Tertiary)),
+                )
+                .padding([8, 12])
+                .class(ui::pill_class(state.source_character == i, ui::INNER_RADIUS))
+                .on_press(M::SourceCharacter(i))
+                .into(),
+            );
         }
     }
-    let blocker = copy_blocker(state, clients_running);
-    copy = copy.add(widget::settings::item_row(vec![
-        widget::button::suggested("Copy to all characters")
-            .on_press_maybe(blocker.is_none().then_some(Msg::CopyCharacters))
-            .into(),
-        widget::button::standard("Refresh").on_press(Msg::RefreshCharacters).into(),
-    ]));
-    if let Some(reason) = blocker {
-        copy = copy.add(widget::text::caption(reason));
-    }
-
-    let mut backups = widget::settings::section().title("Backups");
-    match state.last_backup.as_ref() {
-        Some(dir) => {
-            backups = backups.add(widget::text::monotext(dir.display().to_string()).width(Length::Fill));
-            backups = backups.add(widget::settings::item_row(vec![
-                widget::button::standard("Restore last backup")
-                    .on_press_maybe((!clients_running && state.listing.is_some()).then_some(Msg::RestoreBackup))
-                    .into(),
-            ]));
-            // The same reason the Copy button gives: a running client
-            // would rewrite the restored files the moment it logs out.
-            if clients_running {
-                backups = backups.add(widget::text::caption(RUNNING_CLIENT));
-            }
-        }
-        None => backups = backups.add(widget::text::caption("No backups yet. One is taken before every copy.")),
-    }
-
-    let mut profile = widget::settings::section().title("EVE profile");
+    let mut step1 = Column::new().width(Length::Fill).spacing(10).push(ui::step_title(1, "Copy from"));
     match (state.listing.as_ref(), state.error.as_deref()) {
-        (Some(listing), _) => {
-            profile = profile.add(widget::text::monotext(listing.dir.display().to_string()).width(Length::Fill));
+        (Some(l), _) if l.characters.is_empty() => {
+            step1 = step1.push(ui::prose("No character settings were found in this profile.", ui::ROW_HELP, ui::Role::Tertiary));
         }
-        (None, Some(error)) => {
-            profile = profile.add(widget::text::body(error));
+        (Some(_), _) => {
+            step1 = step1.push(cosmic::widget::flex_row(sources).row_spacing(6).column_spacing(6));
         }
-        (None, None) => profile = profile.add(widget::text::caption("Not read yet.")),
+        (None, Some(error)) => step1 = step1.push(ui::prose(error, ui::ROW_HELP, ui::Role::Destructive)),
+        (None, None) => step1 = step1.push(ui::prose("Reading the EVE profile…", ui::ROW_HELP, ui::Role::Tertiary)),
     }
-    profile = profile.add(widget::text::caption(
-        "Found through Steam's library list. To point elsewhere, set eve_settings_dir in ~/.config/yutani/config.ron.",
-    ));
+    if state.fetching {
+        step1 = step1.push(ui::prose("Looking up character names…", ui::CAPTION, ui::Role::Tertiary));
+    } else if let Some(e) = state.names_error.as_deref() {
+        step1 = step1.push(ui::prose(format!("Names unavailable ({e}); ids are shown instead."), ui::CAPTION, ui::Role::Tertiary));
+    }
 
-    widget::settings::view_column(vec![copy.into(), backups.into(), profile.into()]).into()
+    // 2 — What gets copied
+    let interface = widget::container(
+        Row::new()
+            .spacing(11)
+            .align_y(Alignment::Start)
+            .push(ui::mono("✓", ui::VALUE, Weight::Normal, ui::Role::Success))
+            .push(ui::label_block("Interface — overview, window positions, chat, UI layout", Some("Always included. This is the point of the operation."))),
+    )
+    .width(Length::Fill)
+    .padding(ui::INNER_PAD)
+    .class(ui::inner_class());
+    let only_one_account = state.listing.as_ref().is_some_and(|l| l.accounts.len() < 2);
+    let account_help = if only_one_account {
+        "Only one account has settings here; nothing to copy to."
+    } else {
+        "Off by default: graphics settings rarely suit every machine."
+    };
+    let account = widget::container(
+        Row::new()
+            .spacing(11)
+            .align_y(Alignment::Center)
+            .push(ui::label_block("Account settings — shortcuts, general, graphics, audio", Some(account_help)))
+            .push(ui::toggle(state.copy_account, M::CopyAccount)),
+    )
+    .width(Length::Fill)
+    .padding(ui::INNER_PAD)
+    .class(ui::inner_class());
+    let step2 = Column::new().width(Length::Fill).spacing(10).push(ui::step_title(2, "What gets copied")).push(interface).push(account);
+
+    // 3 — Apply
+    let others = state.listing.as_ref().map_or(0, |l| l.characters.len().saturating_sub(1));
+    let blocker = copy_blocker(state, clients_running);
+    let apply: Element<'a, Msg> = match &settings.copy_phase {
+        CopyPhase::Idle => {
+            let label = if others == 1 { "Copy to 1 other character".to_string() } else { format!("Copy to {others} other characters") };
+            let mut row = Row::new().spacing(11).align_y(Alignment::Center).push(ui::primary_button_owned(label, blocker.is_none().then_some(M::AskCopy)));
+            row = row.push(ui::prose(blocker.unwrap_or("A backup is taken first."), ui::ROW_HELP, ui::Role::Tertiary));
+            row.into()
+        }
+        CopyPhase::Confirm => ui::panel(
+            ui::Tint::Destructive,
+            Column::new()
+                .spacing(10)
+                .push(ui::prose(copy_confirm_text(&state.source_label(), others, state.account_to_copy().is_some()), ui::BODY, ui::Role::Ink))
+                .push(
+                    Row::new()
+                        .spacing(8)
+                        .push(ui::destructive_button("Replace their settings", Some(M::CopyCharacters)))
+                        .push(ui::standard_button("Cancel", Some(M::CancelCopy))),
+                ),
+        ),
+        CopyPhase::Done(text) => ui::panel(
+            ui::Tint::Success,
+            Row::new()
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .push(ui::mono("✓", ui::VALUE, Weight::Normal, ui::Role::Success))
+                .push(ui::prose(text.as_str(), ui::BODY, ui::Role::Ink))
+                .push(ui::quiet_button("Dismiss", M::CancelCopy)),
+        ),
+    };
+    let step3 = Column::new().width(Length::Fill).spacing(10).push(ui::step_title(3, "Apply")).push(apply);
+
+    let step = |content: Element<'a, Msg>| -> Element<'a, Msg> { widget::container(content).width(Length::Fill).padding([14, 16, 12, 16]).into() };
+    let copy_card = ui::card(vec![step(step1.into()), step(step2.into()), step(step3.into())]);
+
+    // Safety net
+    let backup_row = match state.last_backup.as_ref() {
+        Some(dir) => {
+            let when = backup_when(dir);
+            let restorable = !clients_running && state.listing.is_some();
+            widget::container(
+                Row::new()
+                    .width(Length::Fill)
+                    .spacing(14)
+                    .align_y(Alignment::Center)
+                    .push(
+                        Column::new()
+                            .width(Length::Fill)
+                            .spacing(1)
+                            .push(ui::text("Last backup", ui::ROW_LABEL, Weight::Normal, ui::Role::Ink))
+                            .push(ui::mono(when, ui::LAYOUT_META, Weight::Normal, ui::Role::Tertiary)),
+                    )
+                    .push(ui::standard_button("Restore", restorable.then_some(M::RestoreBackup))),
+            )
+            .width(Length::Fill)
+            .padding(ui::ROW_PAD)
+            .into()
+        }
+        None => ui::row("Last backup", Some("No backups yet. One is taken before every copy."), widget::space().width(Length::Shrink)),
+    };
+    let (path, found_how): (String, &'static str) = match (state.listing.as_ref(), state.error.as_deref()) {
+        (Some(l), _) => (l.dir.display().to_string(), "Found automatically through Steam's library list."),
+        (None, Some(e)) => (e.to_string(), "Choose the profile folder — the one holding core_char_*.dat."),
+        (None, None) => ("Not read yet.".to_string(), ""),
+    };
+    let profile_row = widget::container(
+        Column::new()
+            .width(Length::Fill)
+            .spacing(7)
+            .push(
+                Row::new()
+                    .width(Length::Fill)
+                    .spacing(12)
+                    .align_y(Alignment::Center)
+                    .push(ui::text("EVE profile folder", ui::ROW_LABEL, Weight::Normal, ui::Role::Ink))
+                    .push(widget::space().width(Length::Fill))
+                    .push(ui::standard_button("Change…", Some(M::ChangeProfileDir))),
+            )
+            .push(
+                widget::text(path)
+                    .size(ui::LAYOUT_META)
+                    .font(cosmic::font::mono())
+                    .wrapping(cosmic::iced::widget::text::Wrapping::Glyph)
+                    .class(ui::Role::Secondary.class())
+                    .width(Length::Fill),
+            )
+            .push(ui::prose(found_how, ui::ROW_HELP, ui::Role::Tertiary)),
+    )
+    .width(Length::Fill)
+    .padding(ui::ROW_PAD)
+    .into();
+    let safety = ui::section("Safety net", ui::card(vec![backup_row, profile_row]));
+
+    Column::new()
+        .width(Length::Fill)
+        .spacing(ui::PANE_GAP)
+        .push(ui::heading("Characters", "Copy one character's in-game interface onto the others in this EVE profile."))
+        .push(copy_card)
+        .push(safety)
+        .into()
 }
 
 #[cfg(test)]
@@ -430,16 +531,6 @@ mod tests {
         let mut s = State::default();
         s.set_listing(Ok(listing));
         s
-    }
-
-    #[test]
-    fn labels_show_the_name_when_known_and_the_id_when_not() {
-        let now = SystemTime::now();
-        let mut names = Names::new();
-        names.insert(1, "KestrelVance".to_string());
-        assert_eq!(character_label(&entry(1, 0, now), &names, now), "KestrelVance · just now");
-        assert_eq!(character_label(&entry(2, 7200, now), &names, now), "2 · 2 h ago");
-        assert_eq!(account_label(&entry(571002, 120, now), now), "account 571002 · 2 min ago");
     }
 
     #[test]

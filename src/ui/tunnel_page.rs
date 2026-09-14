@@ -14,7 +14,6 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 use cosmic::Element;
-use cosmic::iced::Length;
 use cosmic::iced::clipboard::mime::AllowedMimeTypes;
 use cosmic::widget;
 
@@ -203,25 +202,6 @@ pub fn install_blocker(state: &State) -> Option<&'static str> {
     None
 }
 
-/// One line of state; never a key, never an endpoint.
-pub fn summary(status: Option<&TunnelStatus>) -> String {
-    let Some(t) = status else { return "Status unknown (is the daemon running?)".to_string() };
-    if !t.installed {
-        return "Not installed".to_string();
-    }
-    let state = if t.failed {
-        "unit failed".to_string()
-    } else if t.connected {
-        match &t.exit_address {
-            Some(ip) => format!("connected, exit {ip}"),
-            None => "connected".to_string(),
-        }
-    } else {
-        "disconnected".to_string()
-    };
-    format!("Installed ({}) · {state}", t.location)
-}
-
 /// The note an install leaves behind: the file's *name* and nothing from
 /// inside it — the file holds a private key. It says so, and says to delete
 /// the download, in the same words the CLI's `success_message` uses: the
@@ -244,79 +224,177 @@ fn conf_name(conf: &Path) -> String {
     conf.file_name().map_or_else(|| conf.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
-pub fn view<'a>(state: &'a State, config: &'a Config) -> Element<'a, Msg> {
-    let installed = state.status.as_ref().is_some_and(|t| t.installed);
-    let connected = state.status.as_ref().is_some_and(|t| t.connected);
+/// The state card's headline and sub line.
+pub fn headline(status: Option<&TunnelStatus>) -> (String, String) {
+    match status {
+        Some(t) if t.installed && t.connected => (
+            format!("Connected — {}", t.location),
+            match &t.exit_address {
+                Some(ip) => format!("exit {ip} · EVE traffic only"),
+                None => "handshaking · EVE traffic only".to_string(),
+            },
+        ),
+        Some(t) if t.installed && t.failed => (format!("Installed — unit failed"), "see journalctl -u yutani-tunnel · EVE uses your normal connection".to_string()),
+        Some(t) if t.installed => ("Installed — not connected".to_string(), "ready to connect · EVE traffic only".to_string()),
+        _ => ("No tunnel installed".to_string(), "EVE uses your normal connection".to_string()),
+    }
+}
+
+/// When the unit file was written: the `INSTALLED` fact.
+pub fn installed_when() -> Option<std::time::SystemTime> {
+    std::fs::metadata(crate::tunnel::UNIT_PATH).and_then(|m| m.modified()).ok()
+}
+
+pub fn view<'a>(settings: &'a super::settings::State, config: &'a Config) -> Element<'a, Msg> {
+    use super::settings::Msg as M;
+    use super::settings_ui as ui;
+    use cosmic::iced::font::Weight;
+    use cosmic::iced::{Alignment, Length};
+    use cosmic::widget::{Column, Row};
+
+    let state = &settings.tunnel;
+    let status = state.status.as_ref();
+    let installed = status.is_some_and(|t| t.installed);
+    let connected = status.is_some_and(|t| t.connected);
+    let on = status.is_some_and(|t| t.installed && t.connected && !t.failed);
     let blocker = install_blocker(state);
 
-    let mut file = widget::settings::section().title("WireGuard configuration").add(widget::text::caption(
-        "The wg-quick .conf you downloaded from Proton VPN (WireGuard, one server). Browse for it, type its \
-         path, or drag it from Files and drop it on this window.",
-    ));
-    // No typing while an action is in flight: the field is what the running
-    // install was started from, and `busy` already disables every button.
-    let mut path_field = widget::text_input("/home/you/Downloads/EVE-UK-455.conf", state.conf_path.as_str())
-        .width(Length::Fill);
-    if !state.busy {
-        path_field = path_field.on_input(Msg::TunnelConfPath);
-    }
-    let mut row: Vec<Element<'a, Msg>> = vec![path_field.into()];
-    if state.can_browse {
-        row.push(
-            widget::button::standard("Browse…")
-                .on_press_maybe((!state.busy).then_some(Msg::BrowseTunnelConf))
-                .into(),
-        );
-    }
-    file = file.add(widget::settings::item_row(row));
-    file = file.add(widget::settings::item_row(vec![
-        widget::button::suggested(if installed { "Replace configuration" } else { "Install tunnel" })
-            .on_press_maybe(blocker.is_none().then_some(Msg::InstallTunnel))
-            .into(),
-    ]));
-    if let Some(reason) = blocker {
-        file = file.add(widget::text::caption(reason));
-    }
-    file = file.add(widget::text::caption(
-        "After a successful install, delete the downloaded file: it holds the private key and is world-readable.",
-    ));
-    file = file.add(widget::text::caption(
-        "Installing asks for your password once (polkit). The file's private key goes to /etc/yutani, root-only; \
-         it is never shown here.",
-    ));
-
-    let mut tunnel =
-        widget::settings::section().title("Tunnel").add(widget::text::body(summary(state.status.as_ref())));
-    if installed {
-        tunnel = tunnel.add(widget::settings::item_row(vec![
-            widget::button::suggested("Connect")
-                .on_press_maybe((!state.busy && !connected).then_some(Msg::TunnelConnect))
-                .into(),
-            widget::button::standard("Disconnect")
-                .on_press_maybe((!state.busy && connected).then_some(Msg::TunnelDisconnect))
-                .into(),
-            widget::button::destructive("Uninstall")
-                .on_press_maybe((!state.busy).then_some(Msg::UninstallTunnel))
-                .into(),
-            widget::button::standard("Refresh").on_press_maybe((!state.busy).then_some(Msg::RefreshTunnel)).into(),
-        ]));
+    // State card
+    let (head, sub) = headline(status);
+    let primary: Element<'a, Msg> = if !installed {
+        ui::primary_button("Install first", None)
+    } else if connected {
+        ui::standard_button("Disconnect", (!state.busy).then_some(M::TunnelDisconnect))
     } else {
-        tunnel = tunnel.add(widget::settings::item_row(vec![
-            widget::button::standard("Refresh").on_press_maybe((!state.busy).then_some(Msg::RefreshTunnel)).into(),
-        ]));
+        ui::primary_button("Connect", (!state.busy).then_some(M::TunnelConnect))
+    };
+    let line = widget::container(
+        Row::new()
+            .width(Length::Fill)
+            .spacing(13)
+            .align_y(Alignment::Center)
+            .push(ui::glowing_dot(on, ui::Tint::Success, 9.0))
+            .push(
+                Column::new()
+                    .width(Length::Fill)
+                    .spacing(2)
+                    .push(ui::text(head, ui::STATE_HEADLINE, Weight::Semibold, ui::Role::Ink))
+                    .push(ui::mono(sub, ui::STATE_SUB, Weight::Normal, ui::Role::Secondary)),
+            )
+            .push(primary)
+            .push(ui::glyph_button("↻", 36.0, (!state.busy).then_some(M::RefreshTunnel))),
+    )
+    .width(Length::Fill)
+    .padding([15, 16]);
+    let fact = |label: &'static str, value: String| {
+        Column::new()
+            .width(Length::FillPortion(1))
+            .spacing(2)
+            .push(ui::section_label(label))
+            .push(widget::container(ui::mono(value, ui::FACT_VALUE, Weight::Normal, ui::Role::Ink)).width(Length::Fill).clip(true))
+    };
+    let dash = || "—".to_string();
+    let facts = widget::container(
+        Row::new()
+            .width(Length::Fill)
+            .spacing(10)
+            .push(fact("Location", status.filter(|t| t.installed).map_or_else(dash, |t| t.location.clone())))
+            .push(fact("Private key", if installed { "/etc/yutani · root only".to_string() } else { dash() }))
+            .push(fact("Installed", if installed { installed_when().map_or_else(dash, |t| crate::model::date::date_time(t)) } else { "never".to_string() })),
+    )
+    .width(Length::Fill)
+    .padding([11, 16]);
+    let state_card = widget::container(Column::new().width(Length::Fill).push(line).push(ui::hairline()).push(facts))
+        .width(Length::Fill)
+        .class(if on { ui::panel_class(ui::Tint::Success, ui::CARD_RADIUS) } else { ui::card_class() });
+
+    // Configuration card
+    let mut path_field = widget::text_input("…or type a path", state.conf_path.as_str()).size(ui::FACT_VALUE).font(cosmic::font::mono()).width(Length::Fill);
+    if !state.busy {
+        path_field = path_field.on_input(M::TunnelConfPath);
     }
+    let mut input_row = Row::new().width(Length::Fill).spacing(8).align_y(Alignment::Center).push(path_field);
+    if state.can_browse {
+        input_row = input_row.push(ui::standard_button("Browse…", (!state.busy).then_some(M::BrowseTunnelConf)));
+    }
+    input_row = input_row.push(ui::primary_button(if installed { "Replace" } else { "Install tunnel" }, blocker.is_none().then_some(M::InstallTunnel)));
+    let mut zone = Column::new()
+        .width(Length::Fill)
+        .spacing(7)
+        .push(ui::text("Drop a wg-quick .conf here", ui::ROW_LABEL, Weight::Normal, ui::Role::Ink))
+        .push(ui::prose("From your VPN provider — one server, WireGuard format.", ui::ROW_HELP, ui::Role::Tertiary))
+        .push(widget::container(input_row).width(Length::Fill).padding([4, 0, 0, 0]));
+    if let Some(reason) = blocker.filter(|r| *r != NO_FILE) {
+        zone = zone.push(ui::prose(reason, ui::ROW_HELP, ui::Role::Warning));
+    }
+    let drop_zone = widget::container(zone).width(Length::Fill).padding(ui::DROP_PAD).class(ui::sunken_class());
+    let bullet = |t: &'static str| {
+        Row::new().spacing(9).align_y(Alignment::Start).push(widget::container(ui::dot(true, ui::Tint::Accent, 4.0)).padding([6, 0, 0, 0])).push(ui::prose(t, ui::ROW_HELP, ui::Role::Secondary))
+    };
+    let notes = Column::new()
+        .width(Length::Fill)
+        .spacing(7)
+        .push(bullet("Installing asks for your password once. The private key is written to /etc/yutani, readable only by root, and never shown here."))
+        .push(bullet("Delete the downloaded .conf afterwards — it holds that same key and is world-readable in your Downloads folder."));
+    let configuration = widget::container(
+        Column::new().width(Length::Fill).spacing(14).push(drop_zone).push(notes),
+    )
+    .width(Length::Fill)
+    .padding([16, 16, 14, 16])
+    .class(ui::card_class());
 
+    // DNS card
     let servers: Vec<String> = config.tunnel.dns_servers.iter().map(|s| s.to_string()).collect();
-    let dns = widget::settings::section()
-        .title("DNS inside the tunnel")
-        .add(widget::settings::item("Resolvers", widget::text::body(servers.join(", "))))
-        .add(widget::settings::item("Domains", widget::text::body(config.tunnel.dns_domains.join(", "))))
-        .add(widget::text::caption(
-            "From tunnel.dns_servers / tunnel.dns_domains in config.ron. They are written into the tunnel at \
-             install time, so after changing them press Install tunnel again.",
-        ));
+    let dns = ui::card(vec![
+        ui::row_tight("Resolvers", None, ui::mono(servers.join(", "), ui::FACT_VALUE, Weight::Normal, ui::Role::Secondary)),
+        ui::row_tight("Domains routed", None, ui::mono(config.tunnel.dns_domains.join(", "), ui::FACT_VALUE, Weight::Normal, ui::Role::Secondary)),
+        widget::container(ui::prose(
+            "Written into the tunnel when it is installed — replace the configuration to change them.",
+            ui::ROW_HELP,
+            ui::Role::Tertiary,
+        ))
+        .width(Length::Fill)
+        .padding([10, 16])
+        .into(),
+    ]);
 
-    widget::settings::view_column(vec![file.into(), tunnel.into(), dns.into()]).into()
+    // Danger card
+    let actions: Element<'a, Msg> = if settings.uninstall_confirm {
+        Row::new()
+            .spacing(7)
+            .push(ui::standard_button("Cancel", Some(M::CancelUninstall)))
+            .push(ui::destructive_button("Uninstall", (!state.busy).then_some(M::UninstallTunnel)))
+            .into()
+    } else {
+        ui::destructive_outline_button("Uninstall…", (installed && !state.busy).then_some(M::AskUninstall))
+    };
+    let danger = widget::container(
+        Row::new()
+            .width(Length::Fill)
+            .spacing(13)
+            .align_y(Alignment::Center)
+            .push(
+                Column::new()
+                    .width(Length::Fill)
+                    .spacing(2)
+                    .push(ui::text("Uninstall tunnel", ui::ROW_LABEL, Weight::Medium, ui::Role::Ink))
+                    .push(ui::prose("Removes the interface and the stored private key. EVE goes back to your normal connection.", ui::ROW_HELP, ui::Role::Secondary)),
+            )
+            .push(actions),
+    )
+    .width(Length::Fill)
+    .padding([13, 15])
+    .class(ui::panel_class(ui::Tint::Destructive, ui::CARD_RADIUS));
+
+    Column::new()
+        .width(Length::Fill)
+        .spacing(ui::PANE_GAP)
+        .push(ui::heading("Tunnel", "A WireGuard tunnel used by EVE's traffic only. Everything else keeps your normal route."))
+        .push(state_card)
+        .push(ui::section("Configuration", configuration))
+        .push(ui::section("DNS inside the tunnel", dns))
+        .push(danger)
+        .into()
 }
 
 #[cfg(test)]
@@ -403,24 +481,22 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The state card's two lines, per state — never a key.
     #[test]
-    fn the_summary_names_the_state_without_secrets() {
+    fn the_headline_names_the_state_without_secrets() {
         let mut t = TunnelStatus::default();
-        assert_eq!(summary(None), "Status unknown (is the daemon running?)");
-        assert_eq!(summary(Some(&t)), "Not installed");
+        assert_eq!(headline(None).0, "No tunnel installed");
+        assert_eq!(headline(Some(&t)), ("No tunnel installed".to_string(), "EVE uses your normal connection".to_string()));
         t.installed = true;
         t.location = "London".into();
-        assert_eq!(summary(Some(&t)), "Installed (London) · disconnected");
+        assert_eq!(headline(Some(&t)), ("Installed — not connected".to_string(), "ready to connect · EVE traffic only".to_string()));
         t.connected = true;
-        t.handshake_age_s = Some(12);
-        // Connected before the exit address is known (no handshake yet, or
-        // the lookup failed): the state still has to be readable.
-        assert_eq!(summary(Some(&t)), "Installed (London) · connected");
+        assert_eq!(headline(Some(&t)), ("Connected — London".to_string(), "handshaking · EVE traffic only".to_string()));
         t.exit_address = Some("203.0.113.42".into());
-        assert_eq!(summary(Some(&t)), "Installed (London) · connected, exit 203.0.113.42");
+        assert_eq!(headline(Some(&t)).1, "exit 203.0.113.42 · EVE traffic only");
         t.connected = false;
         t.failed = true;
-        assert_eq!(summary(Some(&t)), "Installed (London) · unit failed");
+        assert!(headline(Some(&t)).0.contains("unit failed"));
     }
 
     #[test]

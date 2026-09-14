@@ -36,6 +36,7 @@ pub mod ipc;
 pub mod pointer;
 pub mod rules;
 pub mod settings;
+pub mod settings_ui;
 pub mod thumbnail;
 pub mod tunnel_page;
 
@@ -1333,6 +1334,7 @@ impl App {
         }
         let (id, open) = cosmic::iced::window::open(settings::window_settings(Self::APP_ID));
         let mut state = settings::State::new(id, &self.config);
+        state.applied_layout = self.layout.last_applied.clone();
         if let Some(i) = position {
             state.pages.activate_position(i as u16);
         }
@@ -1397,10 +1399,65 @@ impl App {
                 }
                 S::ActiveBorder(text) => state.active_border_field = text.clone(),
                 S::InactiveBorder(text) => state.inactive_border_field = text.clone(),
-                S::NextKey(text) => state.next_field = text.clone(),
-                S::PrevKey(text) => state.prev_field = text.clone(),
+                S::ResetFrame => {
+                    state.active_border_field.clear();
+                    state.inactive_border_field = Config::default().inactive_border;
+                }
                 S::Name(text) => {
                     state.name_field = text.clone();
+                    return Task::none();
+                }
+                // Transient UI state: never persisted, cleared on pane change.
+                S::LayoutMenu(name) => {
+                    state.layout_menu = if state.layout_menu.as_deref() == Some(name) { None } else { Some(name.clone()) };
+                    state.renaming = None;
+                    state.confirm_delete = None;
+                    return Task::none();
+                }
+                S::LayoutRenameStart(name) => {
+                    state.renaming = Some((name.clone(), name.clone()));
+                    state.layout_menu = None;
+                    return Task::none();
+                }
+                S::LayoutRenameDraft(draft) => {
+                    if let Some((_, d)) = state.renaming.as_mut() {
+                        *d = draft.clone();
+                    }
+                    return Task::none();
+                }
+                S::LayoutDeleteAsk(name) => {
+                    state.confirm_delete = Some(name.clone());
+                    state.layout_menu = None;
+                    return Task::none();
+                }
+                S::LayoutCancel => {
+                    state.layout_menu = None;
+                    state.renaming = None;
+                    state.confirm_delete = None;
+                    return Task::none();
+                }
+                S::AskCopy => {
+                    state.copy_phase = settings::CopyPhase::Confirm;
+                    return Task::none();
+                }
+                S::CancelCopy => {
+                    state.copy_phase = settings::CopyPhase::Idle;
+                    return Task::none();
+                }
+                S::AskUninstall => {
+                    state.uninstall_confirm = true;
+                    return Task::none();
+                }
+                S::CancelUninstall => {
+                    state.uninstall_confirm = false;
+                    return Task::none();
+                }
+                S::CopyReset => {
+                    state.copied = false;
+                    return Task::none();
+                }
+                S::SteamFullPath(on) => {
+                    state.steam_full_path = *on;
                     return Task::none();
                 }
                 S::TunnelConfPath(text) => {
@@ -1430,12 +1487,6 @@ impl App {
                     }
                     return Task::none();
                 }
-                S::SourceAccount(i) => {
-                    if state.characters.listing.as_ref().is_some_and(|l| *i < l.accounts.len()) {
-                        state.characters.source_account = *i;
-                    }
-                    return Task::none();
-                }
                 S::CopyAccount(on) => {
                     state.characters.copy_account = *on;
                     return Task::none();
@@ -1453,10 +1504,12 @@ impl App {
             S::Page(entity) => {
                 if let Some(state) = self.settings.as_mut() {
                     state.pages.activate(*entity);
-                    // The note was about the page being left behind.
+                    // The note was about the page being left behind, and so
+                    // was every armed confirm and open menu.
                     if settings::clears_note(&msg) {
                         state.note = None;
                     }
+                    state.clear_transient();
                 }
                 return Task::none();
             }
@@ -1465,36 +1518,36 @@ impl App {
                 return Task::none();
             }
             S::Apply(name) => return self.settings_apply_layout(name.clone()),
-            S::Rename(from) => {
-                self.settings_rename_layout(from.clone());
+            S::LayoutRenameCommit => {
+                self.settings_rename_layout();
+                return Task::none();
+            }
+            S::LayoutDuplicate(name) => {
+                self.settings_duplicate_layout(name.clone());
                 return Task::none();
             }
             S::Delete(name) => {
                 self.settings_delete_layout(name.clone());
                 return Task::none();
             }
-            S::InstallShortcuts => {
-                self.settings_shortcuts(true);
-                return Task::none();
-            }
-            S::UninstallShortcuts => {
-                self.settings_shortcuts(false);
-                return Task::none();
-            }
-            // The note *is* the feedback for this press — there is nothing
-            // else on screen to change — so it is set before the clipboard
-            // task is handed back.
+            // The button reads "Copied" for 1.6 s; the clipboard write and
+            // the reset timer are handed back together.
             S::CopySteamArgs => {
-                self.settings_note("copied".to_string());
-                return cosmic::iced::clipboard::write(yutani::STEAM_LAUNCH_ARGS.to_string());
+                let Some(state) = self.settings.as_mut() else { return Task::none() };
+                state.copied = true;
+                let line = settings::launch_command(state.steam_full_path, &state.exe_path);
+                let reset = cosmic::iced::Task::perform(tokio::time::sleep(std::time::Duration::from_millis(1600)), |_| {
+                    cosmic::Action::App(Msg::Settings(settings::Msg::CopyReset))
+                });
+                return Task::batch([cosmic::iced::clipboard::write(line), reset]);
             }
+            S::ChangeProfileDir => return self.browse_profile_dir(),
             // The window's own drop target answered: the Wayland route
             // into the same handler the X11 window event uses.
             S::FilesDropped(paths) => {
                 self.on_files_dropped(paths);
                 return Task::none();
             }
-            S::RefreshCharacters => return self.refresh_characters(),
             S::RefreshTunnel => return self.refresh_tunnel(),
             S::BrowseTunnelConf => return self.browse_tunnel_conf(),
             // Re-checked here and not only on the button: the file behind
@@ -1513,7 +1566,12 @@ impl App {
                 }
                 return self.run_tunnel_action(settings::TunnelAction::Install);
             }
-            S::UninstallTunnel => return self.run_tunnel_action(settings::TunnelAction::Uninstall),
+            S::UninstallTunnel => {
+                if let Some(state) = self.settings.as_mut() {
+                    state.uninstall_confirm = false;
+                }
+                return self.run_tunnel_action(settings::TunnelAction::Uninstall);
+            }
             S::TunnelConnect => return self.run_tunnel_action(settings::TunnelAction::Connect),
             S::TunnelDisconnect => return self.run_tunnel_action(settings::TunnelAction::Disconnect),
             // Whatever happened, the action is over: the buttons come back
@@ -1526,7 +1584,16 @@ impl App {
             // Both set the note themselves, then the listing (and the
             // newest backup) are re-read: the files on disk just changed.
             S::CopyCharacters => {
-                self.settings_copy_characters();
+                let done = self.settings_copy_characters();
+                if let Some(state) = self.settings.as_mut() {
+                    state.copy_phase = match done {
+                        Some((source, n)) => {
+                            state.note = None;
+                            settings::CopyPhase::Done(settings::copy_done_text(&source, n))
+                        }
+                        None => settings::CopyPhase::Idle,
+                    };
+                }
                 return self.refresh_characters();
             }
             S::RestoreBackup => {
@@ -1561,9 +1628,39 @@ impl App {
                 if !settings::is_live_only(&msg) {
                     self.save_config();
                 }
-                task
+                match &msg {
+                    // The chips promise the new prefix is what the keys do,
+                    // so the bindings follow the change at once.
+                    S::Prefix(_) => {
+                        self.settings_shortcuts(true);
+                        task
+                    }
+                    // A new profile folder: read it.
+                    S::ProfileDirChosen(Some(_)) => Task::batch([task, self.refresh_characters()]),
+                    _ => task,
+                }
             }
         }
+    }
+
+    /// Characters page: the XDG folder chooser for the EVE profile. A
+    /// cancelled or unavailable dialog answers `None` and changes nothing.
+    fn browse_profile_dir(&self) -> Task<cosmic::Action<Msg>> {
+        use cosmic::dialog::file_chooser;
+        cosmic::iced::Task::perform(
+            async {
+                let dialog = file_chooser::open::Dialog::new().title("EVE profile folder");
+                match dialog.open_folder().await {
+                    Ok(response) => response.0.uris().first().and_then(|url| url.to_file_path().ok()),
+                    Err(file_chooser::Error::Cancelled) => None,
+                    Err(why) => {
+                        tracing::warn!("folder chooser: {why}");
+                        None
+                    }
+                }
+            },
+            |path| cosmic::Action::App(Msg::Settings(settings::Msg::ProfileDirChosen(path))),
+        )
     }
 
     /// Layouts page: save the current arrangement under the typed name.
@@ -1581,9 +1678,10 @@ impl App {
         match self.layout.save_named(&name) {
             Ok(()) => {
                 let note = format!("saved layout {name:?}");
+                self.mark_applied_layout(Some(name));
                 if let Some(state) = self.settings.as_mut() {
                     state.name_field.clear();
-                    state.layouts = layout::list_names();
+                    state.layouts = layout::summaries();
                     state.note = Some(note);
                 }
             }
@@ -1591,10 +1689,21 @@ impl App {
         }
     }
 
+    /// Remember which named layout the arrangement is, on the window and in
+    /// `current.ron` (`Layout::last_applied`).
+    fn mark_applied_layout(&mut self, name: Option<String>) {
+        self.layout.last_applied = name.clone();
+        self.save_current_layout();
+        if let Some(state) = self.settings.as_mut() {
+            state.applied_layout = name;
+        }
+    }
+
     fn settings_apply_layout(&mut self, name: String) -> Task<cosmic::Action<Msg>> {
         match self.apply_layout(&name) {
             Ok(task) => {
                 self.settings_note(format!("applied layout {name:?}"));
+                self.mark_applied_layout(Some(name));
                 task
             }
             Err(e) => {
@@ -1604,14 +1713,36 @@ impl App {
         }
     }
 
-    fn settings_rename_layout(&mut self, from: String) {
-        let to = self.settings.as_ref().map(|s| s.name_field.clone()).unwrap_or_default();
+    /// Layouts: the inline rename — the row's draft, not a shared field.
+    fn settings_rename_layout(&mut self) {
+        let Some((from, to)) = self.settings.as_ref().and_then(|s| s.renaming.clone()) else { return };
         match layout::rename_named(&from, &to) {
             Ok(()) => {
-                let note = format!("renamed {:?} to {:?}", from, to.trim());
+                let to = to.trim().to_string();
+                let note = format!("renamed {from:?} to {to:?}");
+                if self.layout.last_applied.as_deref() == Some(from.as_str()) {
+                    self.mark_applied_layout(Some(to));
+                }
                 if let Some(state) = self.settings.as_mut() {
-                    state.name_field.clear();
-                    state.layouts = layout::list_names();
+                    state.renaming = None;
+                    state.layouts = layout::summaries();
+                    state.note = Some(note);
+                }
+            }
+            Err(e) => self.settings_note(e),
+        }
+    }
+
+    /// Layouts: `<name> copy` inserted beside the original.
+    fn settings_duplicate_layout(&mut self, name: String) {
+        let taken = layout::list_names();
+        let copy = layout::duplicate_name(&name, &taken);
+        match layout::Layout::load_named(&name).and_then(|l| l.save_named(&copy)) {
+            Ok(()) => {
+                let note = format!("duplicated {name:?} as {copy:?}");
+                if let Some(state) = self.settings.as_mut() {
+                    state.layout_menu = None;
+                    state.layouts = layout::summaries();
                     state.note = Some(note);
                 }
             }
@@ -1623,8 +1754,12 @@ impl App {
         match layout::delete_named(&name) {
             Ok(()) => {
                 let note = format!("deleted layout {name:?}");
+                if self.layout.last_applied.as_deref() == Some(name.as_str()) {
+                    self.mark_applied_layout(None);
+                }
                 if let Some(state) = self.settings.as_mut() {
-                    state.layouts = layout::list_names();
+                    state.confirm_delete = None;
+                    state.layouts = layout::summaries();
                     state.note = Some(note);
                 }
             }
@@ -1716,46 +1851,52 @@ impl App {
     }
 
     /// Characters page: the copy itself. Refused while any EVE toplevel
-    /// exists — the client writes these files on logout.
-    fn settings_copy_characters(&mut self) {
-        let Some(state) = self.settings.as_ref() else { return };
+    /// exists — the client writes these files on logout. `Some((source,
+    /// characters))` when it went through, for the pane's done panel.
+    fn settings_copy_characters(&mut self) -> Option<(String, usize)> {
+        let state = self.settings.as_ref()?;
         // Re-checked here and not only on the button: the listing behind
         // the disabled state can be a redraw old.
         if let Some(reason) = characters::copy_blocker(&state.characters, !self.clients.is_empty()) {
-            return self.settings_note(characters::blocker_note(reason));
+            self.settings_note(characters::blocker_note(reason));
+            return None;
         }
-        let Some(listing) = state.characters.listing.as_ref() else { return };
+        let listing = state.characters.listing.as_ref()?;
         // The toplevel list empties when the window closes; the process
         // outlives it and writes these files while it exits.
         if let Some(reason) =
             characters::write_blocker_now(listing, &self.config.tunnel.adopt_processes, state.characters.last_write)
         {
-            return self.settings_note(reason);
+            self.settings_note(reason);
+            return None;
         }
         let Some(character) = state.characters.selected_character() else {
-            return self.settings_note(characters::blocker_note(characters::NO_SELECTION));
+            self.settings_note(characters::blocker_note(characters::NO_SELECTION));
+            return None;
         };
         let account = state.characters.account_to_copy();
         // Asked for an account copy, there is one to copy to, and yet no
         // account is named: copying without it would silently do half the
         // job the toggle promised.
         if state.characters.copy_account && account.is_none() && listing.accounts.len() >= 2 {
-            return self.settings_note(characters::blocker_note(characters::NO_ACCOUNT_SELECTION));
+            self.settings_note(characters::blocker_note(characters::NO_ACCOUNT_SELECTION));
+            return None;
         }
         let source = state.characters.source_label();
         let backups = yutani::eve_settings::copy::backups_dir(&dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")));
         let backup = backups.join(yutani::eve_settings::copy::backup_name(SystemTime::now()));
-        let (note, wrote) = match yutani::eve_settings::copy::plan(listing, character, account) {
-            Err(e) => (e, false),
+        let (note, wrote, done) = match yutani::eve_settings::copy::plan(listing, character, account) {
+            Err(e) => (e, false, None),
             Ok(plan) => match yutani::eve_settings::copy::execute(&plan, &backup) {
-                Ok(report) => (characters::copy_note(&source, &report), true),
-                Err(e) => (characters::copy_failure_note(&e, &backup), true),
+                Ok(report) => (characters::copy_note(&source, &report), true, Some((source.clone(), report.characters))),
+                Err(e) => (characters::copy_failure_note(&e, &backup), true, None),
             },
         };
         if wrote {
             self.mark_own_settings_write();
         }
         self.settings_note(note);
+        done
     }
 
     /// The profile's files were just replaced by us: their fresh mtimes

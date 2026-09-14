@@ -137,7 +137,13 @@ pub fn panel_button(state: &Applet) -> Element<'_, Msg> {
 // ---- 1. header --------------------------------------------------------------
 
 fn header<'a>(p: &Popover) -> Element<'a, Msg> {
-    let badge = widget::container(fixed("Y", theme::BADGE_GLYPH_SIZE, Weight::Semibold, true, theme::VIOLET))
+    // The Yutani mark itself (the tray's symbolic SVG), violet, centred in
+    // its plate.
+    let mark = widget::icon(widget::icon::from_svg_bytes(yutani::assets::YUTANI_SYMBOLIC).symbolic(true))
+        .class(theme::violet_mark_class())
+        .width(Length::Fixed(theme::BADGE_MARK_PX))
+        .height(Length::Fixed(theme::BADGE_MARK_PX));
+    let badge = widget::container(mark)
         .width(Length::Fixed(theme::BADGE_PX))
         .height(Length::Fixed(theme::BADGE_PX))
         .align_x(Horizontal::Center)

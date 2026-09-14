@@ -24,6 +24,9 @@ pub const SMALL_BUTTON_RADIUS: f32 = 6.0;
 pub const CHIP_RADIUS: f32 = 4.0;
 pub const BADGE_RADIUS: f32 = 8.0;
 pub const BADGE_PX: f32 = 26.0;
+/// The mark inside the header plate: 18 of the plate's 26 px, so the
+/// glyph's own 32-unit margins leave it optically centred.
+pub const BADGE_MARK_PX: f32 = 18.0;
 pub const PRIMARY_HEIGHT: f32 = 38.0;
 pub const OVERFLOW_PX: f32 = 38.0;
 pub const ACCOUNT_ROW_HEIGHT: f32 = 30.0;
@@ -87,7 +90,6 @@ pub const STATUS_GAP: u16 = 8;
 // ---- typography (px) ------------------------------------------------------
 
 pub const TITLE_SIZE: f32 = 14.0;
-pub const BADGE_GLYPH_SIZE: f32 = 13.0;
 pub const STATE_WORD_SIZE: f32 = 12.0;
 pub const SECTION_LABEL_SIZE: f32 = 10.5;
 pub const COUNT_SIZE: f32 = 12.0;
@@ -206,6 +208,11 @@ pub const MARK_ON_DARK: Color = Color::WHITE;
 
 fn mark_ink(c: &Cosmic) -> Color {
     if c.is_dark { MARK_ON_DARK } else { ink(c) }
+}
+
+/// The header plate's mark: the Yutani violet.
+pub fn violet_mark_class() -> cosmic::theme::Svg {
+    cosmic::theme::Svg::custom(|_| cosmic::iced::widget::svg::Style { color: Some(VIOLET) })
 }
 
 /// The SVG class for the tinted panel mark.
@@ -472,7 +479,7 @@ mod tests {
         assert_eq!(POPOVER_WIDTH, 360, "libcosmic's popup width");
         assert_eq!(TOGGLE_PX, 22.0);
         assert_eq!((CARD_RADIUS, TILE_RADIUS, ROW_RADIUS, PRIMARY_RADIUS, MENU_RADIUS), (11.0, 9.0, 7.0, 10.0, 8.0));
-        assert_eq!((BADGE_PX, BADGE_RADIUS, BADGE_GLYPH_SIZE), (26.0, 8.0, 13.0));
+        assert_eq!((BADGE_PX, BADGE_RADIUS, BADGE_MARK_PX), (26.0, 8.0, 18.0));
         assert_eq!((PRIMARY_HEIGHT, OVERFLOW_PX, ACCOUNT_ROW_HEIGHT, MENU_ROW_HEIGHT), (38.0, 38.0, 30.0, 31.0));
         assert_eq!((GRAPH_HEIGHT, GRAPH_GAP, GRAPH_HALF), (64.0, 1.5, 31.5));
         assert_eq!((STATUS_DOT_PX, STATUS_GLOW_PX, INDEX_CHIP_WIDTH), (8.0, 4.0, 16.0));
