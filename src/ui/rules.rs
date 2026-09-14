@@ -42,6 +42,19 @@ pub fn grace_after_update(any_activated: bool, was_activated: bool, within_grace
     (false, within_grace)
 }
 
+/// Whether a client counts as *the focused one* for `hide_active`. It does
+/// while it is activated, and — when no client is activated but EVE still
+/// counts as focused through [`FOCUS_GRACE`] — if it was the last one
+/// activated. The grace exists to keep the existing surfaces alive across
+/// a click from one EVE window to another; without this the client that
+/// just lost focus dropped out of the hide-active rule at once, and its
+/// thumbnail was created for exactly the grace and destroyed after it: a
+/// 300 ms flash on every switch away from EVE, the whole show with one
+/// client.
+pub fn counts_as_activated(this_activated: bool, any_activated: bool, eve_focused: bool, was_last_activated: bool) -> bool {
+    this_activated || (!any_activated && eve_focused && was_last_activated)
+}
+
 /// Whether a client's thumbnail should be on screen right now.
 pub fn should_show(
     visibility: Visibility,
@@ -195,6 +208,26 @@ mod tests {
         assert!(!should_show(Visibility::Always, true, false, true, true)); // hide_active + this is active
         assert!(should_show(Visibility::Always, true, false, true, false));
         assert!(!should_show(Visibility::Always, false, true, true, false)); // hidden via IPC
+    }
+
+    /// The grace keeps the *existing* surfaces alive; it must not conjure
+    /// one. With `hide_active` the client that just lost focus stays "the
+    /// focused one" until the grace ends or another client takes over, so
+    /// its thumbnail does not flash into existence for 300 ms on every
+    /// switch away from EVE (the one-client case made this glaring).
+    #[test]
+    fn the_last_activated_client_keeps_its_status_through_the_grace() {
+        // Activated now: trivially counts.
+        assert!(counts_as_activated(true, true, true, true));
+        assert!(counts_as_activated(true, true, true, false));
+        // Focus just left EVE (nobody activated, grace running): only the
+        // client that had it keeps the status.
+        assert!(counts_as_activated(false, false, true, true));
+        assert!(!counts_as_activated(false, false, true, false));
+        // Grace over: nobody counts.
+        assert!(!counts_as_activated(false, false, false, true));
+        // Another client took focus: the old one is plainly inactive.
+        assert!(!counts_as_activated(false, true, true, true));
     }
 
     #[test]

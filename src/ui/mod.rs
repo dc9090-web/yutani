@@ -134,6 +134,11 @@ pub struct App {
     /// from one EVE window to another does not destroy and recreate every
     /// surface (see `rules::FOCUS_GRACE` for why that matters).
     pub last_eve_focus: Option<Instant>,
+    /// The client most recently seen activated. For `hide_active` it stays
+    /// "the focused one" while the focus grace runs with nobody activated
+    /// (`rules::counts_as_activated`), so switching away from EVE does not
+    /// flash its thumbnail for the length of the grace.
+    pub last_activated: Option<Handle>,
     /// The settings window while it is open (spec §6).
     pub settings: Option<settings::State>,
     /// A permanent 1×1 `Layer::Background` surface, created on the first
@@ -348,6 +353,9 @@ impl App {
         let (stamp, timer) = rules::grace_after_update(self.any_client_activated(), was_focused, self.eve_focused());
         if stamp {
             self.last_eve_focus = Some(Instant::now());
+            if let Some((h, _)) = self.clients.iter().find(|(_, c)| c.info.activated) {
+                self.last_activated = Some(h.clone());
+            }
         }
         if !timer {
             return Task::none();
@@ -361,14 +369,14 @@ impl App {
         )
     }
 
-    fn should_show(&self, client: &Client) -> bool {
-        rules::should_show(
-            self.config.visibility,
-            self.config.hide_active,
-            self.hidden,
-            self.eve_focused(),
+    fn should_show(&self, handle: &Handle, client: &Client) -> bool {
+        let this_activated = rules::counts_as_activated(
             client.info.activated,
-        )
+            self.any_client_activated(),
+            self.eve_focused(),
+            self.last_activated.as_ref() == Some(handle),
+        );
+        rules::should_show(self.config.visibility, self.config.hide_active, self.hidden, self.eve_focused(), this_activated)
     }
 
     /// Bring the backend's capture state for `h` in line with `show`: pause
@@ -393,7 +401,7 @@ impl App {
         let handles: Vec<Handle> = self.clients.keys().cloned().collect();
         let mut tasks = Vec::new();
         for h in handles {
-            let show = self.should_show(&self.clients[&h]);
+            let show = self.should_show(&h, &self.clients[&h]);
             self.sync_capture(&h, show);
             if show && self.clients[&h].surface.is_none() {
                 tasks.push(self.create_surface(&h));
@@ -709,7 +717,7 @@ impl App {
 
     fn create_surface(&mut self, handle: &Handle) -> Task<cosmic::Action<Msg>> {
         let Some(client) = self.clients.get(handle) else { return Task::none() };
-        if client.surface.is_some() || !self.should_show(client) {
+        if client.surface.is_some() || !self.should_show(handle, client) {
             return Task::none();
         }
         let Some(output) = self.output_for_thumb(handle) else {
@@ -2258,6 +2266,7 @@ impl Application for App {
             drag: None,
             hidden: false,
             last_eve_focus: None,
+            last_activated: None,
             tunnel_in_flight: None,
             steam_findings: Vec::new(),
             settings: None,
@@ -2574,6 +2583,7 @@ mod tests {
             drag: None,
             hidden: false,
             last_eve_focus: None,
+            last_activated: None,
             settings: None,
             tunnel_in_flight: None,
             steam_findings: Vec::new(),
@@ -2909,6 +2919,52 @@ mod tests {
 
         let after = (surface_of(&app, &a), surface_of(&app, &b));
         assert_eq!(after, before, "no surface was destroyed and recreated across the click");
+    }
+
+    /// Daniel, 2026-09-14: one client, `EveFocusedOnly` + "Hide the focused
+    /// client's own thumbnail": switching from EVE to another window made
+    /// the thumbnail appear for a moment and vanish. Focus leaving EVE
+    /// released the hide-active rule while the grace still counted EVE as
+    /// focused, so a surface was created for exactly the grace and then
+    /// destroyed. The client that just lost focus must keep its
+    /// hide-active status for the grace.
+    #[test]
+    fn switching_away_from_the_only_client_never_shows_its_thumbnail() {
+        let fake = Fake::new();
+        let mut app = app(Config { visibility: Visibility::EveFocusedOnly, hide_active: true, ..Config::default() });
+        add_output(&mut app, &fake, "DP-1");
+        let a = fake.handle();
+        let _ = app.on_backend(Event::ClientAdded(a.clone(), info(true, Vec::new())));
+        assert_eq!(surface_of(&app, &a), None, "its own thumbnail is hidden while focused");
+        let _ = app.on_backend(Event::ClientUpdated(a.clone(), info(false, Vec::new())));
+        assert_eq!(surface_of(&app, &a), None, "and stays hidden through the grace");
+        app.last_eve_focus = Some(Instant::now().checked_sub(rules::FOCUS_GRACE + Duration::from_millis(100)).unwrap());
+        let _ = app.update(Msg::FocusGraceOver);
+        assert_eq!(surface_of(&app, &a), None, "and after it: EVE is not focused");
+    }
+
+    /// The same rule under `Always`: the thumbnail of the client you just
+    /// left appears once the grace is over, not during it, and clicking
+    /// straight into another client hands the status over at once.
+    #[test]
+    fn under_always_the_left_client_appears_after_the_grace_or_when_another_takes_focus() {
+        let fake = Fake::new();
+        let mut app = app(Config { visibility: Visibility::Always, hide_active: true, ..Config::default() });
+        add_output(&mut app, &fake, "DP-1");
+        let (a, b) = (fake.handle(), fake.handle());
+        let _ = app.on_backend(Event::ClientAdded(a.clone(), info(true, Vec::new())));
+        let _ = app.on_backend(Event::ClientAdded(b.clone(), info(false, Vec::new())));
+        assert!(surface_of(&app, &a).is_none() && surface_of(&app, &b).is_some());
+        let _ = app.on_backend(Event::ClientUpdated(a.clone(), info(false, Vec::new())));
+        assert_eq!(surface_of(&app, &a), None, "still counted as the focused one during the grace");
+        let _ = app.on_backend(Event::ClientUpdated(b.clone(), info(true, Vec::new())));
+        assert!(surface_of(&app, &a).is_some() && surface_of(&app, &b).is_none(), "B took over: A shows, B hides");
+        // And leaving EVE altogether: B stays hidden until the grace ends.
+        let _ = app.on_backend(Event::ClientUpdated(b.clone(), info(false, Vec::new())));
+        assert_eq!(surface_of(&app, &b), None);
+        app.last_eve_focus = Some(Instant::now().checked_sub(rules::FOCUS_GRACE + Duration::from_millis(100)).unwrap());
+        let _ = app.update(Msg::FocusGraceOver);
+        assert!(surface_of(&app, &b).is_some(), "Always: both visible once nothing is focused");
     }
 
     /// The other half of the grace: once it has passed with nobody
