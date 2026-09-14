@@ -13,6 +13,8 @@ pub mod model;
 /// lib module — has to run `systemctl is-failed` under a timeout.
 pub mod proc;
 pub mod service;
+/// Steam's launch options for EVE: read, judged, never written.
+pub mod steam;
 pub mod tunnel;
 
 /// What EVE Online's *Launch Options* in Steam must say for Yutani to see
