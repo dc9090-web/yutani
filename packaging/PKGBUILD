@@ -1,0 +1,88 @@
+# Maintainer: Daniel <dc@ftlgroup.co>
+#
+# Builds Yutani from this checkout (the parent directory of this file):
+#     cd packaging && makepkg -si
+# The package owns the binaries, the icons, both desktop entries and the
+# daemon's systemd *user* unit. Per user, afterwards:
+#     systemctl --user enable --now yutani
+#     yutani shortcuts install
+#     yutani tunnel install ~/Downloads/<your>.conf      # optional
+#     Settings → Desktop → Panel → Applets → add "Yutani"
+
+pkgname=yutani
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc="Live thumbnails, hotkeys, a panel applet and an EVE-only WireGuard tunnel for EVE Online on COSMIC"
+arch=('x86_64')
+url="https://github.com/dc9090-web/yutani"
+license=('GPL-3.0-only')
+depends=(
+  'cosmic-panel'            # hosts the applet
+  'cosmic-comp'             # the layer-shell and screencopy protocols the daemon needs
+  'xdg-desktop-portal-cosmic' # the file and folder choosers in the settings window
+  'wireguard-tools'         # wg
+  'nftables'                # nft
+  'iproute2'                # ip
+  'systemd'                 # systemctl, resolvectl, busctl, systemd-run
+  'polkit'                  # pkexec for the tunnel install
+  'curl'                    # the tunnel's exit-address lookup and ESI names
+  'hicolor-icon-theme'
+  'mesa'                    # libgbm and the EGL the GPU thumbnail pass loads
+  'vulkan-icd-loader'       # wgpu
+  'libdrm'
+  'libxkbcommon'
+  'expat'
+  'gcc-libs'
+)
+makedepends=('rust' 'git')
+optdepends=('steam: launch EVE through `yutani launch -- %command%`')
+source=("$pkgname::git+file://${startdir}/..")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$pkgname"
+  printf '0.1.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$pkgname"
+  install -Dm755 target/release/yutani "$pkgdir/usr/bin/yutani"
+  install -Dm755 target/release/yutani-applet "$pkgdir/usr/bin/yutani-applet"
+
+  # The icon theme, laid out as src/assets.rs::ICONS lays it out.
+  local icons="$pkgdir/usr/share/icons/hicolor"
+  install -Dm644 assets/icons/yutani-symbolic.svg    "$icons/symbolic/status/yutani-symbolic.svg"
+  install -Dm644 assets/icons/yutani-symbolic-16.svg "$icons/16x16/status/yutani-symbolic.svg"
+  install -Dm644 assets/icons/yutani.svg             "$icons/scalable/apps/yutani.svg"
+  install -Dm644 assets/icons/yutani-48.svg          "$icons/48x48/apps/yutani.svg"
+  install -Dm644 assets/icons/yutani-32.svg          "$icons/32x32/apps/yutani.svg"
+
+  # The applet entry cosmic-panel lists, and the Applications launcher.
+  install -Dm644 packaging/com.yutani.Applet.desktop "$pkgdir/usr/share/applications/com.yutani.Applet.desktop"
+  install -Dm644 packaging/com.yutani.Yutani.desktop "$pkgdir/usr/share/applications/com.yutani.Yutani.desktop"
+
+  # The daemon's user unit: `systemctl --user enable --now yutani`.
+  install -Dm644 packaging/yutani.service "$pkgdir/usr/lib/systemd/user/yutani.service"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

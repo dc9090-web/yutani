@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Yutani
+Comment=Live thumbnails and client switching for EVE Online
+Exec=/usr/bin/yutani start
+Icon=yutani
+Terminal=false
+Categories=Game;Utility;
+Keywords=EVE;Online;thumbnails;
+StartupNotify=false

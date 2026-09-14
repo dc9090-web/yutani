@@ -70,8 +70,14 @@ fn quote_exec(path: &str) -> String {
     quoted
 }
 
+/// The unit the `yutani` package ships (`packaging/yutani.service`,
+/// `ExecStart=/usr/bin/yutani`). With it in place `service install` has
+/// nothing to write and `yutani start` goes through systemd as it would
+/// with the per-user unit.
+pub const PACKAGED_UNIT: &str = "/usr/lib/systemd/user/yutani.service";
+
 pub fn installed() -> bool {
-    unit_path().is_file()
+    unit_path().is_file() || Path::new(PACKAGED_UNIT).is_file()
 }
 
 fn systemctl(args: &[&str]) -> anyhow::Result<()> {
@@ -84,8 +90,15 @@ fn systemctl(args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Write the unit for `exe` and reload the user manager. Idempotent.
+/// Write the unit for `exe` and reload the user manager. Idempotent. With
+/// the packaged unit in place nothing is written: a per-user copy would
+/// shadow it with the same text (or, for a source build, a different
+/// `ExecStart` than the package's), so the packaged path is returned.
 pub fn install(exe: &Path) -> anyhow::Result<PathBuf> {
+    if Path::new(PACKAGED_UNIT).is_file() {
+        systemctl(&["daemon-reload"])?;
+        return Ok(PathBuf::from(PACKAGED_UNIT));
+    }
     let path = unit_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -116,6 +129,14 @@ pub fn start_unit() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The unit the package ships is byte-for-byte what `service install`
+    /// would write for `/usr/bin/yutani`, so the two never drift.
+    #[test]
+    fn the_packaged_unit_is_what_service_install_writes_for_usr_bin() {
+        assert_eq!(include_str!("../packaging/yutani.service"), unit_text("/usr/bin/yutani"));
+        assert_eq!(PACKAGED_UNIT, "/usr/lib/systemd/user/yutani.service");
+    }
 
     #[test]
     fn the_unit_restarts_on_failure_only_and_lives_under_the_user_config() {

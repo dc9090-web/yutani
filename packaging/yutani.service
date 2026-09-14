@@ -1,0 +1,17 @@
+[Unit]
+Description=Yutani - EVE Online thumbnails, hotkeys and tunnel
+PartOf=graphical-session.target
+After=graphical-session.target
+# A crash loop (ten failures in a minute) stops rather than spinning.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart="/usr/bin/yutani"
+# `yutani quit` exits 0 and stays down; a crash is back in a second.
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=graphical-session.target

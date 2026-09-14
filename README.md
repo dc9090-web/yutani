@@ -16,7 +16,31 @@ window (layouts, characters, tunnel, Steam).
   `gtk-update-icon-cache`, `rustup`, `git`, `base-devel`.
 - A stable Rust toolchain (`rustup default stable`).
 
-## Install
+## Install as a package (Arch / CachyOS)
+
+`packaging/PKGBUILD` builds Yutani from this checkout into a pacman
+package that owns the binaries (`/usr/bin`), the icons, both desktop
+entries and the daemon's systemd user unit, with every runtime dependency
+declared:
+
+```bash
+cd packaging && makepkg -si        # add --nocheck to skip the test suite
+```
+
+Then, once per user:
+
+```bash
+systemctl --user enable --now yutani      # the daemon, back in a second after a crash
+yutani shortcuts install                  # the COSMIC keyboard shortcuts
+yutani tunnel install ~/Downloads/EVE-UK-455.conf   # optional: the EVE-only tunnel
+```
+
+and **Settings → Desktop → Panel → Applets → add "Yutani"**. Upgrading is
+`makepkg -si` again. (`yutani applet install` and `yutani service install`
+are for the source install below; with the package they have nothing to
+write.)
+
+## Install from source
 
 ```bash
 # 1. build

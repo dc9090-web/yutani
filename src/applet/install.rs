@@ -315,6 +315,14 @@ mod tests {
         sandbox.paths.icons.join(crate::assets::SYMBOLIC_DIR)
     }
 
+    /// The entries the package ships are byte-for-byte what `applet
+    /// install` writes for `/usr/bin`, so the two never drift.
+    #[test]
+    fn the_packaged_desktop_entries_are_what_applet_install_writes_for_usr_bin() {
+        assert_eq!(include_str!("../../packaging/com.yutani.Applet.desktop"), desktop_entry("/usr/bin/yutani-applet"));
+        assert_eq!(include_str!("../../packaging/com.yutani.Yutani.desktop"), launcher_entry("/usr/bin/yutani"));
+    }
+
     #[test]
     fn the_desktop_entry_is_what_cosmic_panel_looks_for() {
         let text = desktop_entry("/usr/local/bin/yutani-applet");
