@@ -106,9 +106,37 @@ pub struct Popover {
     pub thumbs: ThumbsButton,
     pub tunnel: TunnelLine,
     pub throughput: Throughput,
+    /// Whether the throughput card fits: on a short screen it is the first
+    /// thing to drop (the rates still show nowhere else — the card is the
+    /// whole of the traffic display).
+    pub graph: bool,
     /// `ENDPOINT` and `PEER`.
     pub tiles: [(&'static str, String); 2],
     pub primary: Primary,
+}
+
+/// The popover's height in logical pixels, estimated from the handoff's
+/// section sizes, for `accounts` rows, with or without the menu and the
+/// graph card. Estimates, not measurements: iced does not lay the popup
+/// out before it opens, and a few pixels either way only matter right at
+/// the threshold.
+pub fn popover_height(accounts: usize, menu_open: bool, graph: bool) -> i32 {
+    let header = 50;
+    let rows = if accounts == 0 { 44 } else { 30 * accounts as i32 };
+    let accounts_card = 36 + rows + 44 + 12;
+    let tunnel = 12 + 26 + 32;
+    let graph_card = if graph { 172 + 12 } else { 0 };
+    let tiles = 60 + 12;
+    let action = 38 + 12;
+    let menu = if menu_open { 8 + 3 * 31 + 8 } else { 0 };
+    header + accounts_card + tunnel + graph_card + tiles + action + menu
+}
+
+/// Whether the graph card fits in `available` pixels (`None`: unknown, so
+/// it is kept). The handoff's invariant: the popover never exceeds the
+/// panel work area, and the graph card is the first thing to drop.
+pub fn graph_fits(available: Option<i32>, accounts: usize, menu_open: bool) -> bool {
+    available.is_none_or(|h| popover_height(accounts, menu_open, true) <= h)
 }
 
 /// Stale the last good reply so it presents as disconnected (spec §7).
@@ -137,8 +165,9 @@ pub fn hotkey_hint(hint: Option<&ShortcutHint>, clients: usize) -> String {
 }
 
 /// The popover for `status` (`None` = the service is stopped), the live
-/// rates, and the graph's bars.
-pub fn popover(status: Option<&Status>, rates: Rates, bars: Vec<(f32, f32)>) -> Popover {
+/// rates, the graph's bars, the height the popover may take (`None`:
+/// unknown) and whether the menu is open.
+pub fn popover(status: Option<&Status>, rates: Rates, bars: Vec<(f32, f32)>, available: Option<i32>, menu_open: bool) -> Popover {
     let Some(s) = status else {
         // Stopping the service takes the tunnel idle with it: no part of
         // the popover may claim traffic is flowing while the overlay is
@@ -158,6 +187,7 @@ pub fn popover(status: Option<&Status>, rates: Rates, bars: Vec<(f32, f32)>) -> 
                 sent: format::bytes(0),
                 received: format::bytes(0),
             },
+            graph: graph_fits(available, 0, menu_open),
             tiles: [("ENDPOINT", DASH.to_string()), ("PEER", crate::tunnel::IFACE.to_string())],
             primary: Primary::Inert("Start Yutani to route traffic"),
         };
@@ -179,11 +209,12 @@ pub fn popover(status: Option<&Status>, rates: Rates, bars: Vec<(f32, f32)>) -> 
     } else {
         DASH.to_string()
     };
+    let n = accounts.len();
     Popover {
         running: true,
         state_word: "Running",
-        count: accounts.len().to_string(),
-        hint: hotkey_hint(s.shortcuts.as_ref(), accounts.len()),
+        count: n.to_string(),
+        hint: hotkey_hint(s.shortcuts.as_ref(), n),
         accounts,
         thumbs: if s.hidden { ThumbsButton::Show } else { ThumbsButton::Hide },
         tunnel: TunnelLine {
@@ -202,6 +233,7 @@ pub fn popover(status: Option<&Status>, rates: Rates, bars: Vec<(f32, f32)>) -> 
             sent: format::bytes(t.tx_bytes),
             received: format::bytes(t.rx_bytes),
         },
+        graph: graph_fits(available, n, menu_open),
         tiles: [("ENDPOINT", endpoint), ("PEER", t.iface.clone())],
         primary: if !t.installed {
             Primary::Inert("No tunnel installed")
@@ -242,6 +274,7 @@ mod tests {
                 tx_bytes: 2_790_000_000,
             },
             shortcuts: Some(hint()),
+            outputs: Vec::new(),
         }
     }
 
@@ -252,7 +285,7 @@ mod tests {
     #[test]
     fn a_running_service_with_a_healthy_tunnel_fills_every_section() {
         let s = status(true, Some(21), 3);
-        let p = popover(Some(&s), Rates { rx: 222_000.0, tx: 41_000.0 }, flat());
+        let p = popover(Some(&s), Rates { rx: 222_000.0, tx: 41_000.0 }, flat(), None, false);
         assert!(p.running);
         assert_eq!(p.state_word, "Running");
         assert_eq!(p.accounts.len(), 3);
@@ -276,7 +309,7 @@ mod tests {
     /// button inert, and no claim of traffic anywhere.
     #[test]
     fn a_stopped_service_reads_idle_everywhere() {
-        let p = popover(None, Rates { rx: 999.0, tx: 999.0 }, flat());
+        let p = popover(None, Rates { rx: 999.0, tx: 999.0 }, flat(), None, false);
         assert!(!p.running);
         assert_eq!(p.state_word, "Stopped");
         assert!(p.accounts.is_empty());
@@ -294,7 +327,7 @@ mod tests {
     #[test]
     fn a_disconnected_tunnel_offers_connect_in_the_accent_and_shows_no_endpoint() {
         let s = status(false, None, 1);
-        let p = popover(Some(&s), Rates { rx: 5.0, tx: 5.0 }, flat());
+        let p = popover(Some(&s), Rates { rx: 5.0, tx: 5.0 }, flat(), None, false);
         assert_eq!(p.primary, Primary::Accent("Connect tunnel", Action::Connect));
         assert_eq!(p.tunnel.uptime, "idle");
         assert!(!p.tunnel.on);
@@ -311,7 +344,7 @@ mod tests {
     #[test]
     fn a_stale_handshake_keeps_the_link_but_turns_the_dot_off() {
         let s = status(true, Some(180), 1);
-        let p = popover(Some(&s), Rates::default(), flat());
+        let p = popover(Some(&s), Rates::default(), flat(), None, false);
         assert!(!p.tunnel.on);
         assert_eq!(p.tunnel.uptime, "12m 22s");
         assert_eq!(p.primary, Primary::Standard("Disconnect tunnel", Action::Disconnect));
@@ -321,7 +354,7 @@ mod tests {
     fn an_uninstalled_tunnel_has_an_inert_primary_button() {
         let mut s = status(false, None, 0);
         s.tunnel.installed = false;
-        let p = popover(Some(&s), Rates::default(), flat());
+        let p = popover(Some(&s), Rates::default(), flat(), None, false);
         assert_eq!(p.primary, Primary::Inert("No tunnel installed"));
         assert_eq!(p.hint, "Ctrl+Alt+1…9 · Ctrl+Alt+←/→", "no clients: the whole installed range");
     }
@@ -331,20 +364,38 @@ mod tests {
         let mut s = status(true, Some(2), 12);
         s.tunnel.exit_address = None;
         s.shortcuts = None;
-        let p = popover(Some(&s), Rates::default(), flat());
+        let p = popover(Some(&s), Rates::default(), flat(), None, false);
         assert_eq!(p.tiles[0].1, "198.51.100.10");
         assert_eq!(p.hint, "hotkeys active", "an older daemon sends no prefix");
         s.shortcuts = Some(hint());
-        assert_eq!(popover(Some(&s), Rates::default(), flat()).hint, "Ctrl+Alt+1…9 · Ctrl+Alt+←/→", "capped at 9");
+        assert_eq!(popover(Some(&s), Rates::default(), flat(), None, false).hint, "Ctrl+Alt+1…9 · Ctrl+Alt+←/→", "capped at 9");
         s.hidden = true;
-        assert_eq!(popover(Some(&s), Rates::default(), flat()).thumbs, ThumbsButton::Show);
+        assert_eq!(popover(Some(&s), Rates::default(), flat(), None, false).thumbs, ThumbsButton::Show);
+    }
+
+    /// The handoff's short-screen invariant: the graph card is the first
+    /// thing to drop, and only when the estimate says it would not fit.
+    #[test]
+    fn the_graph_card_is_dropped_first_on_a_short_screen() {
+        let s = status(true, Some(21), 3);
+        assert!(popover(Some(&s), Rates::default(), flat(), None, false).graph, "unknown height keeps it");
+        assert!(popover(Some(&s), Rates::default(), flat(), Some(1360), false).graph, "a 1440 screen");
+        let full = popover_height(3, false, true);
+        let without = popover_height(3, false, false);
+        assert_eq!(full - without, 184, "the card and its margin");
+        assert!(popover(Some(&s), Rates::default(), flat(), Some(full), false).graph, "exactly fits");
+        assert!(!popover(Some(&s), Rates::default(), flat(), Some(full - 1), false).graph, "one pixel short");
+        // Opening the menu adds to the estimate; more rows too.
+        assert!(popover_height(3, true, true) > full);
+        assert!(popover_height(9, false, true) > full);
+        assert!(!popover(None, Rates::default(), flat(), Some(200), false).graph, "stopped and short: gone");
     }
 
     #[test]
     fn a_failed_poll_degrades_the_last_reply_to_disconnected() {
         let mut s = status(true, Some(21), 3);
         degrade(&mut s);
-        let p = popover(Some(&s), Rates { rx: 222_000.0, tx: 41_000.0 }, flat());
+        let p = popover(Some(&s), Rates { rx: 222_000.0, tx: 41_000.0 }, flat(), None, false);
         assert!(p.running && !p.tunnel.on);
         assert_eq!(p.tunnel.uptime, "idle");
         assert_eq!(p.throughput.up, ("0".to_string(), "KB/s"));

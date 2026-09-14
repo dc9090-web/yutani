@@ -556,6 +556,11 @@ impl App {
                     next: crate::model::config::key_symbol(&self.config.shortcuts.next),
                     prev: crate::model::config::key_symbol(&self.config.shortcuts.prev),
                 });
+                let outputs: Vec<crate::tunnel::status::OutputStatus> = self
+                    .outputs
+                    .iter()
+                    .map(|o| crate::tunnel::status::OutputStatus { name: o.name.clone(), height: o.logical_size.1 })
+                    .collect();
                 let reply = reply.clone();
                 let task = cosmic::iced::Task::perform(
                     async move {
@@ -563,7 +568,7 @@ impl App {
                             tokio::task::spawn_blocking(move || crate::tunnel::control::current_tunnel_status(&location))
                                 .await
                                 .map_err(|e| format!("status task failed: {e}"))?;
-                        let status = crate::tunnel::status::Status { clients, hidden, tunnel, shortcuts };
+                        let status = crate::tunnel::status::Status { clients, hidden, tunnel, shortcuts, outputs };
                         serde_json::to_string(&status).map(Some).map_err(|e| format!("status: {e}"))
                     },
                     move |result| cosmic::Action::App(Msg::IpcReplyLater(reply, result)),

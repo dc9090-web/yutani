@@ -104,6 +104,15 @@ pub struct ShortcutHint {
     pub prev: String,
 }
 
+/// One connected output and its logical height, for the popover's
+/// short-screen rule (redesign handoff: "the popover never exceeds the
+/// panel work area; the graph card is the first thing to drop").
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct OutputStatus {
+    pub name: String,
+    pub height: i32,
+}
+
 /// Reply body of the IPC `status` request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
@@ -114,6 +123,9 @@ pub struct Status {
     /// `serde(default)`: `None` from a daemon older than this field.
     #[serde(default)]
     pub shortcuts: Option<ShortcutHint>,
+    /// The connected outputs; empty from a daemon older than this field.
+    #[serde(default)]
+    pub outputs: Vec<OutputStatus>,
 }
 
 /// Combine the worker's file, whether `/sys/class/net/yutani0` exists,
@@ -327,6 +339,7 @@ mod tests {
             }],
             hidden: false,
             shortcuts: None,
+            outputs: Vec::new(),
             tunnel: assemble(Some(&file()), true, Some((1, 2)), true, false, "London", 1021),
         };
         let json = serde_json::to_string(&st).unwrap();

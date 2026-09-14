@@ -194,7 +194,18 @@ impl Applet {
     }
 
     pub fn popover(&self) -> Popover {
-        popover(self.status.as_ref(), self.rates, self.history.bars())
+        // The panel's own output (the daemon lists them all); the height
+        // left for the popover is that output's minus the panel strip.
+        let available = self.status.as_ref().and_then(|s| {
+            let mine = &self.core.applet.output_name;
+            s.outputs
+                .iter()
+                .find(|o| &o.name == mine)
+                .map(|o| o.height)
+                .or_else(|| s.outputs.iter().map(|o| o.height).filter(|h| *h > 0).min())
+                .map(|h| h - PANEL_RESERVE)
+        });
+        popover(self.status.as_ref(), self.rates, self.history.bars(), available, self.menu_open)
     }
 
     /// Ask for a `status` now, or — if one is already outstanding — leave
@@ -461,6 +472,11 @@ impl cosmic::Application for Applet {
     }
 }
 
+/// What the panel strip and the popup's own offset take from the output's
+/// height before the popover gets any of it: the largest panel size plus
+/// its paddings and the 4 px popup offset, rounded up.
+pub const PANEL_RESERVE: i32 = 80;
+
 /// Open the popup under the panel button. `bounds` and `offset` come from
 /// the button's own `on_press_with_rectangle`, which is the only way to
 /// learn where the button sits on the panel surface.
@@ -672,7 +688,7 @@ mod tests {
     fn connected() -> Status {
         use yutani::tunnel::status::{Status, TunnelStatus};
         let tunnel = TunnelStatus { installed: true, connected: true, handshake_age_s: Some(4), ..Default::default() };
-        Status { clients: vec![], hidden: false, tunnel, shortcuts: None }
+        Status { clients: vec![], hidden: false, tunnel, shortcuts: None, outputs: Vec::new() }
     }
 
     /// M1: `quit` is acknowledged at once but the daemon spends up to 10 s

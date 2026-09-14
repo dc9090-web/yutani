@@ -442,14 +442,11 @@ fn menu<'a>(running: bool) -> Element<'a, Msg> {
 /// the theme's own colours, so a light COSMIC theme gets a light popover.
 pub fn popup(state: &Applet) -> Element<'_, Msg> {
     let p = state.popover();
-    let mut content = Column::new()
-        .width(Length::Fill)
-        .push(header(&p))
-        .push(accounts_card(&p))
-        .push(tunnel_section(&p))
-        .push(throughput_card(&p))
-        .push(tiles(&p))
-        .push(action_row(&p, state.menu_open));
+    let mut content = Column::new().width(Length::Fill).push(header(&p)).push(accounts_card(&p)).push(tunnel_section(&p));
+    if p.graph {
+        content = content.push(throughput_card(&p));
+    }
+    content = content.push(tiles(&p)).push(action_row(&p, state.menu_open));
     if let Some(note) = state.visible_note() {
         content = content.push(note_line(note));
     }

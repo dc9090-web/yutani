@@ -14,9 +14,10 @@ theme roles, never from the mock's hexes (the applet's dark-only palette in
 
 ## Decisions (2026-09-14, with Daniel)
 
-- **Switch peer… is left out.** Yutani stores one tunnel config; multi-peer
-  is a later project. The applet menu is Layouts & characters…,
-  Preferences…, Quit.
+- **Switch peer… is left out — for good.** Yutani stores one tunnel
+  config; Daniel decided (2026-09-14, after the redesign shipped) that one
+  tunnel is enough and multi-peer is not wanted. The applet menu is
+  Layouts & characters…, Preferences…, Quit.
 - **The thumbnail opacity slider stays**, as a fourth row of the Display
   pane's Thumbnails card (below Hover zoom), in the handoff's row style;
   the live preview strip renders at that opacity.
