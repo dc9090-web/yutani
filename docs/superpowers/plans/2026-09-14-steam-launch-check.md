@@ -1239,35 +1239,10 @@ Expected: green.
 
 - [ ] **Step 3: README**
 
-Replace the "Install from source" section (from `## Install from source` up to but not including `Then, for each EVE account in Steam`) with:
+The README was rewritten for the GitHub page on 2026-09-14 (commit "docs: README for the GitHub page") and already says `/usr/bin`, describes the package as the source build, and has a "Steam launch check" row. Only verify:
 
-```markdown
-## Install from source
-
-A source install is the package built from your checkout:
-`cd packaging && makepkg -si` (see above). It puts the binaries in
-`/usr/bin`, so the launch options below work as written. If you hand-copy
-`target/release/yutani` somewhere else instead, use the settings window's
-Steam page: it prints the launch line with the running binary's real path.
-```
-
-Replace the paragraph after the launch-options code block with:
-
-```markdown
-`PROTON_ENABLE_WAYLAND=1` gives each client a native Wayland toplevel that
-Yutani can capture, `WINE_NO_WM_DECORATION=1` stops Wine drawing its own
-title bar, and `yutani launch` starts the game inside the tunnel's cgroup so
-the tunnel can pick it out. Spell the path out
-(`/usr/bin/yutani launch -- %command%`) if Steam cannot find `yutani`
-on `PATH`.
-
-If the line names a `yutani` that no longer exists (for example after
-moving from a hand-copied binary to the package), Steam's Play button
-fails silently. Yutani checks the line every 30 s and says so on the panel
-icon, in its popover, and on the settings window's Steam page.
-```
-
-Check the rest of the README for `/usr/local/bin` (`grep -n 'usr/local' README.md`) and remove any remaining reference.
+Run: `grep -n 'usr/local' README.md`
+Expected: no output. If there is any, change it to `/usr/bin`.
 
 - [ ] **Step 4: Package spec migration step**
 
@@ -1286,7 +1261,7 @@ check that now catches it).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/lib.rs src/ui/settings.rs README.md docs/superpowers/specs/2026-09-14-yutani-package-design.md
+git add src/lib.rs src/ui/settings.rs docs/superpowers/specs/2026-09-14-yutani-package-design.md
 git commit -m "docs: the packaged binary lives in /usr/bin
 
 STEAM_LAUNCH_ARGS_ABSOLUTE, the README and the package spec's migration
