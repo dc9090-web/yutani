@@ -6,13 +6,15 @@
 
 use cosmic::iced::border::Radius;
 use cosmic::iced::widget::container;
-use cosmic::iced::{Background, Border, Color, Padding, Shadow, Vector};
+use cosmic::iced::{Background, Border, Color, Padding};
 use cosmic::widget::button;
 
 // ---- geometry -------------------------------------------------------------
 
-/// The popover's width; the shell may round it.
-pub const POPOVER_WIDTH: u32 = 340;
+/// The popover's width. The handoff draws 340; libcosmic's applet popup
+/// container pins its content to 360 (`popup_container`'s autosize
+/// limits), so the content fills that and every inset is as designed.
+pub const POPOVER_WIDTH: u32 = 360;
 pub const CARD_RADIUS: f32 = 11.0;
 pub const TILE_RADIUS: f32 = 9.0;
 pub const ROW_RADIUS: f32 = 7.0;
@@ -26,7 +28,7 @@ pub const PRIMARY_HEIGHT: f32 = 38.0;
 pub const OVERFLOW_PX: f32 = 38.0;
 pub const ACCOUNT_ROW_HEIGHT: f32 = 30.0;
 pub const MENU_ROW_HEIGHT: f32 = 31.0;
-pub const TOGGLE_PX: f32 = 19.0;
+pub const TOGGLE_PX: f32 = 22.0;
 pub const STATUS_DOT_PX: f32 = 8.0;
 pub const STATUS_GLOW_PX: f32 = 4.0;
 pub const GRAPH_HEIGHT: f32 = 64.0;
@@ -448,10 +450,6 @@ pub fn menu_row_class(danger: bool) -> cosmic::theme::Button {
     }
 }
 
-/// Unused-shadow guard: the popover takes the shell's own surface shadow.
-#[allow(dead_code)]
-const NO_SHADOW: Shadow = Shadow { color: Color::TRANSPARENT, offset: Vector::ZERO, blur_radius: 0.0 };
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,7 +469,8 @@ mod tests {
     /// The handoff's geometry, as designed.
     #[test]
     fn sizes_match_the_handoff() {
-        assert_eq!(POPOVER_WIDTH, 340);
+        assert_eq!(POPOVER_WIDTH, 360, "libcosmic's popup width");
+        assert_eq!(TOGGLE_PX, 22.0);
         assert_eq!((CARD_RADIUS, TILE_RADIUS, ROW_RADIUS, PRIMARY_RADIUS, MENU_RADIUS), (11.0, 9.0, 7.0, 10.0, 8.0));
         assert_eq!((BADGE_PX, BADGE_RADIUS, BADGE_GLYPH_SIZE), (26.0, 8.0, 13.0));
         assert_eq!((PRIMARY_HEIGHT, OVERFLOW_PX, ACCOUNT_ROW_HEIGHT, MENU_ROW_HEIGHT), (38.0, 38.0, 30.0, 31.0));

@@ -478,10 +478,6 @@ pub fn open_popup_message(bounds: Rectangle, offset: cosmic::iced::Vector) -> Ms
             let parent = state.core.main_window_id().unwrap_or(Id::RESERVED);
             let mut settings =
                 state.core.applet.get_popup_settings(parent, new_id, None, None, None);
-            // libcosmic pins every applet popup to 360 px; the design is 340.
-            let width = yutani::applet::theme::POPOVER_WIDTH as f32;
-            settings.positioner.size_limits =
-                cosmic::iced::Limits::NONE.min_height(1.0).min_width(width).max_width(width).max_height(1080.0);
             settings.positioner.anchor_rect = Rectangle {
                 x: (bounds.x - offset.x) as i32,
                 y: (bounds.y - offset.y) as i32,

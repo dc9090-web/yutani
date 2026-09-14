@@ -45,9 +45,10 @@ theme roles, never from the mock's hexes (the applet's dark-only palette in
   connect/disconnect is shown as a hollow ring dot (ink stroke, panel
   fill) in the same corner as the status dots, so the badge language stays
   one thing. The 1.1 s spinner glyph is retired.
-- **Popover width:** libcosmic sizes the popup; 340 is requested, and
-  whatever the shell gives is accepted (the previous handoff's 336 became
-  360 the same way).
+- **Popover width:** libcosmic's applet popup container pins its content
+  to 360 (the previous handoff's 336 became 360 the same way); the content
+  fills that and every inset is as designed, so nothing is drawn narrower
+  than the surface.
 - **Settings window:** opens at 900×724, resizable, minimum 760×560; the
   content pane scrolls, the sidebar does not.
 - **`INSTALLED` / `CONFIG` facts on the Tunnel pane** come from the unit

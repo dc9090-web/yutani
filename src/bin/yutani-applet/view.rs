@@ -71,6 +71,13 @@ fn fixed<'a>(content: impl Into<std::borrow::Cow<'a, str>> + 'a, size: f32, weig
     widget::text(content).size(size).font(weighted(font, weight)).class(cosmic_theme::Text::Color(color)).into()
 }
 
+/// A button's content, centred in the button's box. iced lays a button's
+/// content at its padding origin, so a fixed-height button needs this to
+/// keep its label off the top edge.
+fn centered<'a>(content: impl Into<Element<'a, Msg>>, x: Horizontal) -> Element<'a, Msg> {
+    widget::container(content).width(Length::Fill).height(Length::Fill).align_x(x).align_y(Vertical::Center).into()
+}
+
 /// A section label: 10.5 / 600, uppercase, secondary.
 fn section_label<'a>(text: &str) -> Element<'a, Msg> {
     ui(text.to_uppercase(), theme::SECTION_LABEL_SIZE, Weight::Semibold, Role::Secondary)
@@ -173,10 +180,10 @@ fn account_row<'a>(row: &AccountRow) -> Element<'a, Msg> {
     if row.focused {
         content = content.push(fixed("focused", theme::FOCUSED_SIZE, Weight::Normal, true, theme::VIOLET));
     }
-    widget::button::custom(content)
+    widget::button::custom(centered(widget::container(content).padding(theme::ACCOUNT_ROW_PAD), Horizontal::Left))
         .width(Length::Fill)
         .height(Length::Fixed(theme::ACCOUNT_ROW_HEIGHT))
-        .padding(theme::ACCOUNT_ROW_PAD)
+        .padding(0)
         .class(theme::account_row_class(row.focused))
         .on_press(Msg::Press(yutani::applet::Action::Focus(row.index)))
         .into()
@@ -193,7 +200,7 @@ fn accounts_card<'a>(p: &Popover) -> Element<'a, Msg> {
     let header = Row::new()
         .width(Length::Fill)
         .padding(theme::CARD_HEADER_PAD)
-        .align_y(Alignment::End)
+        .align_y(Alignment::Center)
         .push(section_label("Accounts connected"))
         .push(widget::space().width(Length::Fill))
         .push(mono(p.count.clone(), theme::COUNT_SIZE, Weight::Normal, Role::State(p.running)));
@@ -232,7 +239,7 @@ fn tunnel_section<'a>(p: &Popover) -> Element<'a, Msg> {
     let label = Row::new()
         .width(Length::Fill)
         .padding(theme::SECTION_LABEL_PAD)
-        .align_y(Alignment::End)
+        .align_y(Alignment::Center)
         .push(section_label("WireGuard tunnel"))
         .push(widget::space().width(Length::Fill))
         .push(ui("EVE traffic only", theme::EVE_ONLY_SIZE, Weight::Normal, Role::Tertiary));
@@ -349,27 +356,24 @@ fn tiles<'a>(p: &Popover) -> Element<'a, Msg> {
 fn action_row<'a>(p: &Popover, menu_open: bool) -> Element<'a, Msg> {
     let label = ui(p.primary.label(), theme::PRIMARY_SIZE, Weight::Semibold, Role::Ink);
     let primary = match p.primary {
-        Primary::Inert(_) => widget::button::custom(widget::container(label).width(Length::Fill).align_x(Horizontal::Center))
-            .class(theme::inert_primary_class()),
-        Primary::Standard(..) => widget::button::custom(widget::container(label).width(Length::Fill).align_x(Horizontal::Center))
-            .class(cosmic_theme::Button::Standard),
+        Primary::Inert(_) => widget::button::custom(centered(label, Horizontal::Center)).class(theme::inert_primary_class()),
+        Primary::Standard(..) => widget::button::custom(centered(label, Horizontal::Center)).class(cosmic_theme::Button::Standard),
         Primary::Accent(..) => {
             // The suggested button paints its own on-accent text.
             let label = widget::text(p.primary.label()).size(theme::PRIMARY_SIZE).font(weighted(cosmic::font::default(), Weight::Semibold));
-            widget::button::custom(widget::container(label).width(Length::Fill).align_x(Horizontal::Center))
-                .class(cosmic_theme::Button::Suggested)
+            widget::button::custom(centered(label, Horizontal::Center)).class(cosmic_theme::Button::Suggested)
         }
     }
     .width(Length::Fill)
     .height(Length::Fixed(theme::PRIMARY_HEIGHT))
+    .padding(0)
     .on_press_maybe(p.primary.action().map(Msg::Press));
-    let overflow = widget::button::custom(
-        widget::container(mono("⋯", theme::OVERFLOW_SIZE, Weight::Normal, Role::Ink)).width(Length::Fill).align_x(Horizontal::Center),
-    )
-    .width(Length::Fixed(theme::OVERFLOW_PX))
-    .height(Length::Fixed(theme::OVERFLOW_PX))
-    .class(theme::overflow_class(menu_open))
-    .on_press(Msg::ToggleMenu);
+    let overflow = widget::button::custom(centered(mono("⋯", theme::OVERFLOW_SIZE, Weight::Normal, Role::Ink), Horizontal::Center))
+        .width(Length::Fixed(theme::OVERFLOW_PX))
+        .height(Length::Fixed(theme::OVERFLOW_PX))
+        .padding(0)
+        .class(theme::overflow_class(menu_open))
+        .on_press(Msg::ToggleMenu);
     widget::container(Row::new().width(Length::Fill).spacing(theme::ACTION_GAP).push(primary).push(overflow))
         .width(Length::Fill)
         .padding(theme::CARD_MARGIN)
@@ -394,10 +398,10 @@ fn menu_row<'a>(row: &MenuRow) -> Element<'a, Msg> {
     if let Some(hint) = &row.hint {
         content = content.push(mono(hint.clone(), theme::MENU_HINT_SIZE, Weight::Normal, Role::Tertiary));
     }
-    widget::button::custom(content)
+    widget::button::custom(centered(widget::container(content).padding(theme::MENU_ROW_PAD), Horizontal::Left))
         .width(Length::Fill)
         .height(Length::Fixed(theme::MENU_ROW_HEIGHT))
-        .padding(theme::MENU_ROW_PAD)
+        .padding(0)
         .class(theme::menu_row_class(row.danger))
         .on_press_maybe(row.action.map(Msg::Press))
         .into()
@@ -437,5 +441,5 @@ pub fn popup(state: &Applet) -> Element<'_, Msg> {
     if state.menu_open {
         content = content.push(menu(p.running));
     }
-    widget::container(content).width(Length::Fixed(theme::POPOVER_WIDTH as f32)).into()
+    widget::container(content).width(Length::Fill).into()
 }
