@@ -51,6 +51,11 @@ cosmic-panel ──spawns──▶ yutani-applet (libcosmic applet, own process)
 
 ## 3. Panel button and icon states
 
+*Superseded 2026-09-14 by `2026-09-14-yutani-redesign-design.md` §1: one
+`yutani-symbolic` mark (solid below 22 px), never recoloured; status as a
+corner dot — success / warning / hollow ring — and 40 % when stopped; the
+launcher icon is `yutani`. The table below is the 2026-09-12 design.*
+
 Icon name `y-symbolic`, tinted **pure white** on a dark panel theme and
 with the theme's `on_bg` ink on a light one (`applet::theme::mark_class`;
 the panel's default `icon_color` is a soft grey that read dull — changed

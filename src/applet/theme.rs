@@ -78,13 +78,9 @@ pub const TITLE_SIZE: f32 = 14.0;
 pub const STATUS_SIZE: f32 = 11.5;
 pub const STATUS_GAP: u16 = 7;
 pub const DOT_PX: f32 = 7.0;
-/// The blue of the Active badge on the panel: the launcher icon's blue, so
-/// the dot and the Applications entry are visibly the same mark.
-pub const ACTIVE_BADGE: Color = rgb(0x0A, 0x5C, 0xFF);
-/// A hairline of near-black around the badge so it reads against both the
-/// white mark and a light panel.
-pub const ACTIVE_BADGE_RING: Color = rgba(0x00, 0x00, 0x00, 0.55);
-pub const ACTIVE_BADGE_RING_PX: f32 = 1.0;
+/// The status badge's ring, in the panel's own background, so the dot
+/// reads as cut out of the mark rather than sitting on it.
+pub const BADGE_RING_PX: f32 = 1.5;
 pub const DOT_GLOW_BLUR: f32 = 8.0;
 pub const CHIP_SIZE: f32 = 11.0;
 pub const CHIP_RADIUS: f32 = 6.0;
@@ -109,8 +105,9 @@ pub const MENU_ROW_GAP: u16 = 8;
 /// be pressed. The labels carry explicit colours, so libcosmic's own
 /// `disabled` button style never reaches them — [`dimmed`] does.
 pub const DISABLED_ALPHA: f32 = 0.4;
-/// The panel icon's opacity in the daemon-offline / not-installed state.
-pub const DIM_OPACITY: f32 = 0.38;
+/// The panel icon's opacity in the daemon-offline / not-installed state:
+/// the redesign's 40 %, "present but inactive".
+pub const DIM_OPACITY: f32 = 0.40;
 /// The services band's dots (2026-09-14 spec §1): the accent when a
 /// service is up, the danger red when it is not — nothing in between.
 pub const SERVICE_UP: Color = ACCENT_UP;
@@ -224,30 +221,41 @@ pub const MARK_ON_DARK: Color = Color::WHITE;
 /// their colour from this class; `Svg::Default` would fall back to the
 /// applet style's `icon_color` (the grey).
 pub fn mark_class() -> cosmic::theme::Svg {
-    cosmic::theme::Svg::custom(|theme| {
-        let cosmic = theme.cosmic();
-        let color = if cosmic.is_dark { MARK_ON_DARK } else { cosmic.on_bg_color().into() };
-        cosmic::iced::widget::svg::Style { color: Some(color) }
-    })
+    cosmic::theme::Svg::custom(|theme| cosmic::iced::widget::svg::Style { color: Some(mark_ink(theme.cosmic())) })
 }
 
-/// The badge's diameter for a panel icon `icon_px` tall: half the mark,
-/// never below 7 px or above 12 (enlarged from a third / 5–8 px on
-/// 2026-09-13: at panel size XS the smaller dot was easy to miss).
+/// The mark's ink: pure white on a dark theme, the theme's `on_bg` on a
+/// light one (see [`MARK_ON_DARK`]).
+fn mark_ink(cosmic: &cosmic::cosmic_theme::Theme) -> Color {
+    if cosmic.is_dark { MARK_ON_DARK } else { cosmic.on_bg_color().into() }
+}
+
+/// The badge's diameter for a panel icon `icon_px` tall: the handoff's
+/// 8 px at the standard 24 px icon, scaled with it, never below 7 or
+/// above 10.
 pub fn badge_px(icon_px: f32) -> f32 {
-    (icon_px * 0.5).round().clamp(7.0, 12.0)
+    (icon_px / 3.0).round().clamp(7.0, 10.0)
 }
 
-/// The Active badge: a filled blue circle with a dark hairline ring.
-pub fn badge_class(diameter: f32) -> cosmic::theme::Container<'static> {
-    cosmic::theme::Container::custom(move |_| container::Style {
-        background: Some(Background::Color(ACTIVE_BADGE)),
-        border: cosmic::iced::Border {
-            radius: Radius::from(diameter / 2.0),
-            width: ACTIVE_BADGE_RING_PX,
-            color: ACTIVE_BADGE_RING,
-        },
-        ..Default::default()
+/// The status badge (redesign spec §1): a filled dot in the theme's
+/// success or warning colour with a ring cut out in the panel background,
+/// or — while an action settles — a hollow ring of ink around that same
+/// background.
+pub fn badge_class(diameter: f32, badge: super::icon::Badge) -> cosmic::theme::Container<'static> {
+    use super::icon::Badge;
+    cosmic::theme::Container::custom(move |theme| {
+        let cosmic = theme.cosmic();
+        let panel: Color = cosmic.bg_color().into();
+        let (fill, ring) = match badge {
+            Badge::Connected => (cosmic.success_color().into(), panel),
+            Badge::Attention => (cosmic.warning_color().into(), panel),
+            Badge::Sync => (panel, mark_ink(cosmic)),
+        };
+        container::Style {
+            background: Some(Background::Color(fill)),
+            border: cosmic::iced::Border { radius: Radius::from(diameter / 2.0), width: BADGE_RING_PX, color: ring },
+            ..Default::default()
+        }
     })
 }
 
@@ -355,13 +363,15 @@ pub fn menu_row_class(text: Color, hover: Color, pressed: Color) -> cosmic::them
 mod tests {
     use super::*;
 
-    /// Half the icon, clamped: XS panels get a 8 px dot, huge ones stop at 12.
+    /// The handoff's 8 px dot at the standard 24 px icon, scaled with the
+    /// icon and clamped: XS panels keep a 7 px dot, huge ones stop at 10.
     #[test]
-    fn the_badge_is_half_the_icon_within_bounds() {
-        assert_eq!(badge_px(16.0), 8.0);
-        assert_eq!(badge_px(24.0), 12.0);
+    fn the_badge_is_a_third_of_the_icon_within_bounds() {
+        assert_eq!(badge_px(24.0), 8.0);
+        assert_eq!(badge_px(16.0), 7.0);
         assert_eq!(badge_px(10.0), 7.0);
-        assert_eq!(badge_px(64.0), 12.0);
+        assert_eq!(badge_px(64.0), 10.0);
+        assert_eq!(BADGE_RING_PX, 1.5);
     }
     use crate::model::config::parse_color;
 
@@ -440,7 +450,7 @@ mod tests {
         assert_eq!((MENU_GAP, MENU_ROW_GAP, DISABLED_ALPHA), (1, 8, 0.4));
         // The band's column gap is the header's, by construction.
         assert_eq!(BAND_COLUMN_GAP, HEADER_COLUMN_GAP);
-        assert_eq!(DIM_OPACITY, 0.38);
+        assert_eq!(DIM_OPACITY, 0.40);
         // The handoff's per-section padding shorthands, in its own order
         // (top, right, bottom, left).
         assert_eq!(HEADER_PAD, pad(10.0, 10.0, 2.0, 10.0));

@@ -1,17 +1,20 @@
-//! The handoff's SVGs, compiled in. `yutani applet install` writes `ICONS`
-//! into the user's icon theme so cosmic-panel can show the applet in its
-//! list; the applet itself always draws from these bytes, so it looks right
-//! straight from `cargo run` with nothing installed.
+//! The icons, compiled in. `yutani applet install` writes `ICONS` into the
+//! user's icon theme so cosmic-panel can show the applet in its list and
+//! the launcher has its icon; the applet itself always draws the panel mark
+//! from these bytes, so it looks right straight from `cargo run` with
+//! nothing installed. Geometry: the 2026-09-14 redesign handoff, "Screen 3".
 
-pub const Y_SYMBOLIC: &[u8] = include_bytes!("../assets/icons/y-symbolic.svg");
-/// The handoff's `#2c2c2c` variant "for light panels". Shipped for
-/// completeness only: a symbolic icon is recoloured by the shell from
-/// `y-symbolic`, so nothing here — panel button or popup — ever asks for
-/// this file. It exists so the installed icon theme matches the bundle.
-pub const Y_SYMBOLIC_DARK: &[u8] = include_bytes!("../assets/icons/y-symbolic-dark.svg");
-pub const Y_SYNC_SYMBOLIC: &[u8] = include_bytes!("../assets/icons/y-sync-symbolic.svg");
-pub const Y_ATTENTION_SYMBOLIC: &[u8] = include_bytes!("../assets/icons/y-attention-symbolic.svg");
-pub const Y_COLOR: &[u8] = include_bytes!("../assets/icons/y-color.svg");
+/// The panel mark, two-piece (the slice through the stem), for 22 px and
+/// up. `fill="currentColor"`: the panel tints it.
+pub const YUTANI_SYMBOLIC: &[u8] = include_bytes!("../assets/icons/yutani-symbolic.svg");
+/// The same mark with the slice omitted — at 16 px it would land on half
+/// a pixel.
+pub const YUTANI_SYMBOLIC_16: &[u8] = include_bytes!("../assets/icons/yutani-symbolic-16.svg");
+/// The launcher icon: plate, sheen, rim, the extruded mark, drop shadow.
+pub const YUTANI_APP: &[u8] = include_bytes!("../assets/icons/yutani.svg");
+/// The launcher icon below 64 px: no slice, no top-contour stroke.
+pub const YUTANI_APP_48: &[u8] = include_bytes!("../assets/icons/yutani-48.svg");
+pub const YUTANI_APP_32: &[u8] = include_bytes!("../assets/icons/yutani-32.svg");
 
 /// Popup decorations. Not icon-theme icons: they carry fixed colours from
 /// the handoff and are never tinted, so they are not installed.
@@ -19,98 +22,116 @@ pub const PIN: &[u8] = include_bytes!("../assets/glyphs/pin.svg");
 pub const ARROW_UP: &[u8] = include_bytes!("../assets/glyphs/arrow-up.svg");
 pub const ARROW_DOWN: &[u8] = include_bytes!("../assets/glyphs/arrow-down.svg");
 
-/// Single-colour marks the shell recolours: `…/icons/hicolor/symbolic/apps`.
-pub const SYMBOLIC_DIR: &str = "symbolic/apps";
+/// The symbolic mark at any size: `…/icons/hicolor/symbolic/status`.
+pub const SYMBOLIC_DIR: &str = "symbolic/status";
+/// The solid 16 px mark: `…/icons/hicolor/16x16/status`.
+pub const SYMBOLIC_16_DIR: &str = "16x16/status";
 /// Full-colour art the shell must *not* touch: `…/icons/hicolor/scalable/apps`.
 pub const SCALABLE_DIR: &str = "scalable/apps";
+pub const APPS_48_DIR: &str = "48x48/apps";
+pub const APPS_32_DIR: &str = "32x32/apps";
+
+/// The panel icon's theme name (`Icon=` of the applet's desktop entry).
+pub const SYMBOLIC_NAME: &str = "yutani-symbolic";
+/// The launcher icon's theme name.
+pub const APP_NAME: &str = "yutani";
 
 /// What `yutani applet install` copies into `~/.local/share/icons/hicolor`:
-/// the directory under that root, the file name, and the bytes.
-///
-/// The blue `y-color.svg` is deliberately *not* among the symbolic ones:
-/// anything under `symbolic/` is fair game for the shell to recolour, which
-/// would throw its blue away. It is the launcher icon only: the panel's
-/// Active state (spec §3) is the tinted `y-symbolic` mark with a blue dot
-/// the applet draws over it, not this file.
+/// the directory under that root, the file name, and the bytes. The same
+/// theme name lands in several size directories, which is how an icon
+/// theme picks the solid mark at 16 px and the simpler plate below 64.
 pub const ICONS: [(&str, &str, &[u8]); 5] = [
-    (SYMBOLIC_DIR, "y-symbolic.svg", Y_SYMBOLIC),
-    (SYMBOLIC_DIR, "y-symbolic-dark.svg", Y_SYMBOLIC_DARK),
-    (SYMBOLIC_DIR, "y-sync-symbolic.svg", Y_SYNC_SYMBOLIC),
-    (SYMBOLIC_DIR, "y-attention-symbolic.svg", Y_ATTENTION_SYMBOLIC),
-    (SCALABLE_DIR, "y-color.svg", Y_COLOR),
+    (SYMBOLIC_DIR, "yutani-symbolic.svg", YUTANI_SYMBOLIC),
+    (SYMBOLIC_16_DIR, "yutani-symbolic.svg", YUTANI_SYMBOLIC_16),
+    (SCALABLE_DIR, "yutani.svg", YUTANI_APP),
+    (APPS_48_DIR, "yutani.svg", YUTANI_APP_48),
+    (APPS_32_DIR, "yutani.svg", YUTANI_APP_32),
+];
+
+/// The files the pre-redesign install wrote (2026-09-12 handoff). Both
+/// `install` and `uninstall` remove them, so an upgraded machine is left
+/// with no stale marks in its theme.
+pub const LEGACY_ICONS: [(&str, &str); 5] = [
+    ("symbolic/apps", "y-symbolic.svg"),
+    ("symbolic/apps", "y-symbolic-dark.svg"),
+    ("symbolic/apps", "y-sync-symbolic.svg"),
+    ("symbolic/apps", "y-attention-symbolic.svg"),
+    ("scalable/apps", "y-color.svg"),
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn every_icon_is_a_single_colour_svg_named_for_the_icon_theme() {
-        assert_eq!(ICONS.len(), 5);
-        for (_dir, name, bytes) in ICONS {
-            let text = std::str::from_utf8(bytes).expect("svg is utf-8");
-            assert!(name.ends_with(".svg"), "{name}");
-            assert!(text.starts_with("<svg "), "{name} must start with <svg ");
-            assert!(text.contains(r#"viewBox="0 0 96 96""#), "{name} keeps the 96×96 box");
-            assert!(!text.contains("c2pa"), "{name} must have the metadata blob stripped");
-        }
-        assert!(ICONS.iter().any(|(_, n, _)| *n == "y-symbolic.svg"));
-        assert!(ICONS.iter().any(|(_, n, _)| *n == "y-color.svg"));
+    fn text(bytes: &[u8]) -> &str {
+        std::str::from_utf8(bytes).expect("svg is utf-8")
     }
 
-    /// M2: symbolic icons are recoloured by the shell, so the blue launcher
-    /// mark must not be filed among them — it goes to `scalable/apps`, the
-    /// full-colour app icon the handoff calls it.
+    /// The handoff's rule for the tray: a `currentColor` symbolic SVG on
+    /// the 32-unit grid, no gradients, no fixed colours.
     #[test]
-    fn the_blue_mark_is_a_launcher_icon_and_never_a_symbolic_one() {
-        let dir = |name: &str| ICONS.iter().find(|(_, n, _)| *n == name).expect(name).0;
-        assert_eq!(dir("y-color.svg"), SCALABLE_DIR);
-        for name in
-            ["y-symbolic.svg", "y-symbolic-dark.svg", "y-sync-symbolic.svg", "y-attention-symbolic.svg"]
-        {
-            assert_eq!(dir(name), SYMBOLIC_DIR, "{name}");
+    fn the_panel_marks_are_current_colour_on_the_32_unit_grid() {
+        for bytes in [YUTANI_SYMBOLIC, YUTANI_SYMBOLIC_16] {
+            let t = text(bytes);
+            assert!(t.starts_with("<svg "));
+            assert!(t.contains(r#"viewBox="0 0 32 32""#));
+            assert!(t.contains(r#"fill="currentColor""#));
+            assert!(!t.contains(r##"fill="#"##), "no fixed colour");
+            assert!(!t.contains("Gradient"), "no gradients");
         }
-        assert_eq!((SYMBOLIC_DIR, SCALABLE_DIR), ("symbolic/apps", "scalable/apps"));
+        // Two pieces from 22 px up (the slice is the mark's signature); one
+        // solid piece at 16, where the slice would land on half a pixel.
+        assert_eq!(text(YUTANI_SYMBOLIC).matches("<path").count(), 2);
+        assert_eq!(text(YUTANI_SYMBOLIC_16).matches("<path").count(), 1);
     }
 
-    /// M3: a badge drawn past the viewBox is silently cropped by the
-    /// renderer — at panel sizes that is a flat-bottomed dot. Every `rect`
-    /// has to close inside the 96-unit box.
+    /// The launcher icon is the one place with depth: a 116 plate in a 128
+    /// box, radius 26, with the face gradient and a dark side wall. Below
+    /// 64 px the slice and the top-contour stroke are dropped.
     #[test]
-    fn no_icon_draws_outside_its_viewbox() {
-        let attr = |tag: &str, name: &str| -> f32 {
-            let rest = tag.split_once(&format!("{name}=\"")).unwrap_or_else(|| panic!("{name} in {tag}")).1;
-            rest.split_once('"').unwrap().0.parse().unwrap()
-        };
-        for (_dir, file, bytes) in ICONS {
-            let text = std::str::from_utf8(bytes).unwrap();
-            for tag in text.split("<rect").skip(1) {
-                let tag = tag.split_once('>').unwrap().0;
-                let right = attr(tag, "x") + attr(tag, "width");
-                let bottom = attr(tag, "y") + attr(tag, "height");
-                assert!(right <= 96.0, "{file}: a rect reaches x={right}, past the 96-unit box");
-                assert!(bottom <= 96.0, "{file}: a rect reaches y={bottom}, past the 96-unit box");
-            }
+    fn the_launcher_icons_are_the_plate_with_the_extruded_mark() {
+        for bytes in [YUTANI_APP, YUTANI_APP_48, YUTANI_APP_32] {
+            let t = text(bytes);
+            assert!(t.contains(r#"viewBox="0 0 128 128""#));
+            assert!(t.contains(r#"<rect x="6" y="6" width="116" height="116" rx="26" fill="url(#plate)""#));
+            assert!(t.contains(r#"fill="url(#face)""#));
+            assert!(t.contains(r##"fill="#0a0d14" fill-opacity="0.55""##), "the side wall");
+            assert!(t.contains("translate(24 24) scale(2.5)"));
+        }
+        assert!(text(YUTANI_APP).contains(r#"stroke-opacity="0.85" stroke-width="0.35""#));
+        assert_eq!(text(YUTANI_APP).matches("<path").count(), 5, "two pieces × wall/face + contour");
+        for bytes in [YUTANI_APP_48, YUTANI_APP_32] {
+            assert!(!text(bytes).contains(r#"stroke-width="0.35""#), "no contour stroke below 64");
+            assert_eq!(text(bytes).matches("<path").count(), 2, "one solid piece × wall/face");
         }
     }
 
+    /// One theme name per role, each filed where the icon theme looks for
+    /// that size; nothing fixed-colour under `symbolic/`.
     #[test]
-    fn the_tinted_panel_icons_are_white_and_the_launcher_icon_is_blue() {
-        for bytes in [Y_SYMBOLIC, Y_SYNC_SYMBOLIC, Y_ATTENTION_SYMBOLIC] {
-            assert!(std::str::from_utf8(bytes).unwrap().contains(r##"fill="#ffffff""##));
+    fn every_icon_is_filed_under_its_theme_name_and_size() {
+        let names: Vec<&str> = ICONS.iter().map(|(_, n, _)| *n).collect();
+        assert_eq!(names, ["yutani-symbolic.svg", "yutani-symbolic.svg", "yutani.svg", "yutani.svg", "yutani.svg"]);
+        let dirs: Vec<&str> = ICONS.iter().map(|(d, _, _)| *d).collect();
+        assert_eq!(dirs, [SYMBOLIC_DIR, SYMBOLIC_16_DIR, SCALABLE_DIR, APPS_48_DIR, APPS_32_DIR]);
+        assert_eq!((SYMBOLIC_NAME, APP_NAME), ("yutani-symbolic", "yutani"));
+        for (dir, name, bytes) in ICONS {
+            let symbolic = dir.starts_with("symbolic") || dir.ends_with("status");
+            assert_eq!(symbolic, name.ends_with("-symbolic.svg"), "{dir}/{name}");
+            assert_eq!(symbolic, text(bytes).contains("currentColor"), "{dir}/{name}");
         }
-        assert!(std::str::from_utf8(Y_SYMBOLIC_DARK).unwrap().contains(r##"fill="#2c2c2c""##));
-        assert!(std::str::from_utf8(Y_COLOR).unwrap().contains(r##"fill="#0A5CFF""##));
-        // The sync badge must be one even-odd path, or a symbolic tint fills its hole.
-        let sync = std::str::from_utf8(Y_SYNC_SYMBOLIC).unwrap();
-        assert!(!sync.contains("<circle"), "sync badge must be an even-odd ring, not two circles");
-        assert_eq!(sync.matches("fill-rule=\"evenodd\"").count(), 2);
+        // Every old file is named for removal, and none of them is written.
+        assert_eq!(LEGACY_ICONS.len(), 5);
+        for (dir, name) in LEGACY_ICONS {
+            assert!(name.starts_with("y-"), "{name}");
+            assert!(!ICONS.iter().any(|(d, n, _)| *d == dir && *n == name));
+        }
     }
 
     #[test]
     fn the_popup_glyphs_carry_the_handoff_stroke_colours() {
-        assert!(std::str::from_utf8(PIN).unwrap().contains(r##"stroke="#9096A0""##));
-        assert!(std::str::from_utf8(ARROW_UP).unwrap().contains(r##"stroke="#2FD6B0""##));
-        assert!(std::str::from_utf8(ARROW_DOWN).unwrap().contains(r##"stroke="#5B9BFF""##));
+        assert!(text(PIN).contains(r##"stroke="#9096A0""##));
+        assert!(text(ARROW_UP).contains(r##"stroke="#2FD6B0""##));
+        assert!(text(ARROW_DOWN).contains(r##"stroke="#5B9BFF""##));
     }
 }

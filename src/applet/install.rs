@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
-use crate::assets::ICONS;
+use crate::assets::{APP_NAME, ICONS, LEGACY_ICONS, SYMBOLIC_NAME};
 
 /// Must match `Applet::APP_ID` in the applet binary — cosmic-panel keys
 /// applets on the desktop-entry id.
@@ -142,7 +142,7 @@ pub fn desktop_entry(exec: &str) -> String {
          Terminal=false\n\
          Categories=COSMIC;\n\
          Keywords=COSMIC;Applet;EVE;WireGuard;VPN;Yutani;\n\
-         Icon=y-symbolic\n\
+         Icon={SYMBOLIC_NAME}\n\
          StartupNotify=true\n\
          NoDisplay=true\n\
          X-CosmicApplet=true\n\
@@ -152,9 +152,10 @@ pub fn desktop_entry(exec: &str) -> String {
 
 /// The launcher entry: an ordinary visible application that starts the
 /// daemon — through `yutani start`, so a `yutani service install` (crash
-/// auto-restart) is honoured without rewriting this file. `Icon=y-color` is the full-colour mark `ICONS` puts in
-/// `hicolor/scalable/apps` — the handoff's app icon, and the one thing in
-/// the theme the shell will not recolour.
+/// auto-restart) is honoured without rewriting this file. `Icon=yutani` is
+/// the full-colour launcher icon `ICONS` puts in `hicolor/scalable/apps`
+/// (and its simpler sizes) — the one thing in the theme the shell will
+/// not recolour.
 pub fn launcher_entry(exec: &str) -> String {
     let exec = exec_quote(exec);
     format!(
@@ -163,7 +164,7 @@ pub fn launcher_entry(exec: &str) -> String {
          Name=Yutani\n\
          Comment=Live thumbnails and client switching for EVE Online\n\
          Exec={exec} start\n\
-         Icon=y-color\n\
+         Icon={APP_NAME}\n\
          Terminal=false\n\
          Categories=Game;Utility;\n\
          Keywords=EVE;Online;thumbnails;\n\
@@ -192,8 +193,20 @@ fn remove_entry(path: &Path) -> anyhow::Result<bool> {
     }
 }
 
+/// The icons a pre-redesign install left in the theme, removed on both
+/// install and uninstall so an upgrade leaves no stale marks. Returns how
+/// many were there.
+fn remove_legacy_icons(theme_dir: &Path) -> anyhow::Result<usize> {
+    let mut removed = 0;
+    for (dir, name) in LEGACY_ICONS {
+        removed += usize::from(remove_entry(&icon_path(theme_dir, dir, name))?);
+    }
+    Ok(removed)
+}
+
 /// Write the five icons and both desktop files; returns how many files were
 /// written. Overwrites, so running it twice is a no-op with the same count.
+/// Any icon a previous version wrote under its old names is removed.
 pub fn install_to(paths: &Paths, applet_exec: &str, yutani_exec: &str) -> anyhow::Result<usize> {
     for (dir, name, bytes) in ICONS {
         let path = icon_path(&paths.icons, dir, name);
@@ -201,17 +214,20 @@ pub fn install_to(paths: &Paths, applet_exec: &str, yutani_exec: &str) -> anyhow
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
     }
+    remove_legacy_icons(&paths.icons)?;
     write_entry(&paths.applet, desktop_entry(applet_exec))?;
     write_entry(&paths.launcher, launcher_entry(yutani_exec))?;
     Ok(ICONS.len() + 2)
 }
 
-/// Remove exactly the files `install_to` wrote; returns how many existed.
+/// Remove exactly the files `install_to` wrote (and any a previous version
+/// wrote); returns how many existed.
 pub fn uninstall_from(paths: &Paths) -> anyhow::Result<usize> {
     let mut removed = 0;
     for (dir, name, _) in ICONS {
         removed += usize::from(remove_entry(&icon_path(&paths.icons, dir, name))?);
     }
+    removed += remove_legacy_icons(&paths.icons)?;
     removed += usize::from(remove_entry(&paths.applet)?);
     removed += usize::from(remove_entry(&paths.launcher)?);
     Ok(removed)
@@ -308,7 +324,7 @@ mod tests {
             "Name=Yutani",
             "Type=Application",
             "Exec=/usr/local/bin/yutani-applet",
-            "Icon=y-symbolic",
+            "Icon=yutani-symbolic",
             "Terminal=false",
             "Categories=COSMIC;",
             "NoDisplay=true",
@@ -330,7 +346,7 @@ mod tests {
             "Name=Yutani",
             "Comment=Live thumbnails and client switching for EVE Online",
             "Exec=/usr/local/bin/yutani start",
-            "Icon=y-color",
+            "Icon=yutani",
             "Terminal=false",
             "Categories=Game;Utility;",
             "Keywords=EVE;Online;thumbnails;",
@@ -343,17 +359,15 @@ mod tests {
         assert!(!text.contains("X-CosmicApplet"), "the launcher is not an applet");
     }
 
-    /// `Icon=y-color` is a theme lookup, so it only resolves because
-    /// `ICONS` installs `y-color.svg` — under `scalable/apps`, where its
-    /// blue survives.
+    /// `Icon=yutani` / `Icon=yutani-symbolic` are theme lookups, so they
+    /// only resolve because `ICONS` installs files of those names — the
+    /// launcher one under `scalable/apps`, where its colours survive.
     #[test]
-    fn the_launcher_icon_name_is_one_the_install_actually_writes() {
-        assert!(launcher_entry("/opt/yutani").lines().any(|l| l == "Icon=y-color"));
-        assert!(
-            ICONS
-                .iter()
-                .any(|(dir, name, _)| *name == "y-color.svg" && *dir == crate::assets::SCALABLE_DIR)
-        );
+    fn both_icon_names_are_ones_the_install_actually_writes() {
+        assert!(launcher_entry("/opt/yutani").lines().any(|l| l == "Icon=yutani"));
+        assert!(desktop_entry("/opt/yutani-applet").lines().any(|l| l == "Icon=yutani-symbolic"));
+        assert!(ICONS.iter().any(|(dir, name, _)| *name == "yutani.svg" && *dir == crate::assets::SCALABLE_DIR));
+        assert!(ICONS.iter().any(|(dir, name, _)| *name == "yutani-symbolic.svg" && *dir == crate::assets::SYMBOLIC_DIR));
     }
 
     #[test]
@@ -367,10 +381,10 @@ mod tests {
         assert!(applet.contains("Exec=/opt/yutani-applet"));
         let launcher = std::fs::read_to_string(&s.paths.launcher).unwrap();
         assert!(launcher.contains("Exec=/opt/yutani start\n"));
-        assert!(launcher.contains("Icon=y-color"));
+        assert!(launcher.contains("Icon=yutani\n"));
         // Running it again rewrites the same seven files, not more.
         assert_eq!(install(&s), 7);
-        assert_eq!(std::fs::read_dir(symbolic(&s)).unwrap().count(), 4);
+        assert_eq!(std::fs::read_dir(symbolic(&s)).unwrap().count(), 1);
         assert_eq!(
             std::fs::read_dir(s.paths.icons.join(crate::assets::SCALABLE_DIR)).unwrap().count(),
             1
@@ -379,14 +393,39 @@ mod tests {
         assert_eq!(std::fs::read_dir(s.paths.applet.parent().unwrap()).unwrap().count(), 2);
     }
 
-    /// The blue mark must not land among the symbolic icons, where the shell
-    /// would happily recolour it into the panel's foreground.
+    /// The launcher's colours must not land among the symbolic icons, where
+    /// the shell would happily recolour them into the panel's foreground.
     #[test]
     fn the_launcher_icon_is_installed_outside_the_symbolic_directory() {
         let s = dirs("launcher");
         install(&s);
-        assert!(s.paths.icons.join("scalable/apps/y-color.svg").is_file());
-        assert!(!symbolic(&s).join("y-color.svg").exists());
+        assert!(s.paths.icons.join("scalable/apps/yutani.svg").is_file());
+        assert!(s.paths.icons.join("16x16/status/yutani-symbolic.svg").is_file());
+        assert!(!symbolic(&s).join("yutani.svg").exists());
+    }
+
+    /// An upgrade from the 2026-09-12 icons: installing removes every old
+    /// `y-*` file, and so does uninstalling a tree that only ever had them.
+    #[test]
+    fn the_old_icons_are_removed_on_install_and_on_uninstall() {
+        let s = dirs("legacy");
+        let write_legacy = |s: &Sandbox| {
+            for (dir, name) in LEGACY_ICONS {
+                let p = s.paths.icons.join(dir).join(name);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, b"<svg/>").unwrap();
+            }
+        };
+        write_legacy(&s);
+        assert_eq!(install(&s), 7);
+        for (dir, name) in LEGACY_ICONS {
+            assert!(!s.paths.icons.join(dir).join(name).exists(), "{dir}/{name} must be gone after install");
+        }
+        write_legacy(&s);
+        assert_eq!(uninstall_from(&s.paths).unwrap(), 7 + LEGACY_ICONS.len());
+        for (dir, name) in LEGACY_ICONS {
+            assert!(!s.paths.icons.join(dir).join(name).exists(), "{dir}/{name} must be gone after uninstall");
+        }
     }
 
     #[test]

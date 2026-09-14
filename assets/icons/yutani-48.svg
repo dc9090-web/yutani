@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="plate" x1="0.1" y1="0" x2="0.8" y2="1"><stop offset="0" stop-color="#303a4f"/><stop offset="0.5" stop-color="#1b2130"/><stop offset="1" stop-color="#0d1017"/></linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0.4" y2="1"><stop offset="0" stop-color="#ffffff" stop-opacity="0.16"/><stop offset="1" stop-color="#ffffff" stop-opacity="0"/></linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#939db2" stop-opacity="0.8"/><stop offset="0.45" stop-color="#939db2" stop-opacity="0.1"/><stop offset="1" stop-color="#000000" stop-opacity="0.5"/></linearGradient>
+    <linearGradient id="face" x1="0.1" y1="0" x2="0.9" y2="1"><stop offset="0" stop-color="#ffffff"/><stop offset="0.45" stop-color="#dfe5ef"/><stop offset="1" stop-color="#a7b0c2"/></linearGradient>
+    <filter id="shadow" x="-15%" y="-15%" width="130%" height="140%"><feDropShadow dx="0" dy="5" stdDeviation="4" flood-color="#000000" flood-opacity="0.55"/></filter>
+  </defs>
+  <rect x="6" y="6" width="116" height="116" rx="26" fill="url(#plate)" filter="url(#shadow)"/>
+  <rect x="6" y="6" width="116" height="116" rx="26" fill="url(#sheen)"/>
+  <rect x="6.75" y="6.75" width="114.5" height="114.5" rx="25.25" fill="none" stroke="url(#rim)" stroke-width="1.5"/>
+  <g transform="translate(24 24) scale(2.5)">
+    <g transform="translate(0.55 0.75)" fill="#0a0d14" fill-opacity="0.55"><path d="M5.5 7 H10.8 L16 13.3 L21.2 7 H26.5 V8.6 L18.6 18.2 V25.1 L16.8 26.9 H13.4 V18.2 L5.5 8.6 Z"/></g>
+    <g fill="url(#face)"><path d="M5.5 7 H10.8 L16 13.3 L21.2 7 H26.5 V8.6 L18.6 18.2 V25.1 L16.8 26.9 H13.4 V18.2 L5.5 8.6 Z"/></g>
+    
+  </g>
+</svg>

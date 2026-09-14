@@ -123,17 +123,17 @@ pub fn panel_button(state: &Applet) -> Element<'_, Msg> {
     let clients = state.status.as_ref().map_or(0, |s| s.clients.len());
     let icon = icon_state(state.status.as_ref().map(|s| &s.tunnel), clients, state.pending());
     let (w, h) = state.core.applet.suggested_size(true);
-    let mark = widget::icon(widget::icon::from_svg_bytes(icon.bytes()).symbolic(true))
+    let mark = widget::icon(widget::icon::from_svg_bytes(icon.bytes(h)).symbolic(true))
         .class(theme::mark_class())
         .width(Length::Fixed(f32::from(w)))
         .height(Length::Fixed(f32::from(h)))
         .opacity(icon.opacity());
-    let content: Element<'_, Msg> = if icon.badge() {
+    let content: Element<'_, Msg> = if let Some(badge) = icon.badge() {
         // The stack takes the mark's size; the badge layer fills it and
         // parks the dot in the corner.
         let d = theme::badge_px(f32::from(h));
         let badge = widget::container(widget::space().width(Length::Fixed(d)).height(Length::Fixed(d)))
-            .class(theme::badge_class(d));
+            .class(theme::badge_class(d, badge));
         cosmic::iced::widget::stack([
             mark.into(),
             widget::container(badge)
@@ -195,7 +195,7 @@ fn header<'a>(d: &Display) -> Element<'a, Msg> {
         // popup's own dark surface, so it must not follow the COSMIC
         // theme's icon colour the way the panel button does.
         .push(
-            widget::icon(widget::icon::from_svg_bytes(assets::Y_SYMBOLIC))
+            widget::icon(widget::icon::from_svg_bytes(assets::YUTANI_SYMBOLIC))
                 .class(theme::svg_class(theme::TEXT_ON_SURFACE))
                 .width(Length::Fixed(f32::from(theme::MARK_PX)))
                 .height(Length::Fixed(f32::from(theme::MARK_PX))),

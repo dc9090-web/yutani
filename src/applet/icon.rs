@@ -1,57 +1,75 @@
-//! Which panel icon the tunnel's state calls for (spec §3).
+//! Which panel icon the tunnel's state calls for (redesign spec §1).
+//!
+//! The glyph is never recoloured: every state is the panel's own ink, at
+//! full strength or at 40 %, and the news is a dot in the bottom-right
+//! corner — filled success for a working tunnel, filled warning for one in
+//! trouble, a hollow ring while an action is settling.
 
 use crate::tunnel::status::TunnelStatus;
 
 /// A tunnel that is up but has not handshaked for this long is in trouble.
 pub const HANDSHAKE_STALE_S: u64 = 180;
 
+/// The panel icon: the solid mark below this many pixels, the two-piece
+/// mark (with the slice through the stem) from here up.
+pub const TWO_PIECE_MIN_PX: u16 = 22;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IconState {
-    /// The plain mark: connected and healthy, or deliberately disconnected.
+    /// The plain mark: connected and healthy with nothing behind it, or
+    /// deliberately disconnected.
     Plain,
-    /// The plain mark with a blue dot: the tunnel is connected *and* there
-    /// is an EVE client behind it. It is the one state where Yutani is
-    /// doing its whole job, and the dot is the only colour on the panel.
+    /// The mark with the success dot: the tunnel is connected *and* there
+    /// is an EVE client behind it — the one state where Yutani is doing its
+    /// whole job.
     Active,
-    /// Ring badge: an action is in flight, or the tunnel has just come up
-    /// and is still handshaking.
+    /// The mark with the hollow ring: an action is in flight, or the tunnel
+    /// has just come up and is still handshaking.
     Sync,
-    /// Exclamation badge: up with no handshake for `HANDSHAKE_STALE_S`
-    /// (including one that never handshaked at all), or a failed unit.
+    /// The mark with the warning dot: up with no handshake for
+    /// `HANDSHAKE_STALE_S` (including one that never handshaked at all), or
+    /// a failed unit.
     Attention,
-    /// The plain mark at 38 %: no daemon, or no tunnel installed.
+    /// The mark at 40 %: no daemon, or no tunnel installed.
     Dim,
 }
 
+/// What is drawn over the mark's bottom-right corner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Badge {
+    /// Filled, the theme's success colour.
+    Connected,
+    /// Filled, the theme's warning colour.
+    Attention,
+    /// Hollow: panel-background fill, ink ring.
+    Sync,
+}
+
 impl IconState {
-    /// The icon-theme name `yutani applet install` writes (the applet draws
-    /// the same bytes from `crate::assets`).
+    /// The icon-theme name `yutani applet install` writes. One name for
+    /// every state: the shape never changes, only its opacity and badge.
     pub fn icon_name(self) -> &'static str {
-        match self {
-            IconState::Sync => "y-sync-symbolic",
-            IconState::Attention => "y-attention-symbolic",
-            IconState::Active | IconState::Plain | IconState::Dim => "y-symbolic",
-        }
+        crate::assets::SYMBOLIC_NAME
     }
 
     pub fn opacity(self) -> f32 {
         if self == IconState::Dim { super::theme::DIM_OPACITY } else { 1.0 }
     }
 
-    /// Whether the mark carries the blue dot. Every state is a single-colour
-    /// mark the panel tints to its own ink; `Active` adds a dot the applet
-    /// draws over the mark (`view::panel_button`), so the Y itself stays the
-    /// panel's colour on a light theme as well as a dark one.
-    pub fn badge(self) -> bool {
-        self == IconState::Active
+    pub fn badge(self) -> Option<Badge> {
+        match self {
+            IconState::Active => Some(Badge::Connected),
+            IconState::Attention => Some(Badge::Attention),
+            IconState::Sync => Some(Badge::Sync),
+            IconState::Plain | IconState::Dim => None,
+        }
     }
 
-    pub fn bytes(self) -> &'static [u8] {
-        match self {
-            IconState::Sync => crate::assets::Y_SYNC_SYMBOLIC,
-            IconState::Attention => crate::assets::Y_ATTENTION_SYMBOLIC,
-            IconState::Active | IconState::Plain | IconState::Dim => crate::assets::Y_SYMBOLIC,
-        }
+    /// The mark's bytes for a panel icon `icon_px` tall: the solid variant
+    /// below [`TWO_PIECE_MIN_PX`], where the slice would land on half a
+    /// pixel, the two-piece mark otherwise.
+    pub fn bytes(self, icon_px: u16) -> &'static [u8] {
+        if icon_px < TWO_PIECE_MIN_PX { crate::assets::YUTANI_SYMBOLIC_16 } else { crate::assets::YUTANI_SYMBOLIC }
     }
 }
 
@@ -208,35 +226,33 @@ mod tests {
         assert_eq!(icon_state(None, 3, false), IconState::Dim);
     }
 
-    /// Every state is the panel's own ink; only Active adds the dot, and it
-    /// does so over the plain mark rather than with a coloured icon, so the
-    /// Y follows a light panel theme too.
+    /// Redesign spec §1: the glyph is never recoloured. Status is a corner
+    /// badge — filled success, filled warning, or a hollow ring — and the
+    /// stopped state is the same shape at 40 %.
     #[test]
-    fn only_the_active_state_carries_the_dot_and_every_mark_is_tintable() {
-        assert!(IconState::Active.badge());
-        for state in [IconState::Plain, IconState::Sync, IconState::Attention, IconState::Dim] {
-            assert!(!state.badge(), "{state:?}");
-        }
-        assert_eq!(IconState::Active.bytes(), crate::assets::Y_SYMBOLIC);
-        assert_eq!(IconState::Active.opacity(), 1.0);
+    fn status_is_a_corner_badge_and_never_a_recoloured_glyph() {
+        assert_eq!(IconState::Active.badge(), Some(Badge::Connected));
+        assert_eq!(IconState::Attention.badge(), Some(Badge::Attention));
+        assert_eq!(IconState::Sync.badge(), Some(Badge::Sync));
+        assert_eq!(IconState::Plain.badge(), None);
+        assert_eq!(IconState::Dim.badge(), None);
         for state in [IconState::Plain, IconState::Sync, IconState::Attention, IconState::Dim, IconState::Active] {
-            assert!(state.icon_name().ends_with("-symbolic"), "{state:?}");
+            assert_eq!(state.icon_name(), "yutani-symbolic", "{state:?}: one shape, one name");
+            let file = format!("{}.svg", state.icon_name());
+            assert!(crate::assets::ICONS.iter().any(|(_, n, _)| *n == file), "{file}");
+            assert_eq!(state.opacity(), if state == IconState::Dim { 0.4 } else { 1.0 });
         }
     }
 
+    /// The slice through the stem lands on half a pixel at 16 px, so the
+    /// panel gets the solid mark below 22 and the two-piece mark from there.
     #[test]
-    fn each_state_names_one_of_the_installed_icons() {
-        assert_eq!(IconState::Plain.icon_name(), "y-symbolic");
-        assert_eq!(IconState::Sync.icon_name(), "y-sync-symbolic");
-        assert_eq!(IconState::Attention.icon_name(), "y-attention-symbolic");
-        assert_eq!(IconState::Dim.icon_name(), "y-symbolic");
-        assert_eq!(IconState::Active.icon_name(), "y-symbolic");
-        // Every name is one of the files `applet install` actually writes.
-        for state in [IconState::Plain, IconState::Sync, IconState::Attention, IconState::Dim, IconState::Active] {
-            let file = format!("{}.svg", state.icon_name());
-            assert!(crate::assets::ICONS.iter().any(|(_, n, _)| *n == file), "{file}");
+    fn the_solid_mark_is_used_below_22_px() {
+        for px in [8u16, 16, 21] {
+            assert_eq!(IconState::Plain.bytes(px), crate::assets::YUTANI_SYMBOLIC_16, "{px}");
         }
-        assert_eq!(IconState::Plain.opacity(), 1.0);
-        assert_eq!(IconState::Dim.opacity(), 0.38);
+        for px in [22u16, 24, 32, 64] {
+            assert_eq!(IconState::Active.bytes(px), crate::assets::YUTANI_SYMBOLIC, "{px}");
+        }
     }
 }

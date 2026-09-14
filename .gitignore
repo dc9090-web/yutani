@@ -3,3 +3,4 @@ reference/
 target/
 vpn/
 design/*.zip
+design/unpacked/
