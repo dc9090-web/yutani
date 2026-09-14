@@ -62,22 +62,13 @@ pub fn launch_options(localconfig: &str) -> Option<String> {
 }
 
 /// `"Key"   "value"` → the value, when the key is `key`.
-///
-/// The key is parsed with [`quoted`], which stops at the first
-/// unescaped `"` — safe, since a key is never itself quoted text. The
-/// value is not: a launch line can carry an unescaped `"` (a value
-/// copied in from outside Steam, e.g. by hand-editing), so instead of
-/// scanning for a terminator, the value is everything between the
-/// line's opening quote and its *last* character (already known to be
-/// the closing quote, since every VDF pair sits on one line) — undone
-/// for escapes only, never truncated early.
 fn quoted_pair(line: &str, key: &str) -> Option<String> {
     let (k, rest) = quoted(line)?;
     if k != key {
         return None;
     }
-    let body = rest.trim_start().strip_prefix('"')?.strip_suffix('"')?;
-    Some(unescape(body))
+    let (v, _) = quoted(rest.trim_start())?;
+    Some(v)
 }
 
 /// The quoted string at the start of `s`, with VDF's `\"`, `\\`, `\n`
@@ -101,28 +92,6 @@ fn quoted(s: &str) -> Option<(String, &str)> {
         }
     }
     None
-}
-
-/// VDF's `\"`, `\\`, `\n` and `\t` undone, over the whole string — no
-/// early stop at a bare `"`, unlike [`quoted`].
-fn unescape(s: &str) -> String {
-    let mut chars = s.chars();
-    let mut out = String::new();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                if let Some(e) = chars.next() {
-                    out.push(match e {
-                        'n' => '\n',
-                        't' => '\t',
-                        other => other,
-                    });
-                }
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 /// The `yutani` the launch line runs the game through: the token right
@@ -218,12 +187,21 @@ mod tests {
 
     #[test]
     fn vdf_escapes_are_undone() {
-        let escaped = REAL.replace("/usr/local/bin/yutani launch", "\"/opt/y\\\\utani\" launch");
+        let escaped = REAL.replace("/usr/local/bin/yutani launch", "\\\"/opt/y\\\\utani\\\" launch");
         // `\"` → `"`, `\\` → `\`.
         assert_eq!(
             launch_options(&escaped).as_deref(),
             Some("PROTON_ENABLE_WAYLAND=1 WINE_NO_WM_DECORATION=1 \"/opt/y\\utani\" launch -- %command%")
         );
+    }
+
+    #[test]
+    fn an_escaped_quote_is_kept_and_the_value_ends_at_the_closing_quote() {
+        let trailing = REAL.replace(
+            "\t\t\t\t\t\t\"LaunchOptions\"\t\t\"PROTON_ENABLE_WAYLAND=1 WINE_NO_WM_DECORATION=1 /usr/local/bin/yutani launch -- %command%\"\n",
+            "\t\t\t\t\t\t\"LaunchOptions\"\t\t\"a \\\"b\\\" c\"\t\"trailing\"\n",
+        );
+        assert_eq!(launch_options(&trailing).as_deref(), Some("a \"b\" c"));
     }
 
     #[test]
