@@ -50,8 +50,11 @@ enum Command {
     },
     /// List the saved layouts, one per line
     Layouts,
-    /// Open the settings window
-    Settings,
+    /// Open the settings window, optionally on a page
+    Settings {
+        /// display | behaviour | layouts | characters | tunnel | steam
+        page: Option<String>,
+    },
     /// Ask the running instance to exit
     Quit,
     /// Print the daemon's status (clients, visibility, tunnel) as JSON
@@ -197,7 +200,8 @@ fn main() -> ExitCode {
             }
         }),
         Some(Command::Layouts) => Ok(cli::layouts()),
-        Some(Command::Settings) => Ok(cli::send(&ipc::Request::Settings)),
+        Some(Command::Settings { page: None }) => Ok(cli::send(&ipc::Request::Settings)),
+        Some(Command::Settings { page: Some(page) }) => Ok(cli::send(&ipc::Request::SettingsPage(page))),
         Some(Command::Quit) => Ok(cli::send(&ipc::Request::Quit)),
         Some(Command::Status) => Ok(cli::send(&ipc::Request::Status)),
         Some(Command::Launch { command }) => Ok(launch::run(command)),
