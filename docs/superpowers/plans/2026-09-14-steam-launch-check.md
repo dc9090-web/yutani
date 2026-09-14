@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn vdf_escapes_are_undone() {
-        let escaped = REAL.replace("/usr/local/bin/yutani launch", "\"/opt/y\\\\utani\" launch");
+        let escaped = REAL.replace("/usr/local/bin/yutani launch", "\\\"/opt/y\\\\utani\\\" launch");
         // `\"` → `"`, `\\` → `\`.
         assert_eq!(
             launch_options(&escaped).as_deref(),
