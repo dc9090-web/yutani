@@ -97,6 +97,11 @@ afterwards. `yutani tunnel connect` / `disconnect` / `status` and the
 Tunnel page's buttons drive it from then on; `yutani tunnel uninstall`
 removes all three files. Private keys are never printed or logged.
 
+After an upgrade that moved the binary (a source install becoming the
+package, say), `yutani tunnel install` with no file rewrites the unit and
+the rule for the new binary from the conf already installed — no second
+copy of the `.conf` needed.
+
 ## Deploying with Ansible
 
 `deploy/ansible/` has a playbook and a `yutani` role that does everything on

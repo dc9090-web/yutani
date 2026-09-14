@@ -115,9 +115,11 @@ enum AppletAction {
 
 #[derive(Subcommand)]
 enum TunnelAction {
-    /// Install the tunnel from a wg-quick .conf (asks for your password once)
+    /// Install the tunnel from a wg-quick .conf (asks for your password
+    /// once); with no .conf, rewrite the unit and polkit rule for this
+    /// binary from the conf already installed
     Install {
-        conf: std::path::PathBuf,
+        conf: Option<std::path::PathBuf>,
         /// Print what would be installed instead of installing (no root
         /// needed); exits 1 if the real install would be refused
         #[arg(long)]
@@ -138,7 +140,10 @@ enum TunnelAction {
     #[command(hide = true)]
     InstallRoot {
         #[arg(long)]
-        conf: std::path::PathBuf,
+        conf: Option<std::path::PathBuf>,
+        /// Rewrite from the stored conf instead of `--conf`
+        #[arg(long)]
+        stored: bool,
         #[arg(long)]
         uid: u32,
         #[arg(long)]
@@ -251,7 +256,14 @@ fn main() -> ExitCode {
             yutani::applet::install::uninstall().map(|()| ExitCode::SUCCESS)
         }
         Some(Command::Tunnel { action }) => match action {
-            TunnelAction::Install { conf, dry_run: true } => {
+            TunnelAction::Install { conf: None, dry_run: true } => {
+                Err(anyhow::anyhow!("a dry run needs the .conf: the installed one is readable by root only"))
+            }
+            TunnelAction::Install { conf: None, dry_run: false } => {
+                let t = model::config::Config::load().tunnel;
+                tunnel::install::reinstall(&t.dns_servers, &t.dns_domains).map(|()| ExitCode::SUCCESS)
+            }
+            TunnelAction::Install { conf: Some(conf), dry_run: true } => {
                 // The same uid/name pair and canonical exe path the real
                 // install passes to `install-root`.
                 let t = model::config::Config::load().tunnel;
@@ -275,7 +287,7 @@ fn main() -> ExitCode {
                     Ok(if tunnel::install::report_has_failure(&report) { ExitCode::from(1) } else { ExitCode::SUCCESS })
                 })
             }
-            TunnelAction::Install { conf, dry_run: false } => {
+            TunnelAction::Install { conf: Some(conf), dry_run: false } => {
                 // From the *validated* config: the root side re-checks these
                 // anyway, but a warning about a bad domain belongs here,
                 // before the password prompt.
@@ -292,8 +304,13 @@ fn main() -> ExitCode {
                 Ok(ExitCode::SUCCESS)
             }
             TunnelAction::Run => tunnel::worker::run().map(|()| ExitCode::SUCCESS),
-            TunnelAction::InstallRoot { conf, uid, user, exe, dns_servers, dns_domains } => {
-                tunnel::install::install_root(&conf, uid, &user, &exe, &dns_servers, &dns_domains, false).map(|report| {
+            TunnelAction::InstallRoot { conf, stored, uid, user, exe, dns_servers, dns_domains } => {
+                let report = match (conf, stored) {
+                    (Some(conf), false) => tunnel::install::install_root(&conf, uid, &user, &exe, &dns_servers, &dns_domains, false),
+                    (None, true) => tunnel::install::reinstall_root(uid, &user, &exe, &dns_servers, &dns_domains, false),
+                    _ => Err(anyhow::anyhow!("install-root takes either --conf <file> or --stored")),
+                };
+                report.map(|report| {
                     print!("{report}");
                     ExitCode::SUCCESS
                 })

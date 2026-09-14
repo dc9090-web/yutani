@@ -200,6 +200,34 @@ pub fn uninstall() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `yutani tunnel install` with no conf: rewrite the unit and the rule for
+/// this binary from the stored conf (see [`reinstall_root`]).
+pub fn reinstall(dns_servers: &[std::net::Ipv4Addr], dns_domains: &[String]) -> anyhow::Result<()> {
+    let exe = current_exe()?;
+    if let Err(why) = trusted_path(Path::new(&exe)) {
+        bail!("refusing {exe}: the tunnel unit runs it as root, so it must be root-owned and not writable by others ({why})");
+    }
+    let (uid, user) = whoami()?;
+    let mut cmd = Command::new("pkexec");
+    cmd.args([&exe, "tunnel", "install-root", "--stored"]).args(["--uid", &uid.to_string(), "--user", &user, "--exe", &exe]);
+    if !dns_servers.is_empty() {
+        cmd.args(["--dns-servers", &joined(dns_servers)]);
+    }
+    if !dns_domains.is_empty() {
+        cmd.args(["--dns-domains", &joined(dns_domains)]);
+    }
+    privileged(&mut cmd, "install")?;
+    println!("{}", reinstall_message(&exe));
+    Ok(())
+}
+
+fn reinstall_message(exe: &str) -> String {
+    format!(
+        "Tunnel unit and polkit rule rewritten for {exe} from the stored conf.\n\
+If the tunnel is running, `yutani tunnel disconnect && yutani tunnel connect` to move it onto this binary."
+    )
+}
+
 /// `create_dir_all` applies the caller's umask, and `pkexec` does not reset
 /// it — so the mode is set explicitly afterwards rather than hoped for.
 fn create_dir_with_mode(dir: &Path, mode: u32) -> anyhow::Result<()> {
@@ -419,8 +447,51 @@ pub fn install_root(
     ensure!(valid_username(username), "{username:?} is not a POSIX portable user name ([a-z_][a-z0-9_-]*$)");
     check_pkexec_uid(std::env::var("PKEXEC_UID").ok().as_deref(), uid)?;
     let text = read_conf(conf_guard(conf, uid)?, conf)?;
+    install_from_text(&text, conf, uid, username, exe, dns_servers, dns_domains, dry_run)
+}
+
+/// Root side of `yutani tunnel install` with no conf: the unit and the
+/// polkit rule are rewritten for `exe` (and the DNS lines refreshed) from
+/// the conf already stored in `/etc/yutani` — an upgrade that moved the
+/// binary (a source install becoming the package) needs no second copy of
+/// a file the user was told to delete.
+pub fn reinstall_root(
+    uid: u32,
+    username: &str,
+    exe: &str,
+    dns_servers: &[std::net::Ipv4Addr],
+    dns_domains: &[String],
+    dry_run: bool,
+) -> anyhow::Result<String> {
+    ensure!(Path::new(exe).is_absolute(), "paths must be absolute");
+    ensure!(valid_username(username), "{username:?} is not a POSIX portable user name ([a-z_][a-z0-9_-]*$)");
+    check_pkexec_uid(std::env::var("PKEXEC_UID").ok().as_deref(), uid)?;
+    let stored = std::fs::read_to_string(CONF_PATH)
+        .with_context(|| format!("no tunnel is installed ({CONF_PATH} cannot be read); pass the .conf to install one"))?;
+    install_from_text(&without_yutani_lines(&stored), Path::new(CONF_PATH), uid, username, exe, dns_servers, dns_domains, dry_run)
+}
+
+/// The stored conf without the `# yutani:` lines root added on install,
+/// so a reinstall does not stack a second set on top.
+pub fn without_yutani_lines(stored: &str) -> String {
+    stored.lines().filter(|l| !l.trim_start().starts_with("# yutani:")).map(|l| format!("{l}\n")).collect()
+}
+
+/// What `install_root` and `reinstall_root` share once the conf's text is
+/// in hand. `conf` is only displayed.
+#[allow(clippy::too_many_arguments)]
+fn install_from_text(
+    text: &str,
+    conf: &Path,
+    uid: u32,
+    username: &str,
+    exe: &str,
+    dns_servers: &[std::net::Ipv4Addr],
+    dns_domains: &[String],
+    dry_run: bool,
+) -> anyhow::Result<String> {
     let label = conf.file_stem().and_then(|s| s.to_str()).unwrap_or("tunnel");
-    let parsed = WgConf::parse(&text, label).map_err(|e| anyhow!("{}: {e}", conf.display()))?;
+    let parsed = WgConf::parse(text, label).map_err(|e| anyhow!("{}: {e}", conf.display()))?;
     let dns_lines = dns_conf_lines(dns_servers, dns_domains)?;
     // Root's own lines first, and nothing derived from a user-chosen string
     // among them: the worker takes the first `# yutani: uid`/`dns_*` line it
@@ -843,6 +914,15 @@ mod tests {
         assert!(!stop_failure_worth_warning("Failed to stop yutani-tunnel.service: Unit yutani-tunnel.service not loaded."));
         assert!(!stop_failure_worth_warning("Unit yutani-tunnel.service not found."));
         assert!(stop_failure_worth_warning("Failed to stop yutani-tunnel.service: Access denied"));
+    }
+
+    /// A reinstall re-reads what root stored: its own `# yutani:` lines
+    /// are dropped first, or every reinstall would stack another set.
+    #[test]
+    fn a_reinstall_drops_the_stored_yutani_lines_before_storing_again() {
+        let stored = "# yutani: uid = 1000\n# yutani: dns_servers = 1.1.1.1\n[Interface]\nPrivateKey = x\n  # yutani: dns_domains = a\n[Peer]\n";
+        assert_eq!(without_yutani_lines(stored), "[Interface]\nPrivateKey = x\n[Peer]\n");
+        assert!(reinstall_message("/usr/bin/yutani").contains("rewritten for /usr/bin/yutani"));
     }
 
     #[test]
