@@ -54,6 +54,64 @@ pub struct Layout {
     pub order: Vec<String>,
     /// Where the next unnamed client's thumbnail goes.
     pub new_client_anchor: Anchor,
+    /// The named layout last applied or saved from this arrangement, for
+    /// the settings window's "applied" mark. Not cleared by a drag: the
+    /// arrangement is still that layout, moved a little.
+    pub last_applied: Option<String>,
+}
+
+/// One saved layout as the settings window lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutSummary {
+    pub name: String,
+    /// Distinct outputs the thumbnails are placed on.
+    pub monitors: usize,
+    pub thumbnails: usize,
+    /// The file's modification time.
+    pub saved: std::time::SystemTime,
+}
+
+impl LayoutSummary {
+    /// `3 monitors · 5 thumbnails · saved 12 Sep`.
+    pub fn meta(&self) -> String {
+        let n = |count: usize, word: &str| if count == 1 { format!("1 {word}") } else { format!("{count} {word}s") };
+        format!(
+            "{} · {} · saved {}",
+            n(self.monitors, "monitor"),
+            n(self.thumbnails, "thumbnail"),
+            crate::model::date::short_date(self.saved)
+        )
+    }
+}
+
+/// Every saved layout in `dir` with its counts and save time, in
+/// [`list_names_in`]'s order. A file that no longer parses is listed with
+/// zero counts rather than dropped — it can still be renamed or deleted.
+pub fn summaries_in(dir: &Path) -> Vec<LayoutSummary> {
+    list_names_in(dir)
+        .into_iter()
+        .map(|name| {
+            let path = dir.join(format!("{name}.ron"));
+            let saved = std::fs::metadata(&path).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            let layout = Layout::load_named_in(dir, &name).unwrap_or_default();
+            let monitors = layout.thumbs.values().map(|t| t.output.as_str()).collect::<std::collections::BTreeSet<_>>().len();
+            LayoutSummary { name, monitors, thumbnails: layout.thumbs.len(), saved }
+        })
+        .collect()
+}
+
+pub fn summaries() -> Vec<LayoutSummary> {
+    summaries_in(&layouts_dir())
+}
+
+/// A name for a duplicate of `name` that no saved layout has yet:
+/// `<name> copy`, then `<name> copy 2`, …
+pub fn duplicate_name(name: &str, taken: &[String]) -> String {
+    let first = format!("{name} copy");
+    if !taken.iter().any(|t| t == &first) {
+        return first;
+    }
+    (2..).map(|i| format!("{name} copy {i}")).find(|c| !taken.iter().any(|t| t == c)).expect("unbounded")
 }
 
 /// The drag snap grid, in logical px (spec §"Interaction": halved from 32
@@ -472,6 +530,34 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The settings window's Layouts list: counts from the file, the save
+    /// time from its mtime, and a duplicate name that is free.
+    #[test]
+    fn summaries_count_monitors_and_thumbnails_and_duplicates_get_a_free_name() {
+        let dir = std::env::temp_dir().join(format!("yutani-layout-summaries-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut l = super::Layout::default();
+        l.thumbs.insert("A".into(), super::ThumbPos { output: "DP-1".into(), x: 0, y: 0, pinned: false });
+        l.thumbs.insert("B".into(), super::ThumbPos { output: "DP-2".into(), x: 0, y: 0, pinned: false });
+        l.thumbs.insert("C".into(), super::ThumbPos { output: "DP-1".into(), x: 9, y: 9, pinned: false });
+        l.save_named_in(&dir, "Mining").unwrap();
+        super::Layout::default().save_named_in(&dir, "Empty").unwrap();
+        let s = super::summaries_in(&dir);
+        assert_eq!(s.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["Empty", "Mining"]);
+        assert_eq!((s[1].monitors, s[1].thumbnails), (2, 3));
+        assert_eq!((s[0].monitors, s[0].thumbnails), (0, 0));
+        assert!(s[1].meta().starts_with("2 monitors · 3 thumbnails · saved "), "{}", s[1].meta());
+        assert!(s[0].meta().starts_with("0 monitors · 0 thumbnails · saved "));
+        let taken: Vec<String> = s.iter().map(|x| x.name.clone()).collect();
+        assert_eq!(super::duplicate_name("Mining", &taken), "Mining copy");
+        let taken = vec!["Mining copy".to_string(), "Mining copy 2".to_string()];
+        assert_eq!(super::duplicate_name("Mining", &taken), "Mining copy 3");
+        // `last_applied` round-trips and defaults to none.
+        assert_eq!(super::Layout::load_named_in(&dir, "Mining").unwrap().last_applied, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn the_snap_grid_is_sixteen_px_and_reaches_the_top_edge() {

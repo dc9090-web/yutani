@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod config;
+pub mod date;
 pub mod layout;
 
 use std::path::Path;

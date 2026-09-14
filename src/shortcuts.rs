@@ -64,7 +64,8 @@ fn shell_word(exe: &str) -> String {
     }
 }
 
-/// The bindings we want, in a stable order: focus 1–9, next, prev.
+/// The bindings we want, in a stable order: focus 1–9, next, prev, and
+/// show / hide thumbnails on `<prefix>+T` (redesign spec §3).
 pub fn desired(cfg: &ShortcutsConfig, exe: &str) -> Vec<(Binding, String)> {
     let exe = shell_word(exe);
     let bind = |key: &str, description: String| Binding {
@@ -78,8 +79,12 @@ pub fn desired(cfg: &ShortcutsConfig, exe: &str) -> Vec<(Binding, String)> {
         .collect();
     out.push((bind(&cfg.next, "Yutani: next client".into()), format!("{exe} next")));
     out.push((bind(&cfg.prev, "Yutani: previous client".into()), format!("{exe} prev")));
+    out.push((bind(TOGGLE_KEY, "Yutani: show / hide thumbnails".into()), format!("{exe} toggle")));
     out
 }
+
+/// The show / hide key, as the settings chips print it: `<prefix> + T`.
+pub const TOGGLE_KEY: &str = "t";
 
 /// True for `Spawn("<something>yutani <args>")` where the command's first
 /// shell word is `yutani` or a path ending in `/yutani`.
@@ -284,7 +289,9 @@ mod tests {
     #[test]
     fn desired_has_eleven_entries_with_absolute_commands() {
         let d = desired(&cfg(), "/opt/yutani/bin/yutani");
-        assert_eq!(d.len(), 11);
+        assert_eq!(d.len(), 12);
+        assert_eq!(d[11].1, "/opt/yutani/bin/yutani toggle");
+        assert_eq!(d[11].0.key.as_deref(), Some("t"));
         assert_eq!(d[0].0, Binding { modifiers: vec![Modifier::Ctrl, Modifier::Alt], key: Some("1".into()), keycode: None, description: Some("Yutani: focus client 1".into()) });
         assert_eq!(d[0].1, "/opt/yutani/bin/yutani focus 1");
         assert_eq!(d[8].1, "/opt/yutani/bin/yutani focus 9");
@@ -319,7 +326,7 @@ mod tests {
         assert!(out.contains(r#"key: "Right""#));
         // Parses back as a RON map with 13 entries.
         let map: std::collections::BTreeMap<Binding, Box<ron::value::RawValue>> = ron::from_str(&out).unwrap();
-        assert_eq!(map.len(), 13);
+        assert_eq!(map.len(), 14);
     }
 
     #[test]
@@ -330,7 +337,7 @@ mod tests {
         assert!(!out.contains("/old/yutani"));
         assert!(out.contains(r#"Spawn("cosmic-term")"#));
         let map: std::collections::BTreeMap<Binding, Box<ron::value::RawValue>> = ron::from_str(&out).unwrap();
-        assert_eq!(map.len(), 12);
+        assert_eq!(map.len(), 13);
     }
 
     #[test]
@@ -338,7 +345,7 @@ mod tests {
         let (out, skipped) = merge("", &desired(&cfg(), "yutani")).unwrap();
         assert!(skipped.is_empty());
         let map: std::collections::BTreeMap<Binding, Box<ron::value::RawValue>> = ron::from_str(&out).unwrap();
-        assert_eq!(map.len(), 11);
+        assert_eq!(map.len(), 12);
         assert_eq!(strip("").unwrap().trim(), "{}");
         let back = strip(&out).unwrap();
         let map: std::collections::BTreeMap<Binding, Box<ron::value::RawValue>> = ron::from_str(&back).unwrap();
@@ -418,7 +425,7 @@ mod tests {
         let (installed, skipped) = merge(COSMIC_SETTINGS_1_8, &desired(&cfg(), "yutani")).unwrap();
         assert!(skipped.is_empty(), "{skipped:?}");
         let with_ours = parse(&installed).unwrap();
-        assert_eq!(with_ours.len(), 15);
+        assert_eq!(with_ours.len(), 16);
         for (binding, action) in &original {
             assert_eq!(with_ours.get(binding).map(|a| a.get_ron()), Some(action.get_ron()), "{binding:?}");
         }
@@ -442,9 +449,9 @@ mod tests {
         assert!(out.contains(r#"Spawn("foo")"#));
         assert!(out.contains(r#"Spawn("bar")"#));
         assert!(!out.contains(r#"Spawn("yutani next")"#));
-        // 2 foreign entries + 10 of ours (11 desired, minus the 1 skipped).
+        // 2 foreign entries + 11 of ours (12 desired, minus the 1 skipped).
         let map: std::collections::BTreeMap<Binding, Box<ron::value::RawValue>> = ron::from_str(&out).unwrap();
-        assert_eq!(map.len(), 12);
+        assert_eq!(map.len(), 13);
     }
 
     #[test]
@@ -462,7 +469,7 @@ mod tests {
         assert!(!out.contains(r#"Spawn("yutani next")"#));
         // 1 foreign entry + 10 of ours (11 desired, minus the 1 skipped).
         let map: Entries = ron::from_str(&out).unwrap();
-        assert_eq!(map.len(), 11);
+        assert_eq!(map.len(), 12);
     }
 
     #[test]
@@ -474,7 +481,7 @@ mod tests {
         assert!(skipped.is_empty(), "{skipped:?}");
         assert!(out.contains(r#"key: "Nonsense""#));
         let map: Entries = ron::from_str(&out).unwrap();
-        assert_eq!(map.len(), 12);
+        assert_eq!(map.len(), 13);
     }
 
     #[test]
@@ -496,7 +503,7 @@ mod tests {
         let (out, skipped) = merge("", &d).unwrap();
         assert!(skipped.is_empty());
         let map: Entries = ron::from_str(&out).unwrap();
-        assert_eq!(map.len(), 11);
+        assert_eq!(map.len(), 12);
         assert!(map.values().all(|action| is_ours(action.get_ron())), "{out}");
         // …and being ours, a following uninstall takes them all away again.
         assert_eq!(strip(&out).unwrap().trim(), "{}");
