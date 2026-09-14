@@ -1,6 +1,11 @@
 <div align="center">
 
-# Yutani
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/logo-white.png">
+  <img src="docs/logo-dark.png" alt="Yutani" width="560">
+</picture>
+
+<br>
 
 **Live thumbnails, one-key client switching and an EVE-only WireGuard tunnel for EVE Online multiboxing on COSMIC.**
 
