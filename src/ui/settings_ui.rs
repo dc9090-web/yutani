@@ -130,6 +130,8 @@ pub enum Role {
     OnAccent,
     /// Text on the destructive surface.
     OnDestructive,
+    /// A disabled control's label: ink at [`yutani::applet::theme::DISABLED_ALPHA`].
+    Disabled,
 }
 
 fn text_style(color: Color) -> cosmic::iced::widget::text::Style {
@@ -148,6 +150,7 @@ impl Role {
             Role::Destructive => |t| text_style(roles::destructive(t.cosmic())),
             Role::OnAccent => |t| text_style(t.cosmic().on_accent_color().into()),
             Role::OnDestructive => |t| text_style(t.cosmic().on_destructive_color().into()),
+            Role::Disabled => |t| text_style(roles::dimmed(roles::ink(t.cosmic()))),
         })
     }
 }
@@ -578,7 +581,7 @@ fn inert_class(radius: f32) -> cosmic_theme::Button {
 pub fn primary_button<'a, M: Clone + 'a>(label: &'a str, msg: Option<M>) -> Element<'a, M> {
     let (class, role) = match msg {
         Some(_) => (cosmic_theme::Button::Suggested, Role::OnAccent),
-        None => (inert_class(INNER_RADIUS), Role::Ink),
+        None => (inert_class(INNER_RADIUS), Role::Disabled),
     };
     widget::button::custom(centred(labelled(label, PRIMARY, Weight::Semibold, role)))
         .height(Length::Fixed(PRIMARY_H))
@@ -592,7 +595,7 @@ pub fn primary_button<'a, M: Clone + 'a>(label: &'a str, msg: Option<M>) -> Elem
 pub fn primary_button_owned<'a, M: Clone + 'a>(label: String, msg: Option<M>) -> Element<'a, M> {
     let (class, role) = match msg {
         Some(_) => (cosmic_theme::Button::Suggested, Role::OnAccent),
-        None => (inert_class(INNER_RADIUS), Role::Ink),
+        None => (inert_class(INNER_RADIUS), Role::Disabled),
     };
     let content: Element<'a, M> = text(label, PRIMARY, Weight::Semibold, role);
     widget::button::custom(centred(content))
@@ -605,7 +608,8 @@ pub fn primary_button_owned<'a, M: Clone + 'a>(label: String, msg: Option<M>) ->
 
 /// A standard button (`Cancel`, `Browse…`, `Restore`).
 pub fn standard_button<'a, M: Clone + 'a>(label: &'a str, msg: Option<M>) -> Element<'a, M> {
-    widget::button::custom(centred(labelled(label, BUTTON, Weight::Normal, Role::Ink)))
+    let role = if msg.is_some() { Role::Ink } else { Role::Disabled };
+    widget::button::custom(centred(labelled(label, BUTTON, Weight::Normal, role)))
         .height(Length::Fixed(BUTTON_H))
         .padding([0, 13])
         .class(pill_class(false, ITEM_RADIUS))
@@ -615,7 +619,8 @@ pub fn standard_button<'a, M: Clone + 'a>(label: &'a str, msg: Option<M>) -> Ele
 
 /// A standard button in the accent surface (`Apply`, `Rename`).
 pub fn accent_button<'a, M: Clone + 'a>(label: &'a str, msg: Option<M>) -> Element<'a, M> {
-    widget::button::custom(centred(labelled(label, BUTTON, Weight::Medium, Role::Ink)))
+    let role = if msg.is_some() { Role::Ink } else { Role::Disabled };
+    widget::button::custom(centred(labelled(label, BUTTON, Weight::Medium, role)))
         .height(Length::Fixed(SMALL_BUTTON_H))
         .padding([0, 14])
         .class(pill_class(true, ITEM_RADIUS))
@@ -625,7 +630,8 @@ pub fn accent_button<'a, M: Clone + 'a>(label: &'a str, msg: Option<M>) -> Eleme
 
 /// libcosmic's destructive button.
 pub fn destructive_button<'a, M: Clone + 'a>(label: &'a str, msg: Option<M>) -> Element<'a, M> {
-    widget::button::custom(centred(labelled(label, BUTTON, Weight::Semibold, Role::OnDestructive)))
+    let role = if msg.is_some() { Role::OnDestructive } else { Role::Disabled };
+    widget::button::custom(centred(labelled(label, BUTTON, Weight::Semibold, role)))
         .height(Length::Fixed(BUTTON_H))
         .padding([0, 12])
         .class(cosmic_theme::Button::Destructive)
@@ -653,7 +659,8 @@ pub fn destructive_outline_button<'a, M: Clone + 'a>(label: &'a str, msg: Option
             button_style(roles::destructive(c), Some(roles::with_alpha(roles::destructive(c), 0.18)), Some(roles::with_alpha(roles::destructive(c), 0.5)), ITEM_RADIUS)
         }),
     };
-    widget::button::custom(centred(labelled(label, BUTTON, Weight::Medium, Role::Destructive)))
+    let role = if msg.is_some() { Role::Destructive } else { Role::Disabled };
+    widget::button::custom(centred(labelled(label, BUTTON, Weight::Medium, role)))
         .height(Length::Fixed(BUTTON_H))
         .padding([0, 13])
         .class(class)
@@ -663,7 +670,8 @@ pub fn destructive_outline_button<'a, M: Clone + 'a>(label: &'a str, msg: Option
 
 /// A small square glyph button (`⋯`, `↻`).
 pub fn glyph_button<'a, M: Clone + 'a>(glyph: &'a str, px: f32, msg: Option<M>) -> Element<'a, M> {
-    widget::button::custom(centred(mono(glyph, 13.0, Weight::Normal, Role::Ink)))
+    let role = if msg.is_some() { Role::Ink } else { Role::Disabled };
+    widget::button::custom(centred(mono(glyph, 13.0, Weight::Normal, role)))
         .width(Length::Fixed(px))
         .height(Length::Fixed(px))
         .padding(0)

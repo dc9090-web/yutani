@@ -30,6 +30,8 @@ enum Role {
     Destructive,
     /// Text on the accent surface (the suggested primary button).
     OnAccent,
+    /// A disabled control's label.
+    Disabled,
     /// The state colour: success when on, muted ink when idle.
     State(bool),
 }
@@ -48,6 +50,7 @@ impl Role {
             Role::Download => |t| text_style(theme::download(t.cosmic())),
             Role::Destructive => |t| text_style(theme::destructive(t.cosmic())),
             Role::OnAccent => |t| text_style(t.cosmic().on_accent_color().into()),
+            Role::Disabled => |t| text_style(theme::dimmed(theme::ink(t.cosmic()))),
             Role::State(true) => |t| text_style(theme::state_color(t.cosmic(), true)),
             Role::State(false) => |t| text_style(theme::state_color(t.cosmic(), false)),
         })
@@ -227,7 +230,8 @@ fn accounts_card<'a>(p: &Popover) -> Element<'a, Msg> {
             .push(ui("Thumbnails, hotkeys and tunnel routing are inactive.", theme::STOPPED_HELP_SIZE, Weight::Normal, Role::Tertiary))
             .into()
     };
-    let thumbs = widget::button::custom(ui(p.thumbs.label(), theme::SMALL_BUTTON_SIZE, Weight::Normal, Role::Ink))
+    let thumbs_role = if p.thumbs.action().is_some() { Role::Ink } else { Role::Disabled };
+    let thumbs = widget::button::custom(ui(p.thumbs.label(), theme::SMALL_BUTTON_SIZE, Weight::Normal, thumbs_role))
         .padding(theme::SMALL_BUTTON_PAD)
         .class(theme::small_button_class(p.thumbs == ThumbsButton::Hide))
         .on_press_maybe(p.thumbs.action().map(Msg::Press));
@@ -363,7 +367,8 @@ fn tiles<'a>(p: &Popover) -> Element<'a, Msg> {
 // ---- 7. action row -----------------------------------------------------------
 
 fn action_row<'a>(p: &Popover, menu_open: bool) -> Element<'a, Msg> {
-    let label = ui(p.primary.label(), theme::PRIMARY_SIZE, Weight::Semibold, Role::Ink);
+    let label_role = if p.primary.action().is_some() { Role::Ink } else { Role::Disabled };
+    let label = ui(p.primary.label(), theme::PRIMARY_SIZE, Weight::Semibold, label_role);
     let primary = match p.primary {
         Primary::Inert(_) => widget::button::custom(centered(label, Horizontal::Center)).class(theme::inert_primary_class()),
         Primary::Standard(..) => widget::button::custom(centered(label, Horizontal::Center)).class(cosmic_theme::Button::Standard),
