@@ -10,7 +10,7 @@
 #     Settings → Desktop → Panel → Applets → add "Yutani"
 
 pkgname=yutani
-pkgver=0.1.0.r269.g17cef1e
+pkgver=0.1.0.r271.g90cb0c7
 pkgrel=1
 pkgdesc="Live thumbnails, hotkeys, a panel applet and an EVE-only WireGuard tunnel for EVE Online on COSMIC"
 arch=('x86_64')
