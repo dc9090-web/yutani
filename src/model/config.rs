@@ -123,6 +123,10 @@ pub struct Config {
     pub show_names: bool,
     /// Hover zoom multiplier, 1.0–4.0 (1.0 = no hover zoom).
     pub zoom_factor: f32,
+    /// Thumbnail opacity as a whole-number percent, 20..=100 (100 = opaque).
+    /// The thumbnail under the pointer is always fully opaque; the floor
+    /// keeps a thumbnail from being made invisible and lost on screen.
+    pub thumb_opacity: u8,
     pub visibility: Visibility,
     /// Hide the thumbnail of the client that currently has focus.
     pub hide_active: bool,
@@ -154,6 +158,7 @@ impl Default for Config {
             border_px: 0,
             show_names: true,
             zoom_factor: 1.0,
+            thumb_opacity: 100,
             visibility: Visibility::EveFocusedOnly,
             hide_active: false,
             snap_grid: true,
@@ -243,6 +248,7 @@ impl Config {
         check!(thumb_width, |v: &u32| (80..=1600).contains(v), "80..=1600");
         check!(fps, |v: &u32| [10, 15, 30, 60].contains(v), "10|15|30|60");
         check!(zoom_factor, |v: &f32| (1.0..=4.0).contains(v), "1.0..=4.0");
+        check!(thumb_opacity, |v: &u8| (20..=100).contains(v), "20..=100");
         check!(border_px, |v: &u32| *v <= 16, "0..=16");
         check!(corner_radius, |v: &u32| *v <= 64, "0..=64");
         check!(active_border, |v: &Option<String>| v.as_deref().is_none_or(|h| parse_color(h).is_some()), "#rrggbb[aa] or absent");
@@ -519,9 +525,27 @@ mod tests {
 
     #[test]
     fn stale_opacity_field_is_ignored() {
-        // Removed in the GPU-thumbnails spec; old config files still parse.
+        // Removed in the GPU-thumbnails spec; old config files still parse,
+        // and the old fraction does not leak into the new percent field.
         let c: Config = ron::from_str("(opacity: 0.5, thumb_width: 300)").unwrap();
         assert_eq!(c.thumb_width, 300);
+        assert_eq!(c.thumb_opacity, 100);
+    }
+
+    /// Opacity spec §1.1: a percent in 20..=100, default 100 so an existing
+    /// install looks exactly as before; anything outside validates back to
+    /// the default rather than to the nearest edge.
+    #[test]
+    fn thumb_opacity_is_a_percent_with_a_floor_of_twenty() {
+        assert_eq!(Config::default().thumb_opacity, 100);
+        for bad in [0u8, 19, 101, 255] {
+            let c = Config { thumb_opacity: bad, ..Config::default() }.validate();
+            assert_eq!(c.thumb_opacity, 100, "{bad}");
+        }
+        for good in [20u8, 80, 100] {
+            let c = Config { thumb_opacity: good, ..Config::default() }.validate();
+            assert_eq!(c.thumb_opacity, good);
+        }
     }
 
     #[test]

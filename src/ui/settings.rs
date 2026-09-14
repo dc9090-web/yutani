@@ -229,6 +229,8 @@ pub enum Msg {
     Commit,
     ThumbWidth(u32),
     Zoom(f32),
+    /// Thumbnail opacity, percent (opacity spec §1.2).
+    Opacity(u8),
     BorderPx(u32),
     CornerRadius(u32),
     ShowNames(bool),
@@ -354,7 +356,7 @@ pub fn parse_required_color(text: &str) -> Result<String, String> {
 /// apply live but must not write `config.ron` on every pixel. The slider's
 /// `on_release` sends `Commit`, which writes once.
 pub fn is_live_only(msg: &Msg) -> bool {
-    matches!(msg, Msg::ThumbWidth(_) | Msg::Zoom(_))
+    matches!(msg, Msg::ThumbWidth(_) | Msg::Zoom(_) | Msg::Opacity(_))
 }
 
 /// True for the messages that make the note line stale: a page the note
@@ -375,6 +377,7 @@ pub fn apply_config_field(config: &mut Config, msg: &Msg) -> Result<bool, String
         // Rounded to the slider's own step first: f32 arithmetic on the way
         // out of the widget otherwise puts a 1.3000001 in the file.
         Msg::Zoom(v) => config.zoom_factor = ((*v * 10.0).round() / 10.0).clamp(1.0, 4.0),
+        Msg::Opacity(v) => config.thumb_opacity = (*v).clamp(20, 100),
         Msg::BorderPx(v) => config.border_px = (*v).min(16),
         Msg::CornerRadius(v) => config.corner_radius = (*v).min(64),
         Msg::ShowNames(v) => config.show_names = *v,
@@ -542,6 +545,13 @@ fn display_page<'a>(state: &'a State, config: &'a Config) -> Element<'a, Msg> {
             .on_release(Msg::Commit)
             .width(Length::Fixed(260.0)),
     );
+    let opacity = widget::settings::item(
+        format!("Thumbnail opacity: {}%", config.thumb_opacity),
+        widget::slider(20..=100u8, config.thumb_opacity, Msg::Opacity)
+            .step(1u8)
+            .on_release(Msg::Commit)
+            .width(Length::Fixed(260.0)),
+    );
     let names =
         widget::settings::item("Show character names", widget::toggler(config.show_names).on_toggle(Msg::ShowNames));
     let border = widget::settings::item(
@@ -565,7 +575,7 @@ fn display_page<'a>(state: &'a State, config: &'a Config) -> Element<'a, Msg> {
             .width(Length::Fixed(160.0)),
     );
     widget::settings::view_column(vec![
-        widget::settings::section().title("Thumbnails").add(width).add(zoom).add(names).into(),
+        widget::settings::section().title("Thumbnails").add(width).add(zoom).add(opacity).add(names).into(),
         widget::settings::section().title("Frame").add(border).add(radius).add(active).add(inactive).into(),
     ])
     .into()
@@ -918,6 +928,14 @@ mod tests {
         // never gets a 1.3000001.
         assert_eq!(apply_config_field(&mut c, &Msg::Zoom(1.3000001)), Ok(true));
         assert_eq!(c.zoom_factor, 1.3);
+        // Opacity spec §1.5.
+        assert_eq!(apply_config_field(&mut c, &Msg::Opacity(80)), Ok(true));
+        assert_eq!(c.thumb_opacity, 80);
+        assert_eq!(apply_config_field(&mut c, &Msg::Opacity(80)), Ok(false));
+        assert_eq!(apply_config_field(&mut c, &Msg::Opacity(5)), Ok(true));
+        assert_eq!(c.thumb_opacity, 20);
+        assert_eq!(apply_config_field(&mut c, &Msg::Opacity(200)), Ok(true));
+        assert_eq!(c.thumb_opacity, 100);
         assert_eq!(apply_config_field(&mut c, &Msg::ShowNames(false)), Ok(true));
         assert!(!c.show_names);
         assert_eq!(apply_config_field(&mut c, &Msg::ActiveBorder("#ff8800".into())), Ok(true));
@@ -937,6 +955,7 @@ mod tests {
     fn sliders_apply_live_but_only_their_release_writes_the_file() {
         assert!(is_live_only(&Msg::ThumbWidth(300)));
         assert!(is_live_only(&Msg::Zoom(1.5)));
+        assert!(is_live_only(&Msg::Opacity(80)));
         assert!(!is_live_only(&Msg::BorderPx(2)));
         assert!(!is_live_only(&Msg::ShowNames(false)));
         assert!(!is_live_only(&Msg::ActiveBorder("#ff8800".into())));
