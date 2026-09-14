@@ -141,6 +141,9 @@ pub enum Verdict {
     Broken { path: String },
     /// No `yutani launch --` at all: EVE starts outside the tunnel.
     NoWrapper,
+    /// The line has an unbalanced double quote: `/bin/sh` fails on the
+    /// syntax error before EVE starts at all, not "outside the tunnel".
+    Malformed,
 }
 
 impl Verdict {
@@ -151,6 +154,9 @@ impl Verdict {
             Verdict::Ok => None,
             Verdict::Broken { path } => Some(format!("Steam launches EVE through {path}, which is missing.")),
             Verdict::NoWrapper => Some("Steam launches EVE without yutani, so it runs outside the tunnel.".to_string()),
+            Verdict::Malformed => {
+                Some("Steam's launch options for EVE have an unbalanced quote, so Play fails before EVE starts.".to_string())
+            }
         }
     }
 }
@@ -159,6 +165,9 @@ impl Verdict {
 /// real binary; it is injected so every verdict is testable without a
 /// filesystem (the production one is [`resolves`]).
 pub fn judge(launch_options: &str, resolves: &dyn Fn(&str) -> bool) -> Verdict {
+    if launch_options.matches('"').count() % 2 == 1 {
+        return Verdict::Malformed;
+    }
     match wrapper_path(launch_options) {
         None => Verdict::NoWrapper,
         Some(p) if resolves(p) => Verdict::Ok,
@@ -185,7 +194,7 @@ pub fn steam_roots(home: &Path) -> [PathBuf; 3] {
     ]
 }
 
-/// Every account's verdict, in root then account-id order. A root whose
+/// Every account's verdict, in root then numeric account-id order. A root whose
 /// `userdata` canonicalises to one already seen (the legacy symlink) is
 /// skipped, so no account is reported twice; an unreadable file or an
 /// account with no EVE block is silently skipped — a missing Steam is not
@@ -200,7 +209,7 @@ pub fn scan(home: &Path, resolves: &dyn Fn(&str) -> bool) -> Vec<Finding> {
         }
         seen.push(userdata.clone());
         let Ok(entries) = std::fs::read_dir(&userdata) else { continue };
-        let mut accounts: Vec<PathBuf> = entries
+        let mut accounts: Vec<(u64, PathBuf)> = entries
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| {
@@ -208,9 +217,13 @@ pub fn scan(home: &Path, resolves: &dyn Fn(&str) -> bool) -> Vec<Finding> {
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
             })
+            .filter_map(|p| {
+                let id = p.file_name()?.to_str()?.parse::<u64>().ok()?;
+                Some((id, p))
+            })
             .collect();
-        accounts.sort();
-        for account in accounts {
+        accounts.sort_by_key(|(id, _)| *id);
+        for (_, account) in accounts {
             let file = account.join("config").join("localconfig.vdf");
             let Ok(text) = std::fs::read_to_string(&file) else { continue };
             let Some(line) = launch_options(&text) else { continue };
@@ -413,6 +426,9 @@ mod tests {
         );
         assert_eq!(judge("A=1 %command%", &exists), Verdict::NoWrapper);
         assert_eq!(judge("", &exists), Verdict::NoWrapper);
+        // An unbalanced quote is its own verdict, not NoWrapper, even
+        // though `wrapper_path` also yields `None` for it.
+        assert_eq!(judge("A=1 \"/opt/yutani launch -- %command%", &exists), Verdict::Malformed);
     }
 
     #[test]
@@ -426,6 +442,10 @@ mod tests {
             Verdict::NoWrapper.message().as_deref(),
             Some("Steam launches EVE without yutani, so it runs outside the tunnel.")
         );
+        assert_eq!(
+            Verdict::Malformed.message().as_deref(),
+            Some("Steam's launch options for EVE have an unbalanced quote, so Play fails before EVE starts.")
+        );
     }
 
     #[test]
@@ -433,6 +453,7 @@ mod tests {
         let json = serde_json::to_string(&Verdict::Broken { path: "/x/yutani".into() }).unwrap();
         assert_eq!(json, r#"{"problem":"broken","path":"/x/yutani"}"#);
         assert_eq!(serde_json::to_string(&Verdict::NoWrapper).unwrap(), r#"{"problem":"no_wrapper"}"#);
+        assert_eq!(serde_json::to_string(&Verdict::Malformed).unwrap(), r#"{"problem":"malformed"}"#);
         assert_eq!(serde_json::from_str::<Verdict>(r#"{"problem":"ok"}"#).unwrap(), Verdict::Ok);
     }
 
@@ -475,6 +496,9 @@ mod tests {
     fn scan_reports_one_finding_per_account_with_an_eve_block() {
         let home = sandbox("scan");
         let native = home.join(".local/share/Steam");
+        // "999" sorts after "1001" and "1002" lexicographically but before
+        // them numerically: this is the case that proves the sort is numeric.
+        let fine_low = write_account(&native, "999", Some("/usr/bin/yutani launch -- %command%"));
         let fine = write_account(&native, "1001", Some("/usr/bin/yutani launch -- %command%"));
         let broken = write_account(&native, "1002", Some("/usr/local/bin/yutani launch -- %command%"));
         let _no_eve = write_account(&native, "1003", None);
@@ -494,6 +518,7 @@ mod tests {
         assert_eq!(
             seen,
             vec![
+                (Verdict::Ok, fine_low.canonicalize().unwrap()),
                 (Verdict::Ok, fine.canonicalize().unwrap()),
                 (Verdict::Broken { path: "/usr/local/bin/yutani".into() }, broken.canonicalize().unwrap()),
             ]
@@ -502,7 +527,7 @@ mod tests {
             first_message(&found).as_deref(),
             Some("Steam launches EVE through /usr/local/bin/yutani, which is missing.")
         );
-        assert_eq!(first_message(&found[..1]), None);
+        assert_eq!(first_message(&found[..2]), None);
         let _ = std::fs::remove_dir_all(&home);
     }
 

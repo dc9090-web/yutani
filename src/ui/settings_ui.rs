@@ -318,7 +318,7 @@ pub fn warning_note<'a, M: 'a>(body: String) -> Element<'a, M> {
         .height(Length::Fixed(18.0))
         .align_x(Horizontal::Center)
         .align_y(Vertical::Center)
-        .class(chip_class(false));
+        .class(panel_class(Tint::Warning, STEP_CHIP_RADIUS));
     widget::container(Row::new().spacing(9).align_y(Alignment::Start).push(glyph).push(prose(body, NOTE, Role::Ink)))
         .width(Length::Fill)
         .padding(NOTE_PAD)

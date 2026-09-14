@@ -444,6 +444,11 @@ mod tests {
             popover(Some(&bare), Rates::default(), flat(), None, false).notice.as_deref(),
             Some("Steam launches EVE without yutani, so it runs outside the tunnel. Open Settings → Steam.")
         );
+        let malformed = with_steam(status(true, Some(21), 3), crate::steam::Verdict::Malformed);
+        assert_eq!(
+            popover(Some(&malformed), Rates::default(), flat(), None, false).notice.as_deref(),
+            Some("Steam's launch options for EVE have an unbalanced quote, so Play fails before EVE starts. Open Settings → Steam.")
+        );
         assert_eq!(popover(None, Rates::default(), flat(), None, false).notice, None, "stopped: nothing to say");
     }
 
