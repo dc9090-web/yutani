@@ -5,6 +5,7 @@
 //! See docs/superpowers/specs/2026-09-14-steam-launch-check-design.md.
 
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// EVE Online's Steam app id.
 pub const EVE_APP_ID: &str = "8500";
@@ -113,10 +114,20 @@ pub fn wrapper_path(launch_options: &str) -> Option<&str> {
     tokens
         .windows(3)
         .find(|w| {
-            let p = w[0].trim_matches('"');
-            w[1] == "launch" && w[2] == "--" && (p == "yutani" || p.ends_with("/yutani"))
+            let p = unquote(w[0]);
+            // A leftover `"` means the quotes didn't balance: `unquote`
+            // handed the token back unchanged, and a bare suffix check
+            // would ignore the stray quote wherever it landed.
+            w[1] == "launch" && w[2] == "--" && !p.contains('"') && (p == "yutani" || p.ends_with("/yutani"))
         })
-        .map(|w| w[0].trim_matches('"'))
+        .map(|w| unquote(w[0]))
+}
+
+/// Strip a matched pair of double quotes from `t`; `t` unchanged when it
+/// isn't quoted at all, or when the quotes don't match (an unbalanced
+/// quote is left alone rather than silently mangled).
+fn unquote(t: &str) -> &str {
+    t.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(t)
 }
 
 /// What the launch line means for the next press of Play.
@@ -156,6 +167,84 @@ pub fn judge(launch_options: &str, resolves: &dyn Fn(&str) -> bool) -> Verdict {
     }
 }
 
+/// One account's verdict and the file it came from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finding {
+    pub verdict: Verdict,
+    /// The `localconfig.vdf` the launch line was read from.
+    pub file: PathBuf,
+}
+
+/// Where Steam keeps `userdata/`: native (the XDG path and the legacy
+/// `~/.steam` symlink tree) and the Flatpak. Mirrors
+/// `eve_settings::steam_vdf_candidates`, one level up.
+pub fn steam_roots(home: &Path) -> [PathBuf; 3] {
+    [
+        home.join(".local/share/Steam"),
+        home.join(".steam/steam"),
+        home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"),
+    ]
+}
+
+/// Every account's verdict, in root then account-id order. A root that
+/// canonicalises to one already seen (the legacy symlink) is skipped, so
+/// no account is reported twice; an unreadable file or an account with no
+/// EVE block is silently skipped — a missing Steam is not Yutani's problem
+/// to report.
+pub fn scan(home: &Path, resolves: &dyn Fn(&str) -> bool) -> Vec<Finding> {
+    let mut seen_roots: Vec<PathBuf> = Vec::new();
+    let mut out = Vec::new();
+    for root in steam_roots(home) {
+        let Ok(root) = root.canonicalize() else { continue };
+        if seen_roots.contains(&root) {
+            continue;
+        }
+        seen_roots.push(root.clone());
+        let Ok(entries) = std::fs::read_dir(root.join("userdata")) else { continue };
+        let mut accounts: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            })
+            .collect();
+        accounts.sort();
+        for account in accounts {
+            let file = account.join("config").join("localconfig.vdf");
+            let Ok(text) = std::fs::read_to_string(&file) else { continue };
+            let Some(line) = launch_options(&text) else { continue };
+            out.push(Finding { verdict: judge(&line, resolves), file });
+        }
+    }
+    out
+}
+
+/// The production resolver: a token with a `/` is a path that must be a
+/// file; a bare name is searched on this process's `PATH`.
+pub fn resolves(name: &str) -> bool {
+    if name.contains('/') {
+        return Path::new(name).is_file();
+    }
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|dir| dir.join(name).is_file()))
+        .unwrap_or(false)
+}
+
+/// What the daemon reports: only the accounts whose launch line is not
+/// [`Verdict::Ok`], from the real home and the real `PATH`.
+pub fn problems() -> Vec<Finding> {
+    let Some(home) = dirs::home_dir() else { return Vec::new() };
+    scan(&home, &resolves).into_iter().filter(|f| f.verdict != Verdict::Ok).collect()
+}
+
+/// The first thing worth saying about `findings`, for the popover and the
+/// settings banner.
+pub fn first_message(findings: &[Finding]) -> Option<String> {
+    findings.iter().find_map(|f| f.verdict.message())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +281,21 @@ mod tests {
         let with_decoy = format!("{decoy}{REAL}");
         assert_eq!(
             launch_options(&with_decoy).as_deref(),
+            Some("PROTON_ENABLE_WAYLAND=1 WINE_NO_WM_DECORATION=1 /usr/local/bin/yutani launch -- %command%")
+        );
+    }
+
+    #[test]
+    fn a_truncated_block_after_a_decoy_is_still_nothing_to_judge() {
+        let decoy = "\"apps\"\n{\n\t\"8500\"\n\t{\n\t\t\"OverlayAppEnable\"\t\t\"0\"\n\t}\n}\n";
+        assert_eq!(launch_options(&format!("{decoy}\"8500\"\n{{\n\t\"LastPlayed\"\t\t\"1\"\n")), None);
+    }
+
+    #[test]
+    fn a_second_eve_block_after_the_real_one_changes_nothing() {
+        let decoy = "\"apps\"\n{\n\t\"8500\"\n\t{\n\t\t\"OverlayAppEnable\"\t\t\"0\"\n\t}\n}\n";
+        assert_eq!(
+            launch_options(&format!("{REAL}{decoy}")).as_deref(),
             Some("PROTON_ENABLE_WAYLAND=1 WINE_NO_WM_DECORATION=1 /usr/local/bin/yutani launch -- %command%")
         );
     }
@@ -258,6 +362,10 @@ mod tests {
         // `launch` alone, or a different wrapper, is not ours.
         assert_eq!(wrapper_path("gamemoderun launch -- %command%"), None);
         assert_eq!(wrapper_path("yutani launch %command%"), None);
+        // A path with a space is unsupported and must not yield a garbled token.
+        assert_eq!(wrapper_path("A=1 \"/opt/my games/yutani\" launch -- %command%"), None);
+        // Unbalanced quote.
+        assert_eq!(wrapper_path("A=1 \"/opt/yutani launch -- %command%"), None);
     }
 
     #[test]
@@ -292,5 +400,98 @@ mod tests {
         assert_eq!(json, r#"{"problem":"broken","path":"/x/yutani"}"#);
         assert_eq!(serde_json::to_string(&Verdict::NoWrapper).unwrap(), r#"{"problem":"no_wrapper"}"#);
         assert_eq!(serde_json::from_str::<Verdict>(r#"{"problem":"ok"}"#).unwrap(), Verdict::Ok);
+    }
+
+    fn sandbox(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("yutani-steam-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_account(root: &std::path::Path, id: &str, launch: Option<&str>) -> std::path::PathBuf {
+        let dir = root.join("userdata").join(id).join("config");
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = match launch {
+            Some(line) => REAL.replace("/usr/local/bin/yutani launch -- %command%", line).replace(
+                "PROTON_ENABLE_WAYLAND=1 WINE_NO_WM_DECORATION=1 ",
+                "",
+            ),
+            None => REAL.replace("\"8500\"\n", "\"8501\"\n"),
+        };
+        let file = dir.join("localconfig.vdf");
+        std::fs::write(&file, text).unwrap();
+        file
+    }
+
+    #[test]
+    fn the_roots_cover_native_legacy_and_flatpak_steam() {
+        let home = std::path::Path::new("/home/x");
+        assert_eq!(
+            steam_roots(home),
+            [
+                std::path::PathBuf::from("/home/x/.local/share/Steam"),
+                std::path::PathBuf::from("/home/x/.steam/steam"),
+                std::path::PathBuf::from("/home/x/.var/app/com.valvesoftware.Steam/.local/share/Steam"),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_reports_one_finding_per_account_with_an_eve_block() {
+        let home = sandbox("scan");
+        let native = home.join(".local/share/Steam");
+        let fine = write_account(&native, "1001", Some("/usr/bin/yutani launch -- %command%"));
+        let broken = write_account(&native, "1002", Some("/usr/local/bin/yutani launch -- %command%"));
+        let _no_eve = write_account(&native, "1003", None);
+        // A non-numeric entry and an account with no config are skipped.
+        std::fs::create_dir_all(native.join("userdata/anonymous")).unwrap();
+        std::fs::create_dir_all(native.join("userdata/1004")).unwrap();
+        // The legacy tree is a symlink to the native one: not a second copy.
+        std::fs::create_dir_all(home.join(".steam")).unwrap();
+        std::os::unix::fs::symlink(&native, home.join(".steam/steam")).unwrap();
+
+        let exists = |p: &str| p == "/usr/bin/yutani";
+        let found = scan(&home, &exists);
+        // `scan` walks the canonical root, so compare canonical paths: the
+        // temp dir itself may sit behind a symlink.
+        let seen: Vec<(Verdict, std::path::PathBuf)> =
+            found.iter().map(|f| (f.verdict.clone(), f.file.canonicalize().unwrap())).collect();
+        assert_eq!(
+            seen,
+            vec![
+                (Verdict::Ok, fine.canonicalize().unwrap()),
+                (Verdict::Broken { path: "/usr/local/bin/yutani".into() }, broken.canonicalize().unwrap()),
+            ]
+        );
+        assert_eq!(
+            first_message(&found).as_deref(),
+            Some("Steam launches EVE through /usr/local/bin/yutani, which is missing.")
+        );
+        assert_eq!(first_message(&found[..1]), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn no_steam_at_all_is_nothing_to_report() {
+        let home = sandbox("nosteam");
+        assert!(scan(&home, &|_| true).is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolves_checks_paths_on_disk_and_bare_names_on_path() {
+        assert!(resolves("/bin/sh"));
+        assert!(!resolves("/nonexistent/yutani"));
+        assert!(resolves("sh"));
+        assert!(!resolves("yutani-surely-not-installed-under-this-name"));
+    }
+
+    #[test]
+    fn a_finding_round_trips_as_json() {
+        let f = Finding { verdict: Verdict::NoWrapper, file: "/h/localconfig.vdf".into() };
+        let json = serde_json::to_string(&f).unwrap();
+        assert_eq!(json, r#"{"verdict":{"problem":"no_wrapper"},"file":"/h/localconfig.vdf"}"#);
+        assert_eq!(serde_json::from_str::<Finding>(&json).unwrap(), f);
     }
 }
