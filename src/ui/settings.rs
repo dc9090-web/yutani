@@ -267,7 +267,7 @@ impl State {
             .ok()
             .and_then(|p| p.canonicalize().ok())
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "/usr/local/bin/yutani".to_string());
+            .unwrap_or_else(|| "/usr/bin/yutani".to_string());
         let mut state = Self {
             window,
             pages,
