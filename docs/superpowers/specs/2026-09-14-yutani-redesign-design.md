@@ -175,6 +175,26 @@ Transient UI state (`open_menu`, `renaming`, `confirm_delete`, `copy_phase`,
 persisted, and is cleared on pane change. Persistence stays immediate;
 sliders keep write-on-release.
 
+## 3a. Deviations recorded while building part 3 (2026-09-14)
+
+- **Tunnel facts:** the conf's file name is not known to the daemon (the
+  installed conf is root-only), so the first fact is `LOCATION` (the
+  conf's label, e.g. London) rather than `CONFIG`; `PRIVATE KEY` and
+  `INSTALLED` (the unit file's mtime, local time) are as designed.
+- **Show thumbnails** offers the two states the config has (Always / Only
+  with EVE focused); the handoff's `Never` has no config field — hiding is
+  the popover's Hide thumbnails action.
+- **Layout `⋯` menu** opens inline under its row (libcosmic's applet-style
+  popover is not available inside a toplevel window without an overlay
+  manager); Rename… is inline in the row, Delete… arms the inline confirm.
+- **Behaviour** has no Install / Uninstall shortcuts buttons: changing the
+  prefix reinstalls the twelve bindings at once (the chips promise what
+  the keys do). Custom next/prev keys stay honoured from `config.ron`.
+- **Characters** copies the account file of the newest account when the
+  toggle is on (the account picker is gone with the dropdowns).
+- **Popover header** shows the Yutani symbolic mark, violet, centred in
+  the plate (Daniel, 2026-09-14) rather than the letter Y.
+
 ## 4. Testing
 
 Pure logic is unit-tested as the codebase does now: icon state → badge
