@@ -28,6 +28,8 @@ enum Role {
     Success,
     Download,
     Destructive,
+    /// Text on the accent surface (the suggested primary button).
+    OnAccent,
     /// The state colour: success when on, muted ink when idle.
     State(bool),
 }
@@ -45,6 +47,7 @@ impl Role {
             Role::Success => |t| text_style(theme::success(t.cosmic())),
             Role::Download => |t| text_style(theme::download(t.cosmic())),
             Role::Destructive => |t| text_style(theme::destructive(t.cosmic())),
+            Role::OnAccent => |t| text_style(t.cosmic().on_accent_color().into()),
             Role::State(true) => |t| text_style(theme::state_color(t.cosmic(), true)),
             Role::State(false) => |t| text_style(theme::state_color(t.cosmic(), false)),
         })
@@ -365,8 +368,9 @@ fn action_row<'a>(p: &Popover, menu_open: bool) -> Element<'a, Msg> {
         Primary::Inert(_) => widget::button::custom(centered(label, Horizontal::Center)).class(theme::inert_primary_class()),
         Primary::Standard(..) => widget::button::custom(centered(label, Horizontal::Center)).class(cosmic_theme::Button::Standard),
         Primary::Accent(..) => {
-            // The suggested button paints its own on-accent text.
-            let label = widget::text(p.primary.label()).size(theme::PRIMARY_SIZE).font(weighted(cosmic::font::default(), Weight::Semibold));
+            // The suggested button needs its on-accent ink spelled out: a
+            // plain text does not inherit it.
+            let label = ui(p.primary.label(), theme::PRIMARY_SIZE, Weight::Semibold, Role::OnAccent);
             widget::button::custom(centered(label, Horizontal::Center)).class(cosmic_theme::Button::Suggested)
         }
     }

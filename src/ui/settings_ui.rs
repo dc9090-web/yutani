@@ -126,6 +126,10 @@ pub enum Role {
     Success,
     Warning,
     Destructive,
+    /// Text on the accent surface (a suggested button).
+    OnAccent,
+    /// Text on the destructive surface.
+    OnDestructive,
 }
 
 fn text_style(color: Color) -> cosmic::iced::widget::text::Style {
@@ -142,6 +146,8 @@ impl Role {
             Role::Success => |t| text_style(roles::success(t.cosmic())),
             Role::Warning => |t| text_style(t.cosmic().warning_color().into()),
             Role::Destructive => |t| text_style(roles::destructive(t.cosmic())),
+            Role::OnAccent => |t| text_style(t.cosmic().on_accent_color().into()),
+            Role::OnDestructive => |t| text_style(t.cosmic().on_destructive_color().into()),
         })
     }
 }
@@ -542,12 +548,11 @@ pub fn step_title<'a, M: 'a>(n: usize, title: &'a str) -> Element<'a, M> {
 
 // ---- buttons ---------------------------------------------------------------------
 
-fn labelled<'a, M: 'a>(label: &'a str, size: f32, weight: Weight, role: Option<Role>) -> Element<'a, M> {
-    match role {
-        Some(role) => text(label, size, weight, role),
-        // libcosmic's suggested / destructive buttons paint their own ink.
-        None => widget::text(label).size(size).font(weighted(cosmic::font::default(), weight)).into(),
-    }
+/// A button label. libcosmic's suggested / destructive buttons expect
+/// their own on-colour ink, which a plain `text` does not inherit, so the
+/// role is always explicit.
+fn labelled<'a, M: 'a>(label: &'a str, size: f32, weight: Weight, role: Role) -> Element<'a, M> {
+    text(label, size, weight, role)
 }
 
 fn centred<'a, M: 'a>(content: Element<'a, M>) -> Element<'a, M> {
@@ -572,8 +577,8 @@ fn inert_class(radius: f32) -> cosmic_theme::Button {
 /// tunnel`); inert when there is nothing to press.
 pub fn primary_button<'a, M: Clone + 'a>(label: &'a str, msg: Option<M>) -> Element<'a, M> {
     let (class, role) = match msg {
-        Some(_) => (cosmic_theme::Button::Suggested, None),
-        None => (inert_class(INNER_RADIUS), Some(Role::Ink)),
+        Some(_) => (cosmic_theme::Button::Suggested, Role::OnAccent),
+        None => (inert_class(INNER_RADIUS), Role::Ink),
     };
     widget::button::custom(centred(labelled(label, PRIMARY, Weight::Semibold, role)))
         .height(Length::Fixed(PRIMARY_H))
@@ -586,13 +591,10 @@ pub fn primary_button<'a, M: Clone + 'a>(label: &'a str, msg: Option<M>) -> Elem
 /// [`primary_button`] with an owned label.
 pub fn primary_button_owned<'a, M: Clone + 'a>(label: String, msg: Option<M>) -> Element<'a, M> {
     let (class, role) = match msg {
-        Some(_) => (cosmic_theme::Button::Suggested, None),
-        None => (inert_class(INNER_RADIUS), Some(Role::Ink)),
+        Some(_) => (cosmic_theme::Button::Suggested, Role::OnAccent),
+        None => (inert_class(INNER_RADIUS), Role::Ink),
     };
-    let content: Element<'a, M> = match role {
-        Some(role) => text(label, PRIMARY, Weight::Semibold, role),
-        None => widget::text(label).size(PRIMARY).font(weighted(cosmic::font::default(), Weight::Semibold)).into(),
-    };
+    let content: Element<'a, M> = text(label, PRIMARY, Weight::Semibold, role);
     widget::button::custom(centred(content))
         .height(Length::Fixed(PRIMARY_H))
         .padding([0, 16])
@@ -603,7 +605,7 @@ pub fn primary_button_owned<'a, M: Clone + 'a>(label: String, msg: Option<M>) ->
 
 /// A standard button (`Cancel`, `Browse…`, `Restore`).
 pub fn standard_button<'a, M: Clone + 'a>(label: &'a str, msg: Option<M>) -> Element<'a, M> {
-    widget::button::custom(centred(labelled(label, BUTTON, Weight::Normal, Some(Role::Ink))))
+    widget::button::custom(centred(labelled(label, BUTTON, Weight::Normal, Role::Ink)))
         .height(Length::Fixed(BUTTON_H))
         .padding([0, 13])
         .class(pill_class(false, ITEM_RADIUS))
@@ -613,7 +615,7 @@ pub fn standard_button<'a, M: Clone + 'a>(label: &'a str, msg: Option<M>) -> Ele
 
 /// A standard button in the accent surface (`Apply`, `Rename`).
 pub fn accent_button<'a, M: Clone + 'a>(label: &'a str, msg: Option<M>) -> Element<'a, M> {
-    widget::button::custom(centred(labelled(label, BUTTON, Weight::Medium, Some(Role::Ink))))
+    widget::button::custom(centred(labelled(label, BUTTON, Weight::Medium, Role::Ink)))
         .height(Length::Fixed(SMALL_BUTTON_H))
         .padding([0, 14])
         .class(pill_class(true, ITEM_RADIUS))
@@ -623,7 +625,7 @@ pub fn accent_button<'a, M: Clone + 'a>(label: &'a str, msg: Option<M>) -> Eleme
 
 /// libcosmic's destructive button.
 pub fn destructive_button<'a, M: Clone + 'a>(label: &'a str, msg: Option<M>) -> Element<'a, M> {
-    widget::button::custom(centred(labelled(label, BUTTON, Weight::Semibold, None)))
+    widget::button::custom(centred(labelled(label, BUTTON, Weight::Semibold, Role::OnDestructive)))
         .height(Length::Fixed(BUTTON_H))
         .padding([0, 12])
         .class(cosmic_theme::Button::Destructive)
@@ -651,7 +653,7 @@ pub fn destructive_outline_button<'a, M: Clone + 'a>(label: &'a str, msg: Option
             button_style(roles::destructive(c), Some(roles::with_alpha(roles::destructive(c), 0.18)), Some(roles::with_alpha(roles::destructive(c), 0.5)), ITEM_RADIUS)
         }),
     };
-    widget::button::custom(centred(labelled(label, BUTTON, Weight::Medium, Some(Role::Destructive))))
+    widget::button::custom(centred(labelled(label, BUTTON, Weight::Medium, Role::Destructive)))
         .height(Length::Fixed(BUTTON_H))
         .padding([0, 13])
         .class(class)

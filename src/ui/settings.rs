@@ -1053,7 +1053,7 @@ fn steam_page(state: &State) -> Element<'_, Msg> {
     let command = launch_command(state.steam_full_path, &state.exe_path);
     let copy_label = if state.copied { "Copied" } else { "Copy" };
     let copy = if state.copied {
-        widget::button::custom(widget::text(copy_label).size(ui::BUTTON).font(cosmic::iced::font::Font { weight: Weight::Medium, ..cosmic::font::default() }))
+        widget::button::custom(ui::text(copy_label, ui::BUTTON, Weight::Medium, ui::Role::OnAccent))
             .height(Length::Fixed(ui::SMALL_BUTTON_H))
             .padding([0, 13])
             .class(cosmic::theme::Button::Suggested)
