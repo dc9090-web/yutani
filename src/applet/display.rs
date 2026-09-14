@@ -275,6 +275,7 @@ mod tests {
             },
             shortcuts: Some(hint()),
             outputs: Vec::new(),
+            steam: Vec::new(),
         }
     }
 

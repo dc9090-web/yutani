@@ -688,7 +688,7 @@ mod tests {
     fn connected() -> Status {
         use yutani::tunnel::status::{Status, TunnelStatus};
         let tunnel = TunnelStatus { installed: true, connected: true, handshake_age_s: Some(4), ..Default::default() };
-        Status { clients: vec![], hidden: false, tunnel, shortcuts: None, outputs: Vec::new() }
+        Status { clients: vec![], hidden: false, tunnel, shortcuts: None, outputs: Vec::new(), steam: Vec::new() }
     }
 
     /// M1: `quit` is acknowledged at once but the daemon spends up to 10 s

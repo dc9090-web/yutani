@@ -111,16 +111,13 @@ fn quoted(s: &str) -> Option<(String, &str)> {
 /// unsupported, and the README never suggests one.
 pub fn wrapper_path(launch_options: &str) -> Option<&str> {
     let tokens: Vec<&str> = launch_options.split_whitespace().collect();
-    tokens
-        .windows(3)
-        .find(|w| {
-            let p = unquote(w[0]);
-            // A leftover `"` means the quotes didn't balance: `unquote`
-            // handed the token back unchanged, and a bare suffix check
-            // would ignore the stray quote wherever it landed.
-            w[1] == "launch" && w[2] == "--" && !p.contains('"') && (p == "yutani" || p.ends_with("/yutani"))
-        })
-        .map(|w| unquote(w[0]))
+    tokens.windows(3).find_map(|w| {
+        let p = unquote(w[0]);
+        // A leftover `"` means the quotes didn't balance: `unquote`
+        // handed the token back unchanged, and a bare suffix check
+        // would ignore the stray quote wherever it landed.
+        (w[1] == "launch" && w[2] == "--" && !p.contains('"') && (p == "yutani" || p.ends_with("/yutani"))).then_some(p)
+    })
 }
 
 /// Strip a matched pair of double quotes from `t`; `t` unchanged when it
@@ -186,21 +183,21 @@ pub fn steam_roots(home: &Path) -> [PathBuf; 3] {
     ]
 }
 
-/// Every account's verdict, in root then account-id order. A root that
-/// canonicalises to one already seen (the legacy symlink) is skipped, so
-/// no account is reported twice; an unreadable file or an account with no
-/// EVE block is silently skipped — a missing Steam is not Yutani's problem
-/// to report.
+/// Every account's verdict, in root then account-id order. A root whose
+/// `userdata` canonicalises to one already seen (the legacy symlink) is
+/// skipped, so no account is reported twice; an unreadable file or an
+/// account with no EVE block is silently skipped — a missing Steam is not
+/// Yutani's problem to report.
 pub fn scan(home: &Path, resolves: &dyn Fn(&str) -> bool) -> Vec<Finding> {
-    let mut seen_roots: Vec<PathBuf> = Vec::new();
+    let mut seen: Vec<PathBuf> = Vec::new();
     let mut out = Vec::new();
     for root in steam_roots(home) {
-        let Ok(root) = root.canonicalize() else { continue };
-        if seen_roots.contains(&root) {
+        let Ok(userdata) = root.join("userdata").canonicalize() else { continue };
+        if seen.contains(&userdata) {
             continue;
         }
-        seen_roots.push(root.clone());
-        let Ok(entries) = std::fs::read_dir(root.join("userdata")) else { continue };
+        seen.push(userdata.clone());
+        let Ok(entries) = std::fs::read_dir(&userdata) else { continue };
         let mut accounts: Vec<PathBuf> = entries
             .filter_map(|e| e.ok())
             .map(|e| e.path())
@@ -243,6 +240,37 @@ pub fn problems() -> Vec<Finding> {
 /// settings banner.
 pub fn first_message(findings: &[Finding]) -> Option<String> {
     findings.iter().find_map(|f| f.verdict.message())
+}
+
+use cosmic::iced::{self, Subscription};
+use std::time::Duration;
+
+/// How often the daemon re-reads Steam's files. Steam rewrites
+/// `localconfig.vdf` when Properties closes and when it exits, so a fix
+/// made in Steam's UI shows up within this.
+pub const PERIOD: Duration = Duration::from_secs(30);
+
+/// The daemon's watch: [`problems`] at startup and every [`PERIOD`],
+/// emitted only when the list changed. The scan reads a few small files
+/// on the blocking pool; the subscription's future shares the one-worker
+/// UI runtime and must not block it.
+pub fn subscription() -> Subscription<Vec<Finding>> {
+    Subscription::run(run)
+}
+
+fn run() -> impl iced::futures::Stream<Item = Vec<Finding>> {
+    iced::futures::stream::unfold(None::<Vec<Finding>>, |mut last| async move {
+        loop {
+            if last.is_some() {
+                futures_timer::Delay::new(PERIOD).await;
+            }
+            let now = tokio::task::spawn_blocking(problems).await.unwrap_or_default();
+            if last.as_ref() != Some(&now) {
+                return Some((now.clone(), Some(now)));
+            }
+            last = Some(now);
+        }
+    })
 }
 
 #[cfg(test)]

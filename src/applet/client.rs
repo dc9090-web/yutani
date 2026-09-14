@@ -193,6 +193,7 @@ mod tests {
             hidden: false,
             shortcuts: None,
             outputs: Vec::new(),
+            steam: Vec::new(),
             tunnel: TunnelStatus {
                 installed: true,
                 connected: true,

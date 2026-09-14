@@ -126,6 +126,12 @@ pub struct Status {
     /// The connected outputs; empty from a daemon older than this field.
     #[serde(default)]
     pub outputs: Vec<OutputStatus>,
+    /// Steam accounts whose EVE launch line is not `steam::Verdict::Ok`:
+    /// a `yutani` path that no longer exists, or no `yutani launch` at
+    /// all. Empty when every account is fine or Steam was not found, and
+    /// (`serde(default)`) from a daemon older than this field.
+    #[serde(default)]
+    pub steam: Vec<crate::steam::Finding>,
 }
 
 /// Combine the worker's file, whether `/sys/class/net/yutani0` exists,
@@ -328,6 +334,7 @@ mod tests {
         assert_eq!(back.tunnel.up_for_s, None);
         assert!(!back.tunnel.failed);
         assert_eq!(back.tunnel.exit_address, None);
+        assert!(back.steam.is_empty(), "an older daemon reports no Steam findings");
     }
 
     #[test]
@@ -340,11 +347,16 @@ mod tests {
             hidden: false,
             shortcuts: None,
             outputs: Vec::new(),
+            steam: vec![crate::steam::Finding {
+                verdict: crate::steam::Verdict::Broken { path: "/usr/local/bin/yutani".into() },
+                file: "/h/localconfig.vdf".into(),
+            }],
             tunnel: assemble(Some(&file()), true, Some((1, 2)), true, false, "London", 1021),
         };
         let json = serde_json::to_string(&st).unwrap();
         let back: Status = serde_json::from_str(&json).unwrap();
         assert_eq!(back.clients[0].name, "KestrelVance");
         assert_eq!(back.tunnel.handshake_age_s, Some(21));
+        assert_eq!(back.steam, st.steam);
     }
 }

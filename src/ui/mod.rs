@@ -160,6 +160,10 @@ pub struct App {
     /// window must start out busy, must not start a second pkexec, and the
     /// note at the end must name the file the action *started* with.
     pub tunnel_in_flight: Option<PathBuf>,
+    /// Steam accounts whose EVE launch line is broken or lacks `yutani
+    /// launch` (`yutani::steam`), from the 30 s subscription; copied into
+    /// every `status` reply and into the settings window when it is open.
+    pub steam_findings: Vec<yutani::steam::Finding>,
 }
 
 #[derive(Clone, Debug)]
@@ -185,6 +189,9 @@ pub enum Msg {
     /// thumbnails if it has not come back.
     FocusGraceOver,
     Adopt(adopt::AdoptEvent),
+    /// The Steam launch-line scan finished (the periodic subscription, or a
+    /// re-check when the settings window opens or shows its Steam page).
+    SteamChecked(Vec<yutani::steam::Finding>),
     /// The Characters page's files, read on the blocking pool by
     /// `refresh_characters`; `on_characters_listed` takes them from here.
     CharactersListed(CharactersListed),
@@ -561,6 +568,7 @@ impl App {
                     .iter()
                     .map(|o| crate::tunnel::status::OutputStatus { name: o.name.clone(), height: o.logical_size.1 })
                     .collect();
+                let steam = self.steam_findings.clone();
                 let reply = reply.clone();
                 let task = cosmic::iced::Task::perform(
                     async move {
@@ -568,7 +576,7 @@ impl App {
                             tokio::task::spawn_blocking(move || crate::tunnel::control::current_tunnel_status(&location))
                                 .await
                                 .map_err(|e| format!("status task failed: {e}"))?;
-                        let status = crate::tunnel::status::Status { clients, hidden, tunnel, shortcuts, outputs };
+                        let status = crate::tunnel::status::Status { clients, hidden, tunnel, shortcuts, outputs, steam };
                         serde_json::to_string(&status).map(Some).map_err(|e| format!("status: {e}"))
                     },
                     move |result| cosmic::Action::App(Msg::IpcReplyLater(reply, result)),
@@ -2235,6 +2243,7 @@ impl Application for App {
             hidden: false,
             last_eve_focus: None,
             tunnel_in_flight: None,
+            steam_findings: Vec::new(),
             settings: None,
             keepalive: None,
             last_config_write: None,
@@ -2350,6 +2359,17 @@ impl Application for App {
                 }
                 Task::none()
             }
+            Msg::SteamChecked(findings) => {
+                // The subscription only emits on change, so this is one
+                // warning per change, not one per tick.
+                for f in &findings {
+                    if let Some(m) = f.verdict.message() {
+                        tracing::warn!(file = %f.file.display(), "{m}");
+                    }
+                }
+                self.steam_findings = findings;
+                Task::none()
+            }
         }
     }
 
@@ -2375,6 +2395,7 @@ impl Application for App {
                 Err(error) => Msg::ConfigBroken(error),
             }),
             ipc::subscription().map(Msg::Ipc),
+            yutani::steam::subscription().map(Msg::SteamChecked),
         ];
         if let Some(conn) = self.conn.clone() {
             subs.push(
@@ -2532,6 +2553,7 @@ mod tests {
             last_eve_focus: None,
             settings: None,
             tunnel_in_flight: None,
+            steam_findings: Vec::new(),
             keepalive: None,
             last_config_write: None,
         }
