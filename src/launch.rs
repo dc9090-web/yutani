@@ -56,11 +56,17 @@ use yutani::model::config::{Config, LaunchConfig};
 
 use crate::tunnel::SLICE;
 
-/// `MESA_VK_WSI_PRESENT_MODE=immediate`: Mesa's Vulkan WSI presents without
+/// `MESA_VK_WSI_PRESENT_MODE=mailbox`: Mesa's Vulkan WSI presents without
 /// waiting for the compositor's frame callback (which never comes for a
 /// covered surface). The compositor still vsyncs the screen, so this does
-/// not tear; it only stops the client blocking.
+/// not tear; it only stops the client blocking. Not `immediate`: Mesa's
+/// Wayland WSI offers that mode only when the compositor has
+/// `wp_tearing_control_v1` (COSMIC does not), rejects the override
+/// otherwise, and with any override set stops honouring the per-present
+/// mode switch vkd3d-proton uses, so the client ends up pinned to FIFO.
 pub const PRESENT_MODE_VAR: &str = "MESA_VK_WSI_PRESENT_MODE";
+/// The value: the one unthrottled mode every Wayland compositor supports.
+pub const PRESENT_MODE: &str = "mailbox";
 /// DXVK's own frame limiter, so "no vsync" does not mean "as fast as the
 /// GPU can go" for every client at once.
 pub const FRAME_RATE_VAR: &str = "DXVK_FRAME_RATE";
@@ -74,12 +80,12 @@ pub const FALLBACK_FRAME_RATE: u32 = 60;
 /// compositor or a game.
 pub fn game_env(config: &LaunchConfig, display_hz: Option<u32>, already_set: impl Fn(&str) -> bool) -> Vec<(String, String)> {
     let mut vars = Vec::new();
-    if config.immediate_present && !already_set(PRESENT_MODE_VAR) {
-        vars.push((PRESENT_MODE_VAR.to_string(), "immediate".to_string()));
+    if config.unlocked_present && !already_set(PRESENT_MODE_VAR) {
+        vars.push((PRESENT_MODE_VAR.to_string(), PRESENT_MODE.to_string()));
     }
     // A cap only matters once vsync no longer paces the client, unless the
     // user asked for one outright.
-    if (config.immediate_present || config.frame_rate.is_some()) && !already_set(FRAME_RATE_VAR) {
+    if (config.unlocked_present || config.frame_rate.is_some()) && !already_set(FRAME_RATE_VAR) {
         let cap = config.frame_rate.or(display_hz).unwrap_or(FALLBACK_FRAME_RATE);
         vars.push((FRAME_RATE_VAR.to_string(), cap.to_string()));
     }
@@ -145,7 +151,7 @@ fn display_refresh_hz() -> Option<u32> {
 /// Put [`game_env`]'s variables into this process's environment, which both
 /// exec paths hand to the game, and say so once on stderr (Steam keeps it).
 fn prepare_game_env(config: &LaunchConfig) {
-    let display_hz = if config.immediate_present && config.frame_rate.is_none() { display_refresh_hz() } else { None };
+    let display_hz = if config.unlocked_present && config.frame_rate.is_none() { display_refresh_hz() } else { None };
     let vars = game_env(config, display_hz, |name| std::env::var_os(name).is_some());
     if vars.is_empty() {
         return;
@@ -276,19 +282,29 @@ mod tests {
 
     /// Daniel, 2026-09-16: two fullscreen clients on one display, the one
     /// underneath drew nothing (0 GPU time) until raised, so its thumbnail
-    /// was a still image. Immediate present keeps it drawing; the cap keeps
-    /// that from meaning "flat out"; a variable on the launch line wins.
+    /// was a still image. A present mode that never waits for the frame
+    /// callback keeps it drawing; the cap keeps that from meaning "flat
+    /// out"; a variable on the launch line wins.
+    ///
+    /// Same day, later: `immediate` was the wrong mode. Mesa only offers it
+    /// when the compositor has `wp_tearing_control_v1`, which cosmic-comp
+    /// lacks, so Mesa rejected the override ("Unsupported
+    /// MESA_VK_WSI_PRESENT_MODE value!" in Steam's console log) and, with
+    /// an override set, also stopped honouring vkd3d-proton's per-present
+    /// mode switch: the swapchain sat in FIFO and the covered client hung in
+    /// `vkQueuePresentKHR` waiting for a frame callback. `mailbox` is always
+    /// offered on Wayland, never tears and never waits on the callback.
     #[test]
-    fn the_game_gets_immediate_present_and_a_cap_from_the_display() {
+    fn the_game_gets_mailbox_present_and_a_cap_from_the_display() {
         let cfg = LaunchConfig::default();
         assert_eq!(
             game_env(&cfg, Some(170), |_| false),
-            vec![("MESA_VK_WSI_PRESENT_MODE".to_string(), "immediate".to_string()), ("DXVK_FRAME_RATE".to_string(), "170".to_string())]
+            vec![("MESA_VK_WSI_PRESENT_MODE".to_string(), "mailbox".to_string()), ("DXVK_FRAME_RATE".to_string(), "170".to_string())]
         );
         // No display to ask: a sane fixed cap rather than none.
         assert_eq!(game_env(&cfg, None, |_| false)[1].1, "60");
         // A configured cap beats the display.
-        let cfg = LaunchConfig { immediate_present: true, frame_rate: Some(90) };
+        let cfg = LaunchConfig { unlocked_present: true, frame_rate: Some(90) };
         assert_eq!(game_env(&cfg, Some(170), |_| false)[1].1, "90");
     }
 
@@ -297,11 +313,11 @@ mod tests {
         let cfg = LaunchConfig::default();
         assert_eq!(game_env(&cfg, Some(60), |name| name == "MESA_VK_WSI_PRESENT_MODE"), vec![("DXVK_FRAME_RATE".to_string(), "60".to_string())]);
         assert_eq!(game_env(&cfg, Some(60), |_| true), vec![]);
-        // Immediate present off: leave the game alone entirely…
-        let cfg = LaunchConfig { immediate_present: false, frame_rate: None };
+        // Unlocked present off: leave the game alone entirely…
+        let cfg = LaunchConfig { unlocked_present: false, frame_rate: None };
         assert_eq!(game_env(&cfg, Some(60), |_| false), vec![]);
         // …unless a cap was asked for outright.
-        let cfg = LaunchConfig { immediate_present: false, frame_rate: Some(72) };
+        let cfg = LaunchConfig { unlocked_present: false, frame_rate: Some(72) };
         assert_eq!(game_env(&cfg, Some(60), |_| false), vec![("DXVK_FRAME_RATE".to_string(), "72".to_string())]);
     }
 

@@ -140,15 +140,21 @@ impl Default for TunnelConfig {
 /// frame callbacks from the compositor, and a vsynced Vulkan swapchain
 /// (EVE's default *Present Interval: One*) blocks on them, so the covered
 /// client stops drawing and its thumbnail freezes on the last frame. The
-/// fix is on the game side: present without waiting for the callback, and
-/// cap the frame rate so "no vsync" does not mean "as fast as possible".
+/// fix is on the game side: present in a mode that never waits for the
+/// callback, and cap the frame rate so "no vsync" does not mean "as fast
+/// as possible".
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LaunchConfig {
-    /// Set `MESA_VK_WSI_PRESENT_MODE=immediate` for the game unless the
-    /// launch line already sets it. The compositor still vsyncs the screen,
-    /// so nothing tears; the client just never blocks on a frame callback.
-    pub immediate_present: bool,
+    /// Set `MESA_VK_WSI_PRESENT_MODE=mailbox` for the game unless the
+    /// launch line already sets it. Mailbox is the one unthrottled mode
+    /// every Wayland compositor gets from Mesa (`immediate` needs
+    /// `wp_tearing_control_v1`, which COSMIC lacks, and Mesa rejects an
+    /// unsupported override); the compositor still vsyncs the screen, so
+    /// nothing tears; the client just never blocks on a frame callback.
+    /// v0.1.2 called this `immediate_present`; that spelling still parses.
+    #[serde(alias = "immediate_present")]
+    pub unlocked_present: bool,
     /// Frame-rate cap for the game (`DXVK_FRAME_RATE`), 10..=1000. `None`
     /// means the fastest refresh rate among the connected displays, so the
     /// focused client runs as it would with vsync; 60 if that cannot be
@@ -158,7 +164,7 @@ pub struct LaunchConfig {
 
 impl Default for LaunchConfig {
     fn default() -> Self {
-        Self { immediate_present: true, frame_rate: None }
+        Self { unlocked_present: true, frame_rate: None }
     }
 }
 
@@ -744,18 +750,21 @@ mod tests {
 
     /// Daniel, 2026-09-16: the covered fullscreen client stopped drawing,
     /// so its thumbnail froze. The launch section defaults to the fix
-    /// (immediate present, cap = display refresh), an older config.ron
-    /// without it still parses, and a nonsense cap falls back.
+    /// (unlocked present, cap = display refresh), an older config.ron
+    /// without it still parses, one written by v0.1.2 (which called the
+    /// flag `immediate_present`) still parses, and a nonsense cap falls back.
     #[test]
     fn launch_defaults_parse_from_an_older_config_and_a_bad_cap_falls_back() {
         let d = LaunchConfig::default();
-        assert!(d.immediate_present);
+        assert!(d.unlocked_present);
         assert_eq!(d.frame_rate, None);
         let c: Config = ron::from_str("(tunnel: (location: \"Amsterdam\"))").unwrap();
         assert_eq!(c.launch, LaunchConfig::default());
-        let c: Config = ron::from_str("(launch: (immediate_present: false, frame_rate: Some(120)))").unwrap();
-        assert!(!c.launch.immediate_present);
+        let c: Config = ron::from_str("(launch: (unlocked_present: false, frame_rate: Some(120)))").unwrap();
+        assert!(!c.launch.unlocked_present);
         assert_eq!(c.launch.frame_rate, Some(120));
+        let c: Config = ron::from_str("(launch: (immediate_present: false))").unwrap();
+        assert!(!c.launch.unlocked_present, "the v0.1.2 spelling of the flag still parses");
         for bad in [0, 9, 1001] {
             let mut c = Config::default();
             c.launch.frame_rate = Some(bad);

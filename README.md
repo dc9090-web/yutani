@@ -71,7 +71,7 @@ Yutani is written in Rust against the protocols COSMIC ships today. Nothing is e
 - 🖥️ **Full-screen, windowed, or fixed.** The overlay is a layer-shell surface, so it sits above a full-screen client just as happily as over a window. *Dock* mode is the fixed-position option for people who never want to drag.
 - 👁️ **Show only when it matters.** Always on, or only while an EVE client has focus. Optionally hide the thumbnail of the client you are currently in.
 - 🧼 **Clean clients.** `WINE_NO_WM_DECORATION=1` removes Wine's title bar; COSMIC draws the frame, or none at all in full screen.
-- 🎞️ **Live even when covered.** A full-screen client hidden under another gets no frame callbacks from the compositor, and with vsync on it simply stops drawing, so its thumbnail would freeze. `yutani launch` starts each client presenting immediately instead, with DXVK's frame limiter set to your fastest display's refresh rate so nothing runs flat out. Both are plain environment variables; set either one on the launch line yourself and Yutani leaves it alone, or tune them under `launch` in `config.ron`.
+- 🎞️ **Live even when covered.** A full-screen client hidden under another gets no frame callbacks from the compositor, and with vsync on it simply stops drawing, so its thumbnail would freeze. `yutani launch` starts each client in Mesa's mailbox present mode instead, which never waits for that callback, with DXVK's frame limiter set to your fastest display's refresh rate so nothing runs flat out. Both are plain environment variables; set either one on the launch line yourself and Yutani leaves it alone, or tune them under `launch` in `config.ron`.
 - 🎨 **Follows your theme.** The active border defaults to COSMIC's accent colour, the same one the compositor outlines the focused window with.
 
 ---
@@ -187,11 +187,11 @@ PROTON_ENABLE_WAYLAND=1 WINE_NO_WM_DECORATION=1 yutani launch -- %command%
 
 `PROTON_ENABLE_WAYLAND=1` gives each client a native Wayland toplevel that Yutani can capture, `WINE_NO_WM_DECORATION=1` stops Wine drawing its own title bar, and `yutani launch` starts the game inside the tunnel's cgroup. Spell the path out (`/usr/bin/yutani launch -- %command%`) if Steam cannot find `yutani` on `PATH`.
 
-`yutani launch` also adds `MESA_VK_WSI_PRESENT_MODE=immediate` and `DXVK_FRAME_RATE=<your fastest display's refresh rate>` to the game's environment, so a client covered by another full-screen client keeps rendering (its thumbnail stays live) without running the GPU flat out. The compositor still vsyncs the screen, so nothing tears. A value you put on the launch line yourself wins, and both knobs live under `launch` in `~/.config/yutani/config.ron`:
+`yutani launch` also adds `MESA_VK_WSI_PRESENT_MODE=mailbox` and `DXVK_FRAME_RATE=<your fastest display's refresh rate>` to the game's environment, so a client covered by another full-screen client keeps rendering (its thumbnail stays live) without running the GPU flat out. The compositor still vsyncs the screen, so nothing tears. (Not `immediate`: Mesa only offers that on compositors with tearing control, COSMIC has none, and a rejected override leaves the game stuck in vsync.) A value you put on the launch line yourself wins, and both knobs live under `launch` in `~/.config/yutani/config.ron`:
 
 ```ron
 launch: (
-    immediate_present: true,   // false: leave the game's present mode alone
+    unlocked_present: true,    // false: leave the game's present mode alone
     frame_rate: None,          // Some(120) for a fixed cap; None follows the display
 ),
 ```
