@@ -32,13 +32,131 @@
 //! is missing, `systemd-run` cannot exec it and exits with its own "command
 //! not found" code (1), which then looks exactly like a game that exited 1
 //! — we cannot tell those apart from here.
+//!
+//! Before either path, the game's environment gets what
+//! [`LaunchConfig`](yutani::model::config::LaunchConfig) asks for: present
+//! mode and frame-rate cap (see [`game_env`]). A fullscreen client covered
+//! by another gets no frame callbacks from the compositor, and a vsynced
+//! swapchain blocks on them, so without this the covered client stops
+//! drawing and its thumbnail freezes.
 
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode, Output};
 use std::time::Duration;
 
+use cosmic::cctk::sctk::{
+    delegate_output, delegate_registry,
+    output::{OutputHandler, OutputState},
+    reexports::client::{Connection, QueueHandle, globals::registry_queue_init, protocol::wl_output},
+    registry::{ProvidesRegistryState, RegistryState},
+    registry_handlers,
+};
+use yutani::model::config::{Config, LaunchConfig};
+
 use crate::tunnel::SLICE;
+
+/// `MESA_VK_WSI_PRESENT_MODE=immediate`: Mesa's Vulkan WSI presents without
+/// waiting for the compositor's frame callback (which never comes for a
+/// covered surface). The compositor still vsyncs the screen, so this does
+/// not tear; it only stops the client blocking.
+pub const PRESENT_MODE_VAR: &str = "MESA_VK_WSI_PRESENT_MODE";
+/// DXVK's own frame limiter, so "no vsync" does not mean "as fast as the
+/// GPU can go" for every client at once.
+pub const FRAME_RATE_VAR: &str = "DXVK_FRAME_RATE";
+/// The cap when neither the config nor the compositor names one.
+pub const FALLBACK_FRAME_RATE: u32 = 60;
+
+/// The variables to add to the game's environment, given the config, the
+/// fastest connected display's refresh rate (if it could be read) and
+/// whether the launch line already sets a variable (then it wins: the user
+/// wrote it on purpose). Pure, so the rules are testable without a
+/// compositor or a game.
+pub fn game_env(config: &LaunchConfig, display_hz: Option<u32>, already_set: impl Fn(&str) -> bool) -> Vec<(String, String)> {
+    let mut vars = Vec::new();
+    if config.immediate_present && !already_set(PRESENT_MODE_VAR) {
+        vars.push((PRESENT_MODE_VAR.to_string(), "immediate".to_string()));
+    }
+    // A cap only matters once vsync no longer paces the client, unless the
+    // user asked for one outright.
+    if (config.immediate_present || config.frame_rate.is_some()) && !already_set(FRAME_RATE_VAR) {
+        let cap = config.frame_rate.or(display_hz).unwrap_or(FALLBACK_FRAME_RATE);
+        vars.push((FRAME_RATE_VAR.to_string(), cap.to_string()));
+    }
+    vars
+}
+
+/// The highest current refresh rate among the given outputs' modes, in
+/// whole Hz (`59_997` mHz → 60), or `None` if nothing reports one.
+pub fn fastest_refresh_hz(current_modes_mhz: impl IntoIterator<Item = i32>) -> Option<u32> {
+    current_modes_mhz
+        .into_iter()
+        .filter(|&mhz| mhz > 0)
+        .map(|mhz| ((mhz as u32) + 500) / 1000)
+        .filter(|&hz| hz > 0)
+        .max()
+}
+
+struct DisplayProbe {
+    registry: RegistryState,
+    outputs: OutputState,
+}
+
+impl OutputHandler for DisplayProbe {
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.outputs
+    }
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+}
+
+impl ProvidesRegistryState for DisplayProbe {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry
+    }
+    registry_handlers!(OutputState);
+}
+
+delegate_output!(DisplayProbe);
+delegate_registry!(DisplayProbe);
+
+/// Ask the compositor for every output's current mode: two round trips on
+/// a throw-away connection, milliseconds on a live compositor. `None` when
+/// there is no Wayland display to ask (or it answers nothing useful); the
+/// game must start either way.
+fn display_refresh_hz() -> Option<u32> {
+    let conn = Connection::connect_to_env().ok()?;
+    let (globals, mut queue) = registry_queue_init::<DisplayProbe>(&conn).ok()?;
+    let qh = queue.handle();
+    let mut probe = DisplayProbe { registry: RegistryState::new(&globals), outputs: OutputState::new(&globals, &qh) };
+    // One round trip binds the outputs, the next collects their modes.
+    queue.roundtrip(&mut probe).ok()?;
+    queue.roundtrip(&mut probe).ok()?;
+    let modes: Vec<i32> = probe
+        .outputs
+        .outputs()
+        .filter_map(|o| probe.outputs.info(&o))
+        .flat_map(|info| info.modes.into_iter().filter(|m| m.current).map(|m| m.refresh_rate))
+        .collect();
+    fastest_refresh_hz(modes)
+}
+
+/// Put [`game_env`]'s variables into this process's environment, which both
+/// exec paths hand to the game, and say so once on stderr (Steam keeps it).
+fn prepare_game_env(config: &LaunchConfig) {
+    let display_hz = if config.immediate_present && config.frame_rate.is_none() { display_refresh_hz() } else { None };
+    let vars = game_env(config, display_hz, |name| std::env::var_os(name).is_some());
+    if vars.is_empty() {
+        return;
+    }
+    let shown: Vec<String> = vars.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    eprintln!("yutani launch: {}", shown.join(" "));
+    for (k, v) in vars {
+        // Single-threaded here, before anything is spawned.
+        unsafe { std::env::set_var(k, v) };
+    }
+}
 
 /// Wall-clock bound on the preflight. The game is waiting behind it, so it
 /// is deliberately short: a manager that cannot answer in two seconds is
@@ -134,6 +252,7 @@ pub fn run(command: Vec<String>) -> ExitCode {
         eprintln!("yutani launch: nothing to run (usage: yutani launch -- <command…>)");
         return ExitCode::from(2);
     }
+    prepare_game_env(&Config::load().launch);
     let preflight = run_preflight();
     let answer = preflight.as_ref().ok().and_then(|o| o.as_ref());
     if should_wrap(answer) {
@@ -153,6 +272,45 @@ mod tests {
 
     fn output(code: i32, stdout: &[u8]) -> Output {
         Output { status: ExitStatus::from_raw(code << 8), stdout: stdout.to_vec(), stderr: Vec::new() }
+    }
+
+    /// Daniel, 2026-09-16: two fullscreen clients on one display, the one
+    /// underneath drew nothing (0 GPU time) until raised, so its thumbnail
+    /// was a still image. Immediate present keeps it drawing; the cap keeps
+    /// that from meaning "flat out"; a variable on the launch line wins.
+    #[test]
+    fn the_game_gets_immediate_present_and_a_cap_from_the_display() {
+        let cfg = LaunchConfig::default();
+        assert_eq!(
+            game_env(&cfg, Some(170), |_| false),
+            vec![("MESA_VK_WSI_PRESENT_MODE".to_string(), "immediate".to_string()), ("DXVK_FRAME_RATE".to_string(), "170".to_string())]
+        );
+        // No display to ask: a sane fixed cap rather than none.
+        assert_eq!(game_env(&cfg, None, |_| false)[1].1, "60");
+        // A configured cap beats the display.
+        let cfg = LaunchConfig { immediate_present: true, frame_rate: Some(90) };
+        assert_eq!(game_env(&cfg, Some(170), |_| false)[1].1, "90");
+    }
+
+    #[test]
+    fn the_launch_line_wins_and_vsync_users_get_nothing_they_did_not_ask_for() {
+        let cfg = LaunchConfig::default();
+        assert_eq!(game_env(&cfg, Some(60), |name| name == "MESA_VK_WSI_PRESENT_MODE"), vec![("DXVK_FRAME_RATE".to_string(), "60".to_string())]);
+        assert_eq!(game_env(&cfg, Some(60), |_| true), vec![]);
+        // Immediate present off: leave the game alone entirely…
+        let cfg = LaunchConfig { immediate_present: false, frame_rate: None };
+        assert_eq!(game_env(&cfg, Some(60), |_| false), vec![]);
+        // …unless a cap was asked for outright.
+        let cfg = LaunchConfig { immediate_present: false, frame_rate: Some(72) };
+        assert_eq!(game_env(&cfg, Some(60), |_| false), vec![("DXVK_FRAME_RATE".to_string(), "72".to_string())]);
+    }
+
+    #[test]
+    fn the_fastest_current_mode_wins_rounded_to_whole_hz() {
+        assert_eq!(fastest_refresh_hz([59_997, 170_001]), Some(170));
+        assert_eq!(fastest_refresh_hz([60_000]), Some(60));
+        assert_eq!(fastest_refresh_hz([0, -1]), None);
+        assert_eq!(fastest_refresh_hz([]), None);
     }
 
     #[test]

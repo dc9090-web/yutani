@@ -132,6 +132,36 @@ impl Default for TunnelConfig {
     }
 }
 
+/// How `yutani launch` starts the game: the environment it adds so a client
+/// hidden under another keeps rendering (its thumbnail stays live) without
+/// running the GPU flat out.
+///
+/// A fullscreen EVE window that another fullscreen window covers gets no
+/// frame callbacks from the compositor, and a vsynced Vulkan swapchain
+/// (EVE's default *Present Interval: One*) blocks on them, so the covered
+/// client stops drawing and its thumbnail freezes on the last frame. The
+/// fix is on the game side: present without waiting for the callback, and
+/// cap the frame rate so "no vsync" does not mean "as fast as possible".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LaunchConfig {
+    /// Set `MESA_VK_WSI_PRESENT_MODE=immediate` for the game unless the
+    /// launch line already sets it. The compositor still vsyncs the screen,
+    /// so nothing tears; the client just never blocks on a frame callback.
+    pub immediate_present: bool,
+    /// Frame-rate cap for the game (`DXVK_FRAME_RATE`), 10..=1000. `None`
+    /// means the fastest refresh rate among the connected displays, so the
+    /// focused client runs as it would with vsync; 60 if that cannot be
+    /// read. Ignored when the launch line sets `DXVK_FRAME_RATE` itself.
+    pub frame_rate: Option<u32>,
+}
+
+impl Default for LaunchConfig {
+    fn default() -> Self {
+        Self { immediate_present: true, frame_rate: None }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -174,6 +204,8 @@ pub struct Config {
     pub shortcuts: ShortcutsConfig,
     /// EVE-only WireGuard tunnel.
     pub tunnel: TunnelConfig,
+    /// What `yutani launch` adds to the game's environment.
+    pub launch: LaunchConfig,
     /// EVE's profile directory (the one holding `core_char_*.dat`), when
     /// Steam's library list cannot find it. Absolute path.
     pub eve_settings_dir: Option<String>,
@@ -200,6 +232,7 @@ impl Default for Config {
             dock_edge: Edge::Top,
             shortcuts: ShortcutsConfig::default(),
             tunnel: TunnelConfig::default(),
+            launch: LaunchConfig::default(),
             eve_settings_dir: None,
         }
     }
@@ -285,6 +318,10 @@ impl Config {
         check!(corner_radius, |v: &u32| *v <= 64, "0..=64");
         check!(active_border, |v: &Option<String>| v.as_deref().is_none_or(|h| parse_color(h).is_some()), "#rrggbb[aa] or absent");
         check!(inactive_border, |v: &String| parse_color(v).is_some(), "#rrggbb[aa]");
+        if self.launch.frame_rate.is_some_and(|v| !(10..=1000).contains(&v)) {
+            tracing::warn!("config: launch.frame_rate {:?} is invalid (10..=1000); using default", self.launch.frame_rate);
+            self.launch.frame_rate = d.launch.frame_rate;
+        }
         if self.app_ids.is_empty() {
             tracing::warn!("config: app_ids is empty; using default");
             self.app_ids = d.app_ids.clone();
@@ -703,6 +740,30 @@ mod tests {
             ron::from_str("(tunnel: (dns_servers: [\"8.8.8.8\"], dns_domains: [\"example.net\"]))").unwrap();
         assert_eq!(c.tunnel.dns_servers, vec![Ipv4Addr::new(8, 8, 8, 8)]);
         assert_eq!(c.tunnel.dns_domains, vec!["example.net"]);
+    }
+
+    /// Daniel, 2026-09-16: the covered fullscreen client stopped drawing,
+    /// so its thumbnail froze. The launch section defaults to the fix
+    /// (immediate present, cap = display refresh), an older config.ron
+    /// without it still parses, and a nonsense cap falls back.
+    #[test]
+    fn launch_defaults_parse_from_an_older_config_and_a_bad_cap_falls_back() {
+        let d = LaunchConfig::default();
+        assert!(d.immediate_present);
+        assert_eq!(d.frame_rate, None);
+        let c: Config = ron::from_str("(tunnel: (location: \"Amsterdam\"))").unwrap();
+        assert_eq!(c.launch, LaunchConfig::default());
+        let c: Config = ron::from_str("(launch: (immediate_present: false, frame_rate: Some(120)))").unwrap();
+        assert!(!c.launch.immediate_present);
+        assert_eq!(c.launch.frame_rate, Some(120));
+        for bad in [0, 9, 1001] {
+            let mut c = Config::default();
+            c.launch.frame_rate = Some(bad);
+            assert_eq!(c.validate().launch.frame_rate, None, "{bad}");
+        }
+        let mut c = Config::default();
+        c.launch.frame_rate = Some(10);
+        assert_eq!(c.validate().launch.frame_rate, Some(10));
     }
 
     #[test]
