@@ -90,18 +90,25 @@ impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Sparkline {
 
     fn draw(&self, _: &(), renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
+        // The dots are laid out on the handoff's 240 px track; the row
+        // leaves the sparkline less than that on a 360 px popover, so the
+        // track is scaled to the width it actually got rather than clipped
+        // (which hid the newest samples at its right end).
+        let w = bounds.width;
+        let sx = w / SPARK_W;
         let base = SPARK_H - 0.5;
-        frame.stroke(&Path::line(Point::new(0.0, base), Point::new(SPARK_W, base)), Stroke::default().with_color(LINE).with_width(1.0));
+        frame.stroke(&Path::line(Point::new(0.0, base), Point::new(w, base)), Stroke::default().with_color(LINE).with_width(1.0));
         if self.live {
             // The average: white 30 %, dashed 1 4.
             let mut x = 0.0;
-            while x < SPARK_W {
+            while x < w {
                 frame.fill_rectangle(Point::new(x, self.avg_y - 0.5), Size::new(1.0, 1.0), alpha(WHITE, 0.3));
                 x += 5.0;
             }
         }
         for d in &self.dots {
-            frame.fill_rectangle(Point::new(d.x, d.y), Size::new(d.size, d.size), alpha(self.color, d.opacity));
+            let x = (d.x * sx).min(w - d.size);
+            frame.fill_rectangle(Point::new(x, d.y), Size::new(d.size, d.size), alpha(self.color, d.opacity));
         }
         vec![frame.into_geometry()]
     }

@@ -243,12 +243,13 @@ pub const SCOPE_BAND_PX: i32 = 105;
 /// geometry (iced does not lay a popup out before it opens). Measured on the
 /// panel on 2026-10-07: the real popover was 679 px tall for running, tunnel
 /// connected, 0 clients (`Accounts::Empty`), menu closed, no notice, no
-/// note, scope shown.
+/// note, scope shown — before Phase 2 moved JIT · LOSS under MIN/AVG/MAX,
+/// which adds one 8 px stat line (+10) to the ping row.
 pub fn console_height(c: &Console, menu_open: bool) -> i32 {
     const HEADER: i32 = 48;
     const SECTION_HEAD: i32 = 23;
     const CONTROL: i32 = 2 * 46 + 1 + 2;
-    const PING_AND_FACTS: i32 = 50 + 1 + 27 + 2;
+    const PING_AND_FACTS: i32 = 60 + 1 + 27 + 2;
     const HOST: i32 = 9 + 3 * 14 + 2 * 6 + 9 + 2;
     const ACTION: i32 = 36;
     const MENU: i32 = 1 + 2 * 5 + 3 * 28 + 2;
@@ -483,7 +484,8 @@ mod tests {
         assert_eq!((row.sub.as_str(), row.rocker, row.press), ("IDLE · LONDON", RockerState::Off, Some(Action::Connect)));
     }
 
-    /// Measured on the panel (2026-10-07): 679 px.
+    /// Measured on the panel (2026-10-07): 679 px, plus the Phase 2 stat
+    /// line: 689.
     #[test]
     fn the_height_estimate_matches_the_measured_popover() {
         let (h, p) = (HostReading::default(), PingWindow::default());
@@ -491,7 +493,7 @@ mod tests {
         assert_eq!(c.accounts, Accounts::Empty);
         assert!(c.notice.is_none() && c.network.scope);
         let est = console_height(&c, false);
-        assert!((est - 679).abs() <= 10, "{est}");
+        assert!((est - 689).abs() <= 10, "{est}");
     }
 
     #[test]

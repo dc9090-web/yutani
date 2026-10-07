@@ -11,7 +11,7 @@ use yutani::applet::Action;
 use yutani::applet::console::{AccountRow, Accounts, Console, ControlRow, Gauge, LaunchButton, Level, Network};
 use yutani::applet::fonts::{self, advance_em};
 use yutani::applet::menu::MenuRow;
-use yutani::applet::ping::{Quality, SPARK_H, SPARK_W};
+use yutani::applet::ping::{Quality, SPARK_H};
 use yutani::applet::sand::Drive;
 use yutani::applet::skin::{self, Ink, PrimaryLook, Type};
 
@@ -281,14 +281,14 @@ fn ping_row<'a>(n: &Network) -> Element<'a, Msg> {
     let middle = Column::new()
         .width(Length::Fill)
         .spacing(4)
-        .push(layered(spark, Length::Fixed(SPARK_W), Length::Fixed(SPARK_H)))
-        .push(t(p.stats.clone(), skin::PING_STATS, skin::DIM));
-    let right = Column::new()
-        .width(Length::Fixed(skin::PING_RIGHT_W))
-        .spacing(4)
-        .align_x(Alignment::End)
-        .push(Row::new().spacing(6).align_y(Alignment::Center).push(t(p.quality.word(), skin::QUALITY_WORD, q)).push(led(q, false, 6.0)))
+        .push(layered(spark, Length::Fill, Length::Fixed(SPARK_H)))
+        .push(t(p.stats.clone(), skin::PING_STATS, skin::DIM))
         .push(t(p.jitter_loss.clone(), skin::PING_STATS, skin::DIM));
+    // The quality word alone on the right; JIT · LOSS sits under the
+    // MIN/AVG/MAX line instead. The handoff's three columns (64 · 240 · 74)
+    // do not fit a 360 px popover with three-digit pings: the sparkline was
+    // clipped and both stat lines wrapped.
+    let right = Row::new().spacing(6).align_y(Alignment::Center).push(t(p.quality.word(), skin::QUALITY_WORD, q)).push(led(q, false, 6.0));
     Row::new().width(Length::Fill).padding(skin::ROW_PAD).spacing(skin::ROW_GAP).align_y(Alignment::Center).push(left).push(middle).push(right).into()
 }
 

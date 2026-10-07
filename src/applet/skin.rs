@@ -108,7 +108,6 @@ pub const SCOPE_HEIGHT: f32 = 104.0;
 pub const SCOPE_INSET: f32 = 12.0;
 pub const CORNER_MARK_PX: f32 = 7.0;
 pub const PING_LEFT_W: f32 = 64.0;
-pub const PING_RIGHT_W: f32 = 74.0;
 pub const FACTS_PAD: Padding = pad(7.0, 12.0, 8.0, 12.0);
 
 pub const HOST_PAD: Padding = pad(8.0, 12.0, 9.0, 12.0);
