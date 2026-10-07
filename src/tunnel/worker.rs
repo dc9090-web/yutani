@@ -5,6 +5,8 @@
 use anyhow::{Context as _, anyhow};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::conf::WgConf;
@@ -604,11 +606,16 @@ async fn serve(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut exit = ExitIp::new();
     // PING · TQ: the probe runs on its own thread and stops when this drops.
+    // It probes only while `wanted`, which follows the daemon's lease. Tests
+    // never start it: `serve` under test must do no network I/O.
     let latest = super::probe::Latest::default();
-    let _probe = super::probe::spawn(loaded.conf.address, latest.clone());
+    let wanted = Arc::new(AtomicBool::new(false));
+    let lease = super::ping_lease_path(loaded.uid);
+    let _probe = if cfg!(test) { None } else { super::probe::spawn(loaded.conf.address, latest.clone(), wanted.clone()) };
     loop {
         tokio::select! {
             _ = tick.tick() => {
+                wanted.store(super::lease_fresh(&lease, SystemTime::now()), Ordering::Relaxed);
                 keep_route(x, link_is_up());
                 slice.tick(x, loaded, now_unix());
                 if let Err(e) = write_status(x, &loaded.conf, since, &mut exit, latest.get()) {

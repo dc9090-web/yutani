@@ -73,6 +73,39 @@ pub const UNIT_NAME: &str = "yutani-tunnel.service";
 pub const UNIT_PATH: &str = "/etc/systemd/system/yutani-tunnel.service";
 pub const POLKIT_PATH: &str = "/etc/polkit-1/rules.d/50-yutani-tunnel.rules";
 
+/// How long a touch of the ping lease keeps the probe running. The applet
+/// polls status at least every 5 s, so a daemon that renews on each poll
+/// never lets it lapse while it is wanted.
+pub const PING_LEASE_S: u64 = 10;
+const PING_LEASE_NAME: &str = "yutani-ping.lease";
+
+/// `/run/user/<uid>/yutani-ping.lease`: the daemon (as the user) keeps
+/// its mtime fresh while the ping is wanted; the root worker only
+/// `symlink_metadata`s it, never opens it.
+pub fn ping_lease_path(uid: u32) -> std::path::PathBuf {
+    ping_lease_in(std::path::Path::new(&format!("/run/user/{uid}")))
+}
+
+/// The lease inside a runtime directory: the daemon builds it from
+/// `$XDG_RUNTIME_DIR`, which the systemd user unit sets to `/run/user/<uid>`.
+pub fn ping_lease_in(runtime_dir: &std::path::Path) -> std::path::PathBuf {
+    runtime_dir.join(PING_LEASE_NAME)
+}
+
+/// Fresh = exists, mtime within PING_LEASE_S of `now`; a future mtime
+/// (clock step) counts as fresh; any error = not fresh. Metadata only —
+/// `path` is user-writable and this runs as root, so it is never opened
+/// and a symlink is not followed.
+pub fn lease_fresh(path: &std::path::Path, now: std::time::SystemTime) -> bool {
+    let Ok(mtime) = std::fs::symlink_metadata(path).and_then(|m| m.modified()) else {
+        return false;
+    };
+    match now.duration_since(mtime) {
+        Ok(age) => age.as_secs() < PING_LEASE_S,
+        Err(_) => true, // mtime is in the future
+    }
+}
+
 /// Write `path` with exactly `mode`, atomically.
 ///
 /// The temporary is created in the target's directory with `mode` from the
@@ -178,6 +211,40 @@ mod tests {
             assert!(!usable_dns_server(&bad.parse().unwrap()), "{bad} cannot be reached from the exit node");
         }
         assert!(DEFAULT_DNS_SERVERS.iter().all(usable_dns_server), "the defaults must pass their own check");
+    }
+
+    #[test]
+    fn the_worker_and_the_daemon_name_the_same_lease() {
+        assert_eq!(ping_lease_path(1000), std::path::PathBuf::from("/run/user/1000/yutani-ping.lease"));
+        assert_eq!(ping_lease_in(std::path::Path::new("/run/user/1000")), ping_lease_path(1000));
+    }
+
+    #[test]
+    fn a_lease_is_fresh_for_its_term_and_through_a_clock_step() {
+        use std::time::{Duration, SystemTime};
+        let dir = temp_dir("lease");
+        let path = dir.join("yutani-ping.lease");
+        let now = SystemTime::now();
+        // Missing.
+        assert!(!lease_fresh(&path, now));
+        // Just written.
+        std::fs::write(&path, "").unwrap();
+        assert!(lease_fresh(&path, SystemTime::now()));
+        let set = |t: SystemTime| std::fs::File::options().write(true).open(&path).unwrap().set_modified(t).unwrap();
+        // Old.
+        set(now - Duration::from_secs(PING_LEASE_S + 1));
+        assert!(!lease_fresh(&path, now));
+        set(now - Duration::from_secs(PING_LEASE_S - 2));
+        assert!(lease_fresh(&path, now));
+        // Future (the clock stepped back).
+        set(now + Duration::from_secs(3600));
+        assert!(lease_fresh(&path, now));
+        // A symlink to a fresh file is judged by the link itself, not followed.
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        let link_mtime = std::fs::symlink_metadata(&link).unwrap().modified().unwrap();
+        assert!(!lease_fresh(&link, link_mtime + Duration::from_secs(PING_LEASE_S + 1)));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
