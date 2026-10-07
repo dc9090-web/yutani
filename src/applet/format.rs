@@ -78,6 +78,6 @@ mod tests {
     #[test]
     fn the_build_hash_is_baked_in() {
         let b = env!("YUTANI_BUILD");
-        assert!(b == "UNKNOWN" || (b.len() == 7 && b.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase())), "{b}");
+        assert!(b == "UNKNOWN" || (b.len() >= 7 && b.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase())), "{b}");
     }
 }

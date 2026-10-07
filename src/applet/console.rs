@@ -165,6 +165,8 @@ enum TunnelState {
     Stale,
     Connected,
     Idle,
+    /// systemd reports the tunnel unit failed.
+    Failed,
 }
 
 fn tunnel_state(status: Option<&Status>, pending: Option<bool>) -> TunnelState {
@@ -176,7 +178,12 @@ fn tunnel_state(status: Option<&Status>, pending: Option<bool>) -> TunnelState {
     if pending == Some(true) && !t.connected {
         return TunnelState::Connecting;
     }
+    if pending == Some(false) && t.connected {
+        // Disconnect pressed: show it at once, not when the poll catches up.
+        return TunnelState::Idle;
+    }
     match (t.connected, t.handshake_age_s) {
+        (false, _) if t.failed => TunnelState::Failed,
         (false, _) => TunnelState::Idle,
         (true, None) if t.up_for_s.is_none_or(|up| up < HANDSHAKE_STALE_S) => TunnelState::Connecting,
         (true, None) => TunnelState::Stale,
@@ -194,10 +201,11 @@ fn tunnel_row(state: TunnelState, location: &str) -> ControlRow {
         TunnelState::Stale => (format!("{loc} · HANDSHAKE STALE"), Ink::Amber, RockerState::On, Some(Action::Disconnect)),
         TunnelState::Connected => (format!("CONNECTED · {loc}"), Ink::Dim, RockerState::On, Some(Action::Disconnect)),
         TunnelState::Idle => (format!("IDLE · {loc}"), Ink::Dimmer, RockerState::Off, Some(Action::Connect)),
+        TunnelState::Failed => (format!("TUNNEL FAILED · {loc}"), Ink::Amber, RockerState::Off, Some(Action::Connect)),
     };
     let led = match state {
         TunnelState::Connected => Ink::Phosphor,
-        TunnelState::Connecting | TunnelState::Stale => Ink::Amber,
+        TunnelState::Connecting | TunnelState::Stale | TunnelState::Failed => Ink::Amber,
         _ => Ink::Dimmer,
     };
     ControlRow { title: "WIREGUARD TUNNEL", sub, sub_ink: ink, led, glow: state == TunnelState::Connected, rocker, press }
@@ -232,8 +240,10 @@ fn service_row(running: bool, pending: bool) -> ControlRow {
 pub const SCOPE_BAND_PX: i32 = 105;
 
 /// The popover's height in logical px, estimated from the handoff's
-/// geometry (iced does not lay a popup out before it opens). Verified
-/// against a screenshot in Task 11; adjust the section constants there.
+/// geometry (iced does not lay a popup out before it opens). Measured on the
+/// panel on 2026-10-07: the real popover was 679 px tall for running, tunnel
+/// connected, 0 clients (`Accounts::Empty`), menu closed, no notice, no
+/// note, scope shown.
 pub fn console_height(c: &Console, menu_open: bool) -> i32 {
     const HEADER: i32 = 48;
     const SECTION_HEAD: i32 = 23;
@@ -261,6 +271,19 @@ pub fn console_height(c: &Console, menu_open: bool) -> i32 {
         + ACTION + GAP
         + menu
         + FOOTER
+}
+
+/// The Steam notice, shouted like the rest of the popover, except that a
+/// filesystem path inside it keeps its case (paths are case-sensitive).
+fn steam_notice(findings: &[crate::steam::Finding]) -> Option<String> {
+    use crate::steam::Verdict;
+    let f = findings.iter().find(|f| f.verdict.message().is_some())?;
+    let msg = f.verdict.message()?;
+    let mut shouted = msg.to_uppercase();
+    if let Verdict::Broken { path } = &f.verdict {
+        shouted = shouted.replace(&path.to_uppercase(), path);
+    }
+    Some(format!("{shouted} OPEN SETTINGS → STEAM."))
 }
 
 pub fn console(status: Option<&Status>, i: &Inputs) -> Console {
@@ -294,9 +317,7 @@ pub fn console(status: Option<&Status>, i: &Inputs) -> Console {
         _ => ("IDLE".to_string(), Ink::Dimmer),
     };
     let ram_total = i.host.ram_total.map_or_else(|| DASH.to_string(), format::gb_ceil);
-    let notice = status
-        .and_then(|s| crate::steam::first_message(&s.steam))
-        .map(|m| format!("{} OPEN SETTINGS → STEAM.", m.to_uppercase()));
+    let notice = status.and_then(|s| steam_notice(&s.steam));
     let mut c = Console {
         running,
         state_word: if running { "RUNNING" } else { "STOPPED" },
@@ -315,7 +336,7 @@ pub fn console(status: Option<&Status>, i: &Inputs) -> Console {
             scope: true,
             ping: i.ping.summary(live),
             endpoint,
-            peer: t.map_or_else(|| crate::tunnel::IFACE.to_string(), |t| t.iface.clone()),
+            peer: t.map_or_else(|| DASH.to_string(), |t| t.iface.clone()),
             uptime,
             uptime_ink,
         },
@@ -409,6 +430,7 @@ mod tests {
         assert_eq!((c.control[0].rocker, c.control[0].press), (RockerState::Off, Some(Action::StartDaemon)));
         assert_eq!((c.control[1].sub.as_str(), c.control[1].rocker, c.control[1].press), ("START YUTANI TO ROUTE TRAFFIC", RockerState::Disabled, None));
         assert_eq!(c.accounts, Accounts::Stopped);
+        assert_eq!(c.network.peer, "—", "no service, no interface to name");
         assert_eq!(c.count, None);
         assert_eq!((c.network.up.as_str(), c.network.down.as_str()), ("0", "0"));
         assert_eq!((c.network.endpoint.as_str(), c.network.uptime.as_str(), c.network.uptime_ink), ("—", "IDLE", Ink::Dimmer));
@@ -437,6 +459,37 @@ mod tests {
         assert_eq!(sub(&never, &i).1, Ink::Amber, "up for 3 min without a handshake is stale");
         let pending = Inputs { tunnel_pending: Some(true), ..inputs(&h, &p) };
         assert_eq!(sub(&status(false, None, 0), &pending), ("CONNECTING · LONDON".into(), Ink::Amber, RockerState::Pending));
+    }
+
+    #[test]
+    fn a_failed_unit_reads_failed_and_offers_connect() {
+        let (h, p) = (HostReading::default(), PingWindow::default());
+        let mut s = status(false, None, 0);
+        s.tunnel.failed = true;
+        let c = console(Some(&s), &inputs(&h, &p));
+        let row = &c.control[1];
+        assert_eq!((row.sub.as_str(), row.sub_ink, row.led), ("TUNNEL FAILED · LONDON", Ink::Amber, Ink::Amber));
+        assert_eq!((row.rocker, row.press), (RockerState::Off, Some(Action::Connect)));
+    }
+
+    #[test]
+    fn a_pending_disconnect_shows_idle_at_once() {
+        let (h, p) = (HostReading::default(), PingWindow::default());
+        let i = Inputs { tunnel_pending: Some(false), ..inputs(&h, &p) };
+        let c = console(Some(&status(true, Some(4), 0)), &i);
+        let row = &c.control[1];
+        assert_eq!((row.sub.as_str(), row.rocker, row.press), ("IDLE · LONDON", RockerState::Off, Some(Action::Connect)));
+    }
+
+    /// Measured on the panel (2026-10-07): 679 px.
+    #[test]
+    fn the_height_estimate_matches_the_measured_popover() {
+        let (h, p) = (HostReading::default(), PingWindow::default());
+        let c = console(Some(&status(true, Some(4), 0)), &inputs(&h, &p));
+        assert_eq!(c.accounts, Accounts::Empty);
+        assert!(c.notice.is_none() && c.network.scope);
+        let est = console_height(&c, false);
+        assert!((est - 679).abs() <= 10, "{est}");
     }
 
     #[test]
@@ -475,6 +528,19 @@ mod tests {
         let n = c.notice.expect("notice");
         assert!(n.ends_with("OPEN SETTINGS → STEAM."), "{n}");
         assert_eq!(n, n.to_uppercase());
+    }
+
+    #[test]
+    fn a_path_in_the_steam_notice_keeps_its_case() {
+        use crate::steam::{Finding, Verdict};
+        let (h, p) = (HostReading::default(), PingWindow::default());
+        let mut s = status(true, Some(4), 0);
+        let path = "/home/Daniel/bin/yutani".to_string();
+        s.steam = vec![Finding { verdict: Verdict::Broken { path: path.clone() }, file: std::path::PathBuf::from("/x/localconfig.vdf") }];
+        let n = console(Some(&s), &inputs(&h, &p)).notice.expect("notice");
+        assert!(n.contains(&path), "{n}");
+        assert!(n.starts_with("STEAM LAUNCHES EVE THROUGH /home/Daniel/bin/yutani, WHICH IS MISSING."), "{n}");
+        assert!(n.ends_with("OPEN SETTINGS → STEAM."), "{n}");
     }
 
     /// The scope band is the first (and only) thing to drop on a short screen.
