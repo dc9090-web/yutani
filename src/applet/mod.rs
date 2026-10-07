@@ -12,6 +12,7 @@ pub mod host;
 pub mod icon;
 pub mod install;
 pub mod menu;
+pub mod ping;
 pub mod rate;
 pub mod theme;
 
