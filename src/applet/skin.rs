@@ -35,8 +35,10 @@ pub const FOCUSED_ROW: Color = rgba(0xff, 0xb0, 0x00, 0x14);
 pub const HEADER_PLATE: Color = rgba(0xff, 0xb0, 0x00, 0x1f);
 pub const NOTICE_BORDER: Color = rgba(0xff, 0xb0, 0x00, 0x80);
 pub const QUIT_HOVER: Color = rgba(0xff, 0x4a, 0x3d, 0x1a);
-/// Scanline: `#00000059`, one row in three.
-pub const SCANLINE: Color = rgba(0, 0, 0, 0x59);
+/// Scanline: one row in three. The handoff's `#00000059` is drawn for a
+/// 2× screen; at 1× a 35 % row lands on whole rows of the 8–9 px type and
+/// erases strokes (seen on the panel 2026-10-07), so it is 12 % here.
+pub const SCANLINE: Color = rgba(0, 0, 0, 0x1f);
 /// The top edge's phosphor line at 70 %.
 pub const TOP_LINE: Color = rgba(0x7c, 0xe3, 0x8b, 0xb3);
 
