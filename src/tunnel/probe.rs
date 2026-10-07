@@ -8,6 +8,7 @@
 //! Cloudflare edge — the tunnel figure is the one that matters.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -55,15 +56,25 @@ async fn resolve() -> Option<SocketAddr> {
     tokio::net::lookup_host((TQ_HOST, TQ_PORT)).await.ok()?.find(SocketAddr::is_ipv4)
 }
 
-/// Probe once a second for as long as the task lives. The worker aborts it
-/// when the tunnel goes down. A failed resolution is a loss and is retried
-/// on the next tick; a good one is reused for `DNS_TTL`.
-pub async fn run(source: Ipv4Addr, latest: Latest) {
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
+/// Probe once a second until `stop` is set. A failed resolution is a loss
+/// and is retried on the next tick; a good one is reused for `DNS_TTL`.
+pub async fn run(source: Ipv4Addr, latest: Latest, stop: Arc<AtomicBool>) {
+    probe_loop(source, latest, stop, Duration::from_secs(1), resolve).await
+}
+
+async fn probe_loop<F, Fut>(source: Ipv4Addr, latest: Latest, stop: Arc<AtomicBool>, period: Duration, resolve: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Option<SocketAddr>>,
+{
+    let mut tick = tokio::time::interval(period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut target: Option<(SocketAddr, Instant)> = None;
     loop {
         tick.tick().await;
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         if target.is_none_or(|(_, at)| at.elapsed() >= DNS_TTL) {
             target = resolve().await.map(|a| (a, Instant::now())).or(target);
         }
@@ -72,6 +83,37 @@ pub async fn run(source: Ipv4Addr, latest: Latest) {
             None => None,
         };
         latest.record(rtt);
+    }
+}
+
+/// A running probe; dropping it tells its thread to stop (within a tick).
+pub struct Probe(Arc<AtomicBool>);
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Start the probe on its own OS thread with its own runtime, so the
+/// worker's blocking subprocess calls (`wg show`, the exit-IP `curl`)
+/// cannot hold up the connect it is timing. `None` if the thread or
+/// runtime cannot be made: the tunnel carries on without a ping.
+pub fn spawn(source: Ipv4Addr, latest: Latest) -> Option<Probe> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let started = std::thread::Builder::new().name("tq-probe".into()).spawn(move || {
+        match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt.block_on(run(source, latest, flag)),
+            Err(e) => tracing::warn!("ping probe: runtime: {e}"),
+        }
+    });
+    match started {
+        Ok(_) => Some(Probe(stop)),
+        Err(e) => {
+            tracing::warn!("ping probe: thread: {e}");
+            None
+        }
     }
 }
 
@@ -122,6 +164,26 @@ mod tests {
         assert_eq!(l.get(), Sample { rtt_us: None, seq: 2 });
         l.record(Some(359_000));
         assert_eq!(l.get(), Sample { rtt_us: Some(359_000), seq: 3 });
+    }
+
+    #[test]
+    fn a_dropped_probe_stops_its_loop() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap();
+        let latest = Latest::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let probe = Probe(stop.clone());
+        let (l, s) = (latest.clone(), stop);
+        let th = std::thread::spawn(move || {
+            block_on(probe_loop(Ipv4Addr::LOCALHOST, l, s, Duration::from_millis(50), || async move { Some(target) }))
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(latest.get().seq >= 2, "{:?}", latest.get());
+        drop(probe);
+        th.join().unwrap(); // returns only because the flag was seen
+        let seq = latest.get().seq;
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(latest.get().seq, seq);
     }
 
     /// `cargo test --lib tunnel::probe -- --ignored` with the tunnel up:

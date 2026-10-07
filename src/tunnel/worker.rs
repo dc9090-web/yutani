@@ -603,10 +603,9 @@ async fn serve(
     // `Burst`) instead of simply carrying on once a second.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut exit = ExitIp::new();
-    // PING · TQ: the probe runs beside this loop and is aborted with it.
+    // PING · TQ: the probe runs on its own thread and stops when this drops.
     let latest = super::probe::Latest::default();
-    let probe = tokio::spawn(super::probe::run(loaded.conf.address, latest.clone()));
-    let _stop_probe = Teardown::new(move || probe.abort());
+    let _probe = super::probe::spawn(loaded.conf.address, latest.clone());
     loop {
         tokio::select! {
             _ = tick.tick() => {
