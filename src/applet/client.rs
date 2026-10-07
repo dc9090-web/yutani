@@ -194,6 +194,7 @@ mod tests {
             shortcuts: None,
             outputs: Vec::new(),
             steam: Vec::new(),
+            launch: None,
             tunnel: TunnelStatus {
                 installed: true,
                 connected: true,

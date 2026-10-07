@@ -150,6 +150,10 @@ pub struct Status {
     /// (`serde(default)`) from a daemon older than this field.
     #[serde(default)]
     pub steam: Vec<crate::steam::Finding>,
+    /// A Launch EVE in progress or just ended (`launch_eve`); `None`
+    /// otherwise and (`serde(default)`) from a daemon older than Phase 3.
+    #[serde(default)]
+    pub launch: Option<crate::launch_eve::LaunchState>,
 }
 
 /// Combine the worker's file, whether `/sys/class/net/yutani0` exists,
@@ -399,6 +403,7 @@ mod tests {
                 verdict: crate::steam::Verdict::Broken { path: "/usr/local/bin/yutani".into() },
                 file: "/h/localconfig.vdf".into(),
             }],
+            launch: None,
             tunnel: assemble(Some(&file()), true, Some((1, 2)), true, false, "London", 1021),
         };
         let json = serde_json::to_string(&st).unwrap();

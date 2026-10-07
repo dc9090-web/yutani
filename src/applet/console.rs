@@ -393,6 +393,7 @@ mod tests {
             shortcuts: None,
             outputs: Vec::new(),
             steam: Vec::new(),
+            launch: None,
         }
     }
 

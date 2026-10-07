@@ -589,7 +589,7 @@ impl App {
                             tokio::task::spawn_blocking(move || crate::tunnel::control::current_tunnel_status(&location))
                                 .await
                                 .map_err(|e| format!("status task failed: {e}"))?;
-                        let status = crate::tunnel::status::Status { clients, hidden, tunnel, shortcuts, outputs, steam };
+                        let status = crate::tunnel::status::Status { clients, hidden, tunnel, shortcuts, outputs, steam, launch: None };
                         serde_json::to_string(&status).map(Some).map_err(|e| format!("status: {e}"))
                     },
                     move |result| cosmic::Action::App(Msg::IpcReplyLater(reply, result)),

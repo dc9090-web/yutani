@@ -792,7 +792,7 @@ mod tests {
     fn connected() -> Status {
         use yutani::tunnel::status::{Status, TunnelStatus};
         let tunnel = TunnelStatus { installed: true, connected: true, handshake_age_s: Some(4), ..Default::default() };
-        Status { clients: vec![], hidden: false, tunnel, shortcuts: None, outputs: Vec::new(), steam: Vec::new() }
+        Status { clients: vec![], hidden: false, tunnel, shortcuts: None, outputs: Vec::new(), steam: Vec::new(), launch: None }
     }
 
     /// Each new probe becomes one sample; a repeated sequence adds nothing;
