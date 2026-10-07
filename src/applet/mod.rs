@@ -14,6 +14,8 @@ pub mod install;
 pub mod menu;
 pub mod ping;
 pub mod rate;
+pub mod rocker;
+pub mod sand;
 pub mod theme;
 
 use std::time::{Duration, Instant};
