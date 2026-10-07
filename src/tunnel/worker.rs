@@ -551,7 +551,7 @@ impl ExitIp {
     }
 }
 
-fn write_status(x: &dyn Exec, conf: &WgConf, since: u64, exit: &mut ExitIp) -> anyhow::Result<()> {
+fn write_status(x: &dyn Exec, conf: &WgConf, since: u64, exit: &mut ExitIp, ping: super::probe::Sample) -> anyhow::Result<()> {
     let dump = x.run(&["wg".to_string(), "show".to_string(), IFACE.to_string(), "dump".to_string()], None)?;
     let (endpoint, handshake, rx, tx) = parse_wg_dump(&dump).unwrap_or((conf.endpoint.clone(), 0, 0, 0));
     exit.refresh(x, conf.address, handshake, now_unix());
@@ -565,8 +565,8 @@ fn write_status(x: &dyn Exec, conf: &WgConf, since: u64, exit: &mut ExitIp) -> a
         tx_bytes: tx,
         since_unix: since,
         exit_address: exit.address.clone(),
-        ping_us: None,
-        ping_seq: 0,
+        ping_us: ping.rtt_us,
+        ping_seq: ping.seq,
     };
     // `write_with_mode` creates the temporary with 0644 from the start and
     // renames it into place, so the file is never briefly unreadable and a
@@ -603,12 +603,16 @@ async fn serve(
     // `Burst`) instead of simply carrying on once a second.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut exit = ExitIp::new();
+    // PING · TQ: the probe runs beside this loop and is aborted with it.
+    let latest = super::probe::Latest::default();
+    let probe = tokio::spawn(super::probe::run(loaded.conf.address, latest.clone()));
+    let _stop_probe = Teardown::new(move || probe.abort());
     loop {
         tokio::select! {
             _ = tick.tick() => {
                 keep_route(x, link_is_up());
                 slice.tick(x, loaded, now_unix());
-                if let Err(e) = write_status(x, &loaded.conf, since, &mut exit) {
+                if let Err(e) = write_status(x, &loaded.conf, since, &mut exit, latest.get()) {
                     tracing::warn!("status: {e:#}");
                 }
             }

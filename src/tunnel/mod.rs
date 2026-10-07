@@ -4,6 +4,7 @@
 pub mod conf;
 pub mod control;
 pub mod install;
+pub mod probe;
 pub mod rules;
 pub mod status;
 pub mod worker;
