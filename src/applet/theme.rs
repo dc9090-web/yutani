@@ -27,6 +27,8 @@ pub const BADGE_PX: f32 = 26.0;
 /// The mark inside the header plate: 18 of the plate's 26 px, so the
 /// glyph's own 32-unit margins leave it optically centred.
 pub const BADGE_MARK_PX: f32 = 18.0;
+/// The status badge (Nostromo): a 7×7 square, radius 1.
+pub const BADGE_SQUARE_PX: f32 = 7.0;
 pub const PRIMARY_HEIGHT: f32 = 38.0;
 pub const OVERFLOW_PX: f32 = 38.0;
 pub const ACCOUNT_ROW_HEIGHT: f32 = 30.0;
@@ -223,30 +225,34 @@ pub fn mark_class() -> cosmic::theme::Svg {
     cosmic::theme::Svg::custom(|theme| cosmic::iced::widget::svg::Style { color: Some(mark_ink(theme.cosmic())) })
 }
 
-/// The badge's diameter for a panel icon `icon_px` tall: the handoff's
-/// 8 px at the standard 24 px icon, scaled with it, never below 7 or
-/// above 10.
-pub fn badge_px(icon_px: f32) -> f32 {
-    (icon_px / 3.0).round().clamp(7.0, 10.0)
+/// The status badge's fill on a dark panel, and whether it glows.
+pub fn badge_fill(_is_dark: bool, badge: super::icon::Badge) -> (Color, bool) {
+    use super::icon::Badge;
+    match badge {
+        Badge::Connected => (crate::applet::skin::PHOSPHOR, true),
+        Badge::Attention | Badge::Sync => (crate::applet::skin::AMBER, false),
+    }
 }
 
-/// The status badge (redesign spec §1): a filled dot in the theme's
-/// success or warning colour with a ring cut out in the panel background,
-/// or — while an action settles — a hollow ring of ink around that same
-/// background.
-pub fn badge_class(diameter: f32, badge: super::icon::Badge) -> cosmic::theme::Container<'static> {
+/// The status badge: phosphor (glowing) or amber on a dark panel, the
+/// theme's success/warning on a light one (phosphor on a light grey is
+/// under 2:1); a 1.5 px ring in the panel's own colour; Sync is a hollow
+/// outline.
+pub fn badge_class(badge: super::icon::Badge) -> cosmic::theme::Container<'static> {
     use super::icon::Badge;
     cosmic::theme::Container::custom(move |theme| {
         let c = theme.cosmic();
         let panel = panel_bg(c);
-        let (fill, ring) = match badge {
-            Badge::Connected => (success(c), panel),
-            Badge::Attention => (warning(c), panel),
-            Badge::Sync => (panel, mark_ink(c)),
+        let (fill, glow) = if c.is_dark {
+            badge_fill(true, badge)
+        } else {
+            (if badge == Badge::Connected { success(c) } else { warning(c) }, false)
         };
+        let (bg, ring) = if badge == Badge::Sync { (panel, fill) } else { (fill, panel) };
         container::Style {
-            background: Some(Background::Color(fill)),
-            border: Border { radius: Radius::from(diameter / 2.0), width: BADGE_RING_PX, color: ring },
+            background: Some(Background::Color(bg)),
+            border: Border { radius: Radius::from(1.0), width: BADGE_RING_PX, color: ring },
+            shadow: if glow { cosmic::iced::Shadow { color: Color { a: 0.67, ..fill }, offset: cosmic::iced::Vector::ZERO, blur_radius: 6.0 } } else { Default::default() },
             ..Default::default()
         }
     })
@@ -464,16 +470,14 @@ pub fn menu_row_class(danger: bool) -> cosmic::theme::Button {
 mod tests {
     use super::*;
 
-    /// The handoff's 8 px dot at the standard 24 px icon, scaled with the
-    /// icon and clamped: XS panels keep a 7 px dot, huge ones stop at 10.
+    /// Nostromo: a 7×7 square badge whatever the panel size.
     #[test]
-    fn the_badge_is_a_third_of_the_icon_within_bounds() {
-        assert_eq!(badge_px(24.0), 8.0);
-        assert_eq!(badge_px(16.0), 7.0);
-        assert_eq!(badge_px(10.0), 7.0);
-        assert_eq!(badge_px(64.0), 10.0);
+    fn the_badge_is_a_seven_pixel_square() {
+        assert_eq!(BADGE_SQUARE_PX, 7.0);
         assert_eq!(BADGE_RING_PX, 1.5);
         assert_eq!(DIM_OPACITY, 0.40);
+        assert_eq!(badge_fill(true, crate::applet::icon::Badge::Connected), (crate::applet::skin::PHOSPHOR, true));
+        assert_eq!(badge_fill(true, crate::applet::icon::Badge::Attention), (crate::applet::skin::AMBER, false));
     }
 
     /// The handoff's geometry, as designed.
