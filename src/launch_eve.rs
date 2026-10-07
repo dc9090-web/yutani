@@ -15,6 +15,12 @@ pub const STEAM_TIMEOUT_MS: u64 = 60_000;
 pub const LAUNCHER_GONE_MS: u64 = 10_000;
 pub const DONE_LINGER_MS: u64 = 2_000;
 pub const FAILED_LINGER_MS: u64 = 5_000;
+/// Step 4 waits this long for the new client's thumbnail to be placed (its
+/// slot is only known then). Past it the launch finishes anyway — the
+/// client is running, only its hotkey is unknown (`—`) — so a client that
+/// never gets a frame cannot keep the launch, and the daemon's 2 Hz tick,
+/// alive until it closes.
+pub const PLACE_TIMEOUT_MS: u64 = 15_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Step {
@@ -75,6 +81,8 @@ pub struct Launch<H> {
     launcher_seen: bool,
     launcher_gone_since: Option<u64>,
     target: Option<H>,
+    /// When the new client appeared (`now_ms`), for [`PLACE_TIMEOUT_MS`].
+    target_since: Option<u64>,
     ended_ms: Option<u64>,
 }
 
@@ -105,6 +113,7 @@ impl<H: Clone + Eq + Hash> Launch<H> {
             launcher_seen: false,
             launcher_gone_since: None,
             target: None,
+            target_since: None,
             ended_ms: None,
         }
     }
@@ -164,6 +173,15 @@ impl<H: Clone + Eq + Hash> Launch<H> {
                 if self.state.steps[0] == Step::Running && now_ms.saturating_sub(self.started_ms) >= STEAM_TIMEOUT_MS {
                     self.fail(0, "STEAM DID NOT START EVE");
                 }
+                if self.state.steps[3] == Step::Running
+                    && let (Some(target), Some(since)) = (self.target.clone(), self.target_since)
+                    && now_ms.saturating_sub(since) >= PLACE_TIMEOUT_MS
+                {
+                    self.state.steps[3] = Step::Done;
+                    self.state.hotkey = "—".to_string();
+                    self.end();
+                    return vec![Effect::Focus(target)];
+                }
                 Vec::new()
             }
             Obs::SpawnFailed(why) => {
@@ -176,6 +194,7 @@ impl<H: Clone + Eq + Hash> Launch<H> {
                     self.state.steps[2] = Step::Done;
                     self.state.steps[3] = Step::Running;
                     self.target = Some(h);
+                    self.target_since = Some(self.now_ms);
                 }
                 Vec::new()
             }
@@ -328,6 +347,20 @@ mod tests {
         l.observe(Obs::ClientGone(7));
         assert_eq!(l.state().steps[3], Failed);
         assert_eq!(l.state().failed.as_deref(), Some("CLIENT CLOSED"));
+    }
+
+    /// A client that is never placed cannot hold the launch open: after
+    /// 15 s it finishes with an unknown hotkey and is focused anyway.
+    #[test]
+    fn an_unplaced_client_finishes_the_launch_after_fifteen_seconds() {
+        let mut l = started();
+        l.observe(tick(1_000, true));
+        l.observe(Obs::ClientAppeared(7));
+        assert!(l.observe(tick(15_999, true)).is_empty());
+        assert_eq!(l.state().steps[3], Running);
+        assert_eq!(l.observe(tick(16_000, true)), vec![Effect::Focus(7)]);
+        assert!(l.state().finished());
+        assert_eq!(l.state().hotkey, "—");
     }
 
     #[test]
