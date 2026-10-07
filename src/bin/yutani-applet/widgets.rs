@@ -44,7 +44,7 @@ impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Scope {
         let sand = state.sand.get_or_insert_with(|| Sand::new(bounds.width, bounds.height, 0x5EED));
         sand.resize(bounds.width, bounds.height);
         sand.step(dt, self.drive);
-        Some(Action::request_redraw())
+        Some(Action::request_redraw_at(*now + Duration::from_millis(33))) // 30 fps
     }
 
     fn draw(&self, state: &ScopeState, renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
@@ -274,6 +274,27 @@ impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Hazard {
             });
             frame.fill(&band, AMBER);
             x += 12.0;
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+// ---- overflow glyph ---------------------------------------------------------------------
+
+/// The overflow button's ⋯ (not in B612 Mono): three 2×2 phosphor squares,
+/// 3 px apart, centred in the canvas.
+pub struct Ellipsis;
+
+impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Ellipsis {
+    type State = ();
+
+    fn draw(&self, _: &(), renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        let total = 3.0 * 2.0 + 2.0 * 3.0;
+        let x0 = ((bounds.width - total) / 2.0).floor();
+        let y = ((bounds.height - 2.0) / 2.0).floor();
+        for n in 0..3 {
+            frame.fill_rectangle(Point::new(x0 + n as f32 * 5.0, y), Size::new(2.0, 2.0), PHOSPHOR);
         }
         vec![frame.into_geometry()]
     }

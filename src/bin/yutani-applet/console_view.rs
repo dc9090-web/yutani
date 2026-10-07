@@ -361,7 +361,7 @@ fn notice<'a>(text: &str) -> Element<'a, Msg> {
 }
 
 fn action_row<'a>(c: &Console, menu_open: bool) -> Element<'a, Msg> {
-    let overflow = widget::button::custom(centered(t("⋯", skin::OVERFLOW, skin::PHOSPHOR), Horizontal::Center))
+    let overflow = widget::button::custom(centered(layered(widgets::Ellipsis, Length::Fixed(12.0), Length::Fixed(2.0)), Horizontal::Center))
         .width(Length::Fixed(skin::OVERFLOW_PX))
         .height(Length::Fixed(skin::OVERFLOW_PX))
         .padding(0)
@@ -408,7 +408,7 @@ fn primary<'a>(l: LaunchButton) -> Element<'a, Msg> {
 }
 
 fn menu_row<'a>(r: &MenuRow) -> Element<'a, Msg> {
-    let color = if r.danger { skin::RED } else if r.action.is_some() { skin::PHOSPHOR } else { skin::DIMMER };
+    let color = if r.action.is_none() { skin::DIMMER } else if r.danger { skin::RED } else { skin::PHOSPHOR };
     widget::button::custom(centered(widget::container(t(r.label.to_uppercase(), skin::MENU, color)).padding(skin::MENU_ROW_PAD), Horizontal::Left))
         .width(Length::Fill)
         .height(Length::Fixed(skin::MENU_ROW_HEIGHT))

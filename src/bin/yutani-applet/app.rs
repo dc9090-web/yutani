@@ -67,8 +67,8 @@ pub struct Applet {
     pub glass: crate::widgets::Glass,
 }
 
-/// A one-line note under a menu row (spec §7): what went wrong, when it was
-/// said, and which row it belongs under. `action` is `None` for a failed
+/// A one-line note under the action row (spec §7): what went wrong, when it
+/// was said, and which action it belongs to. `action` is `None` for a failed
 /// poll, which belongs to no row and sits at the foot of the menu instead.
 /// A `progress` note is not an error but what a slow action is doing while
 /// it is awaited (`waiting_note`); it is muted rather than red and lives
@@ -192,6 +192,11 @@ fn start_outcome(exit: Option<Exit>) -> Result<(), String> {
 }
 
 impl Applet {
+    /// The popover is showing: a real popup, or the preview window.
+    fn popover_open(&self) -> bool {
+        self.popup.is_some() || crate::preview()
+    }
+
     pub fn now_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
     }
@@ -328,7 +333,7 @@ impl cosmic::Application for Applet {
     }
 
     fn subscription(&self) -> Subscription<Msg> {
-        cosmic::iced::time::every(poll_interval(self.popup.is_some())).map(|_| Msg::Tick)
+        cosmic::iced::time::every(poll_interval(self.popover_open())).map(|_| Msg::Tick)
     }
 
     fn update(&mut self, message: Msg) -> Task<Msg> {
@@ -341,7 +346,7 @@ impl cosmic::Application for Applet {
                 if self.note.is_some() && self.visible_note().is_none() {
                     self.note = None;
                 }
-                if self.popup.is_some() {
+                if self.popover_open() {
                     self.host_reading = self.host.sample();
                 }
                 if self.poll.tick() { Self::status_task() } else { Task::none() }
