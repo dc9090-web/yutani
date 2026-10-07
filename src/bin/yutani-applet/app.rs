@@ -95,8 +95,6 @@ pub enum Msg {
     /// Popup create/destroy, handled by libcosmic.
     Surface(cosmic::surface::Action<Msg>),
     PopupClosed(Id),
-    /// The bundled fonts finished loading (`false`: at least one failed).
-    FontsLoaded(bool),
     /// The primary button's Launch EVE (Phase 3 handles it).
     Launch,
 }
@@ -322,8 +320,7 @@ impl cosmic::Application for Applet {
         // Through the guard like every other poll, so the very first reply
         // releases it instead of finding it never armed.
         let first = applet.poll();
-        let fonts = yutani::applet::fonts::load_all().map(|ok| cosmic::Action::App(Msg::FontsLoaded(ok)));
-        (applet, Task::batch([first, fonts]))
+        (applet, first)
     }
 
     fn on_close_requested(&self, id: Id) -> Option<Msg> {
@@ -505,18 +502,14 @@ impl cosmic::Application for Applet {
                 }
                 Task::none()
             }
-            Msg::FontsLoaded(ok) => {
-                if !ok {
-                    yutani::applet::fonts::set_missing();
-                    tracing::warn!("a bundled font failed to load; using the COSMIC monospace");
-                }
-                Task::none()
-            }
             Msg::Launch => Task::none(),
         }
     }
 
     fn view(&self) -> cosmic::Element<'_, Msg> {
+        if crate::preview() {
+            return crate::console_view::popup(self);
+        }
         view::panel_button(self)
     }
 
@@ -527,7 +520,7 @@ impl cosmic::Application for Applet {
     }
 
     fn style(&self) -> Option<cosmic::iced::theme::Style> {
-        Some(cosmic::applet::style())
+        (!crate::preview()).then(cosmic::applet::style)
     }
 }
 

@@ -81,10 +81,25 @@ pub fn advance_em(face: Face, ch: char) -> f32 {
     })
 }
 
-/// Load every bundled face; `true` when all of them loaded.
-pub fn load_all() -> cosmic::iced::Task<bool> {
-    let tasks = ALL.map(|b| cosmic::iced::font::load(b).map(|r| r.is_ok()));
-    cosmic::iced::Task::batch(tasks).collect().map(|oks: Vec<bool>| oks.into_iter().all(|ok| ok))
+/// Register every bundled face with iced's global font system, before
+/// the applet runs — the way libcosmic preloads its own Open Sans and Noto
+/// Sans Mono. The async `iced::font::load` task was not enough: text laid
+/// out before it landed kept its fallback font (2026-10-07). Should the
+/// mono family still not be found, every face falls back to COSMIC's
+/// monospace (`set_missing`).
+pub fn preload() {
+    let Ok(mut fs) = cosmic::iced::advanced::graphics::text::font_system().write() else {
+        set_missing();
+        return;
+    };
+    for bytes in ALL {
+        fs.load_font(std::borrow::Cow::Borrowed(bytes));
+    }
+    let found = fs.db().faces().any(|f| f.families.iter().any(|(name, _)| name == FAMILY_MONO));
+    if !found {
+        set_missing();
+        tracing::warn!("the bundled fonts did not register; using the COSMIC monospace");
+    }
 }
 
 #[cfg(test)]

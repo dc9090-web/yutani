@@ -42,9 +42,26 @@ fn t<'a>(text: impl AsRef<str>, ty: Type, color: Color) -> Element<'a, Msg> {
 /// square) rather than set as text.
 fn arrowed<'a>(dir: Direction, word: &'static str, ty: Type, color: Color) -> Element<'a, Msg> {
     let px = (ty.size * 0.6).ceil();
-    let arrow: Element<'a, Msg> = widget::canvas(widgets::Arrow { direction: dir, color }).width(Length::Fixed(px)).height(Length::Fixed(px)).into();
+    let arrow = layered(widgets::Arrow { direction: dir, color }, Length::Fixed(px), Length::Fixed(px));
     let row = Row::new().spacing(4).align_y(Alignment::Center);
     if dir == Direction::Down { row.push(t(word, ty, color)).push(arrow) } else { row.push(arrow).push(t(word, ty, color)) }.into()
+}
+
+/// A canvas in a renderer layer of its own. On the panel's popup surface
+/// only the last canvas drawn into a layer showed up (2026-10-07: the
+/// rockers, dotted rules, uplink arrow and scope were missing while the
+/// footer cursor — the last canvas — and the stacked brackets and glass
+/// drew); the same view in an ordinary window drew every one. A stack draws
+/// each child after its first in a layer of its own, so each canvas gets a
+/// stack whose first child is an empty space of the same size.
+fn layered<'a, P>(program: P, w: Length, h: Length) -> Element<'a, Msg>
+where
+    P: cosmic::iced::widget::canvas::Program<Msg, cosmic::Theme, cosmic::Renderer> + 'a,
+{
+    cosmic::iced::widget::stack([widget::space().width(w).height(h).into(), widget::canvas(program).width(w).height(h).into()])
+        .width(w)
+        .height(h)
+        .into()
 }
 
 fn ink(i: Ink) -> Color {
@@ -132,7 +149,7 @@ fn section<'a>(index: &'static str, label: &str, meta: Option<Element<'a, Msg>>)
         .align_y(Alignment::Center)
         .push(chip)
         .push(t(label, skin::SECTION_LABEL, skin::PHOSPHOR))
-        .push(widget::canvas(widgets::DottedRule).width(Length::Fill).height(Length::Fixed(3.0)));
+        .push(layered(widgets::DottedRule, Length::Fill, Length::Fixed(3.0)));
     if let Some(meta) = meta {
         row = row.push(meta);
     }
@@ -143,7 +160,7 @@ fn section<'a>(index: &'static str, label: &str, meta: Option<Element<'a, Msg>>)
 
 fn control_row<'a>(r: &ControlRow) -> Element<'a, Msg> {
     let text = Column::new().spacing(3).push(t(r.title, skin::ROW_TITLE, skin::PHOSPHOR)).push(t(r.sub.clone(), skin::ROW_SUB, ink(r.sub_ink)));
-    let rocker = widget::button::custom(widget::canvas(widgets::Rocker { state: r.rocker }).width(Length::Fixed(skin::TOGGLE_W)).height(Length::Fixed(skin::TOGGLE_H)))
+    let rocker = widget::button::custom(layered(widgets::Rocker { state: r.rocker }, Length::Fixed(skin::TOGGLE_W), Length::Fixed(skin::TOGGLE_H)))
         .padding(0)
         .class(skin::bare_class())
         .on_press_maybe(r.press.map(Msg::Press));
@@ -235,7 +252,7 @@ fn scope<'a>(n: &Network) -> Element<'a, Msg> {
         .push(t(n.rx_total.clone(), skin::SCOPE_FOOT, skin::DIM));
     let overlay = Column::new().width(Length::Fill).height(Length::Fill).padding([10.0, skin::SCOPE_INSET]).push(top).push(widget::space().height(Length::Fill)).push(bottom);
     cosmic::iced::widget::stack([
-        widget::canvas(widgets::Scope { drive }).width(Length::Fill).height(Length::Fixed(skin::SCOPE_HEIGHT)).into(),
+        layered(widgets::Scope { drive }, Length::Fill, Length::Fixed(skin::SCOPE_HEIGHT)),
         overlay.into(),
     ])
     .width(Length::Fill)
@@ -264,7 +281,7 @@ fn ping_row<'a>(n: &Network) -> Element<'a, Msg> {
     let middle = Column::new()
         .width(Length::Fill)
         .spacing(4)
-        .push(widget::canvas(spark).width(Length::Fixed(SPARK_W)).height(Length::Fixed(SPARK_H)))
+        .push(layered(spark, Length::Fixed(SPARK_W), Length::Fixed(SPARK_H)))
         .push(t(p.stats.clone(), skin::PING_STATS, skin::DIM));
     let right = Column::new()
         .width(Length::Fixed(skin::PING_RIGHT_W))
@@ -336,7 +353,7 @@ fn host<'a>(c: &Console) -> Element<'a, Msg> {
 // ---- notice, action row, menu, footer ---------------------------------------------------------
 
 fn notice<'a>(text: &str) -> Element<'a, Msg> {
-    let stripe = widget::canvas(widgets::Hazard).width(Length::Fill).height(Length::Fixed(skin::NOTICE_STRIPE_H));
+    let stripe = layered(widgets::Hazard, Length::Fill, Length::Fixed(skin::NOTICE_STRIPE_H));
     let body = widget::container(widget::text(text.to_string()).size(skin::NOTICE.size).font(fonts::font(skin::NOTICE.face)).class(cosmic::theme::Text::Color(skin::AMBER)))
         .width(Length::Fill)
         .padding(skin::NOTICE_PAD);
@@ -423,7 +440,7 @@ fn footer<'a>(c: &Console) -> Element<'a, Msg> {
         .spacing(4)
         .align_y(Alignment::Center)
         .push(t("READY FOR INQUIRY", skin::FOOTER, skin::DIM))
-        .push(widget::canvas(widgets::Cursor).width(Length::Fixed(skin::CURSOR_W)).height(Length::Fixed(skin::CURSOR_H)));
+        .push(layered(widgets::Cursor, Length::Fixed(skin::CURSOR_W), Length::Fixed(skin::CURSOR_H)));
     Column::new()
         .width(Length::Fill)
         .push(hairline(0.0))
