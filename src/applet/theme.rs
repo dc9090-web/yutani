@@ -6,8 +6,14 @@ use cosmic::iced::border::Radius;
 use cosmic::iced::widget::container;
 use cosmic::iced::{Background, Border, Color};
 
-/// The status badge (Nostromo): a 7×7 square, radius 1.
-pub const BADGE_SQUARE_PX: f32 = 7.0;
+/// The status badge's box (ring included) for a panel icon `icon_px`
+/// tall: a third of the icon, 7–10 px. The handoff's 7×7 is drawn for a
+/// 24 px icon at 2×; a fixed 10 px box (7 + the ring) covered most of the
+/// mark on Daniel's small panel (2026-10-07), so it scales as the round
+/// dot before it did.
+pub fn badge_px(icon_px: f32) -> f32 {
+    (icon_px / 3.0).round().clamp(7.0, 10.0)
+}
 /// The status badge's ring, in the panel's own background.
 pub const BADGE_RING_PX: f32 = 1.5;
 /// The panel icon's opacity in the daemon-offline / not-installed state:
@@ -122,7 +128,7 @@ pub fn badge_class(badge: super::icon::Badge) -> cosmic::theme::Container<'stati
         container::Style {
             background: Some(Background::Color(bg)),
             border: Border { radius: Radius::from(1.0), width: BADGE_RING_PX, color: ring },
-            shadow: if glow { cosmic::iced::Shadow { color: Color { a: 0.67, ..fill }, offset: cosmic::iced::Vector::ZERO, blur_radius: 6.0 } } else { Default::default() },
+            shadow: if glow { cosmic::iced::Shadow { color: Color { a: 0.5, ..fill }, offset: cosmic::iced::Vector::ZERO, blur_radius: 3.0 } } else { Default::default() },
             ..Default::default()
         }
     })
@@ -132,10 +138,12 @@ pub fn badge_class(badge: super::icon::Badge) -> cosmic::theme::Container<'stati
 mod tests {
     use super::*;
 
-    /// Nostromo: a 7×7 square badge whatever the panel size.
+    /// A third of the icon, never below 7 or above 10.
     #[test]
-    fn the_badge_is_a_seven_pixel_square() {
-        assert_eq!(BADGE_SQUARE_PX, 7.0);
+    fn the_badge_scales_with_the_icon() {
+        assert_eq!(badge_px(24.0), 8.0);
+        assert_eq!(badge_px(16.0), 7.0);
+        assert_eq!(badge_px(64.0), 10.0);
         assert_eq!(BADGE_RING_PX, 1.5);
         assert_eq!(DIM_OPACITY, 0.40);
         assert_eq!(badge_fill(crate::applet::icon::Badge::Connected), (crate::applet::skin::PHOSPHOR, true));

@@ -23,7 +23,7 @@ pub fn panel_button(state: &Applet) -> Element<'_, Msg> {
         .height(Length::Fixed(f32::from(h)))
         .opacity(icon.opacity());
     let content: Element<'_, Msg> = if let Some(badge) = icon.badge() {
-        let d = theme::BADGE_SQUARE_PX + 2.0 * theme::BADGE_RING_PX;
+        let d = theme::badge_px(f32::from(h));
         let badge = widget::container(widget::space().width(Length::Fixed(d)).height(Length::Fixed(d)))
             .class(theme::badge_class(badge));
         cosmic::iced::widget::stack([

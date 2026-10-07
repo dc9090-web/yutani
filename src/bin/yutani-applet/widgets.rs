@@ -51,7 +51,10 @@ impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Scope {
         let mut frame = Frame::new(renderer, bounds.size());
         if let Some(sand) = &state.sand {
             for (x, y, size, tint, level) in sand.dots(self.drive) {
-                if level == 0 {
+                // Only grains inside the scope: canvas geometry is not
+                // clipped to its bounds, and in strong wind grains overshoot
+                // into the ping row below (2026-10-07).
+                if level == 0 || x < 0.0 || y < 0.0 || x + size > bounds.width || y + size > bounds.height {
                     continue;
                 }
                 let base = match tint {
