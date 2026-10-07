@@ -170,10 +170,11 @@ the "EVE Launcher" window out of the clients; an IPC reply can be held. What
 is new is a daemon-side `steam` spawn, a view of Steam's own window, and a
 "launcher still alive" check.
 
-- **IPC:** `Request::Launch` (`launch\n`), answered at once (`ok`, or `err`
-  when all 9 slots are in use or `steam` cannot be spawned). Progress travels
-  in `Status.launch: Option<LaunchState>` (`serde(default)`), polled by the
-  applet as usual.
+- **IPC:** `Request::Launch` (`launch\n`), answered at once: `ok`, or `err`
+  when all 9 slots are in use. It answers `ok` even when Steam cannot be
+  spawned; that failure shows as step 1 FAILED (`CANNOT RUN STEAM: …`) in
+  `status`. Progress travels in `Status.launch: Option<LaunchState>`
+  (`serde(default)`), polled by the applet as usual.
 - **Wire (`src/launch_eve.rs`, lib):** `LaunchState { steps: [Step; 4],
   hotkey: String, failed: Option<String> }`, `Step = Pending | Running | Done
   | Failed`. `hotkey` is the predicted `CTRL+ALT+n` (clients + 1) until the
@@ -186,24 +187,42 @@ is new is a daemon-side `steam` spawn, a view of Steam's own window, and a
   | 1 STEAM · APPLAUNCH 8500 | an `evelauncher.exe` process is seen, or a new client appears | neither within 60 s |
   | 2 STEAM · WINDOW MINIMISED | right after step 1 | — (cosmetic) |
   | 3 EVE CLIENT · STARTING | a client handle not present at the start appears | the launcher has been gone 10 s with no new client |
-  | 4 HOTKEY ASSIGNED · CTRL+ALT+n | that client's thumbnail is placed; its slot is its position in the focus order; the daemon then focuses it | the client closes first |
+  | 4 HOTKEY ASSIGNED · CTRL+ALT+n | that client's thumbnail is placed (Dock mode: its thumbnail surface is created, since Dock never marks a client placed); its slot is its position in the focus order; the daemon then focuses it | the client closes first |
+
+  In Dock mode the order sorts by name, so the shown hotkey can change once
+  the character logs in and the client's name changes.
 
   - **Steam's window (Daniel's choice: minimise only if it popped up):** the
     daemon tracks toplevels whose app_id is `steam` (any case). From the
-    start of a launch until it ends, any Steam window that becomes visible
-    (new, or un-minimised) and was not visible at the start is minimised.
-    One that was already open is left alone.
+    start of a launch until Steam hands EVE on (step 1 done), a Steam
+    window that becomes visible (new, or un-minimised) and was not visible
+    at the start is minimised, at most once per window per launch: one the
+    user restores stays restored. One that was already open is left alone,
+    and after step 1 Steam's windows (a dialog that needs an answer) are the
+    user's.
   - A slot above 9 has no hotkey: step 4 reads `HOTKEY ASSIGNED · —`.
   - Finished: the state stays 2 s, then clears. Failed: the failed line
-    shows the reason for 5 s, then clears. One launch at a time; a second
-    `launch` while one runs is a no-op `ok`.
+    shows the reason (clipped to one 40-character line) for 5 s, then
+    clears. One launch at a time; a second `launch` while one runs is a
+    no-op `ok`, but one that finished or failed and is only still on show
+    is replaced by a fresh launch.
 - **Daemon wiring:**
-  - `steam steam://rungameid/8500` spawned with null stdio in its own
-    process group, reaped on a thread.
+  - Steam is spawned in its own scope under `app.slice`: `systemd-run
+    --user --scope --slice=app.slice --collect --quiet -- steam
+    steam://rungameid/8500`, null stdio, own process group, reaped on a
+    thread. A Steam started this way is not in `yutani.service`'s cgroup,
+    so restarting the daemon (`KillMode=control-group`) never kills it. As
+    with `yutani launch`, the scope is used only when a `busctl status`
+    preflight answers; if `systemd-run` cannot be spawned, `steam` runs
+    directly; if `steam` is not found (Flatpak), `xdg-open
+    steam://rungameid/8500` is tried the same way before step 1 fails.
   - `Event::SteamWindow(handle, visible)` / `SteamWindowGone(handle)` from
     the backend for `steam` toplevels.
   - A 500 ms `LaunchTick` subscription only while a launch is active; it
-    scans `/proc` for `evelauncher.exe` and checks the target's placement.
+    scans `/proc` for `evelauncher.exe` only while step 1 or 3 runs
+    (`Launch::wants_launcher`), and checks the target's placement. The
+    walk reads a process's `cmdline` only when its `comm` is 15 bytes (the
+    kernel's truncation length).
 - **Applet:**
   - Button: ready "▶ LAUNCH EVE"; while launching "LAUNCHING…" /
     "STEP n / 4"; inert "START YUTANI TO LAUNCH" when stopped; inert "ALL 9

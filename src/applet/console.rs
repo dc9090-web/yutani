@@ -273,7 +273,9 @@ pub fn console_height(c: &Console, menu_open: bool) -> i32 {
     let scope = if c.network.scope { SCOPE_BAND_PX } else { 0 };
     let notice = c.notice.as_ref().map_or(0, |n| 4 + 7 + 8 + 13 * n.chars().count().div_ceil(52).max(1) as i32 + 2 + GAP);
     let menu = if menu_open { MENU } else { 0 };
-    let log = if c.launch_log.is_some() { LOG_CARD_PX + if c.launch_failed.is_some() { 13 } else { 0 } } else { 0 };
+    // The failure line is one 13 px line (clipped, [`FAILED_MAX_CHARS`])
+    // plus the card's 3 px spacing.
+    let log = if c.launch_log.is_some() { LOG_CARD_PX + if c.launch_failed.is_some() { 13 + 3 } else { 0 } } else { 0 };
     HEADER
         + 4 * SECTION_HEAD
         + CONTROL + GAP
@@ -285,6 +287,19 @@ pub fn console_height(c: &Console, menu_open: bool) -> i32 {
         + log
         + menu
         + FOOTER
+}
+
+/// The launch failure line fits the log card on one line: at most this
+/// many characters, the last an `…` when cut.
+pub const FAILED_MAX_CHARS: usize = 40;
+
+fn clip_failed(why: &str) -> String {
+    if why.chars().count() <= FAILED_MAX_CHARS {
+        return why.to_string();
+    }
+    let mut s: String = why.chars().take(FAILED_MAX_CHARS - 1).collect();
+    s.push('…');
+    s
 }
 
 fn launch_button(status: Option<&Status>) -> LaunchButton {
@@ -380,7 +395,7 @@ pub fn console(status: Option<&Status>, i: &Inputs) -> Console {
         notice,
         launch: launch_button(status),
         launch_log: status.and_then(|s| s.launch.as_ref()).map(launch_log),
-        launch_failed: status.and_then(|s| s.launch.as_ref()).and_then(|l| l.failed.clone()),
+        launch_failed: status.and_then(|s| s.launch.as_ref()).and_then(|l| l.failed.as_deref()).map(clip_failed),
         footer: format!("YUTANI OS · BUILD {}", env!("YUTANI_BUILD")),
     };
     c.network.scope = i.available.is_none_or(|h| console_height(&c, i.menu_open) <= h);
@@ -479,7 +494,21 @@ mod tests {
         let busy = console(Some(&launching([Done, Done, Running, Pending], None)), &inputs(&h, &p));
         assert_eq!(console_height(&busy, false) - console_height(&plain, false), LOG_CARD_PX);
         let failed = console(Some(&launching([Done, Done, Failed, Pending], Some("LAUNCHER CLOSED"))), &inputs(&h, &p));
-        assert_eq!(console_height(&failed, false) - console_height(&busy, false), 13);
+        assert_eq!(console_height(&failed, false) - console_height(&busy, false), 13 + 3);
+    }
+
+    #[test]
+    fn a_long_failure_reason_is_clipped_to_one_line() {
+        let (h, p) = (HostReading::default(), PingWindow::default());
+        use Step::*;
+        let long = "CANNOT RUN STEAM: PERMISSION DENIED (OS ERROR 13) WHILE STARTING";
+        let c = console(Some(&launching([Failed, Pending, Pending, Pending], Some(long))), &inputs(&h, &p));
+        let shown = c.launch_failed.unwrap();
+        assert_eq!(shown.chars().count(), FAILED_MAX_CHARS);
+        assert!(shown.ends_with('…'));
+        assert!(long.starts_with(shown.trim_end_matches('…')));
+        let short = console(Some(&launching([Failed, Pending, Pending, Pending], Some("LAUNCHER CLOSED"))), &inputs(&h, &p));
+        assert_eq!(short.launch_failed.as_deref(), Some("LAUNCHER CLOSED"), "short reasons are untouched");
     }
 
     #[test]
