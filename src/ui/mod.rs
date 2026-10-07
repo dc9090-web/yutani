@@ -608,9 +608,9 @@ impl App {
                 );
                 (Reply::Later, task)
             }
+            Request::Launch => (Reply::Now(self.start_launch()), Task::none()),
             // The popover is open: keep the ping probe running (an open and
             // a `set_modified`, cheap enough to do inline).
-            Request::Launch => (Reply::Now(self.start_launch()), Task::none()),
             Request::Watch => {
                 crate::tunnel::touch_ping_lease();
                 (Reply::Now(Ok(None)), cosmic::iced::Task::none())
@@ -647,11 +647,19 @@ impl App {
     }
 
     /// IPC `launch`: start Launch EVE (Nostromo Phase 3) and ask Steam for
-    /// EVE. A run already in progress is left alone; a Steam that cannot be
-    /// run is a failed step 1, which the applet reads from `status`.
+    /// EVE. A run in progress is left alone; one that finished or failed
+    /// but is still shown is replaced (the applet already offers the button
+    /// again). A Steam that cannot be run is a failed step 1, which the
+    /// applet reads from `status`.
     fn start_launch(&mut self) -> Result<Option<String>, String> {
+        self.start_launch_with(crate::launch_steam::spawn_eve)
+    }
+
+    /// [`Self::start_launch`] with the spawn handed in, so tests never run
+    /// Steam.
+    fn start_launch_with(&mut self, spawn: impl FnOnce() -> std::io::Result<()>) -> Result<Option<String>, String> {
         let now_ms = self.now_ms();
-        if self.launch.as_ref().is_some_and(|l| !l.expired(now_ms)) {
+        if self.launch.as_ref().is_some_and(|l| l.active()) {
             return Ok(None);
         }
         if self.clients.len() >= 9 {
@@ -663,7 +671,7 @@ impl App {
             self.clients.keys().cloned(),
             self.steam_windows.iter().map(|(h, v)| (h.clone(), *v)),
         );
-        match crate::launch_steam::spawn("steam") {
+        match spawn() {
             Ok(()) => tracing::info!("launch: asked Steam for EVE ({})", crate::launch_steam::URL),
             Err(e) => {
                 tracing::warn!("launch: cannot run steam: {e}");
@@ -704,15 +712,19 @@ impl App {
             return;
         }
         let now_ms = self.now_ms();
-        // A /proc walk of a few ms, at 2 Hz and only while launching; move
-        // it to spawn_blocking if it ever shows in a profile.
-        let launcher_alive = crate::adopt::process_running(&["evelauncher.exe".to_string()], crate::ipc::uid());
+        // A /proc walk of a few ms, at 2 Hz and only while step 1 or 3
+        // needs it; move it to spawn_blocking if it ever shows in a profile.
+        let launcher_alive = self.launch.as_ref().is_some_and(|l| l.wants_launcher())
+            && crate::adopt::process_running(&["evelauncher.exe".to_string()], crate::ipc::uid());
         self.observe_launch(Obs::Tick { now_ms, launcher_alive });
+        // Dock mode never sets `placed` (its slot does not depend on a
+        // placement): there the target is ready once it has a surface.
+        let dock = self.config.mode == Mode::Dock;
         let placed = self
             .launch
             .as_ref()
             .and_then(|l| l.target())
-            .filter(|t| self.clients.get(*t).is_some_and(|c| c.placed))
+            .filter(|t| self.clients.get(*t).is_some_and(|c| c.placed || (dock && c.surface.is_some())))
             .cloned();
         if let Some(target) = placed
             && let Some(i) = self.focus_order().iter().position(|x| x == &target)
@@ -2797,6 +2809,31 @@ mod tests {
         assert_eq!(app.launch.as_ref().unwrap().state().current(), 1);
     }
 
+    /// A failed launch still on show (the applet already offers the button
+    /// again) does not swallow the next press: it is replaced by a fresh
+    /// launch. The spawn is stubbed — no Steam here.
+    #[test]
+    fn launch_after_a_failed_one_still_shown_starts_a_fresh_one() {
+        use yutani::launch_eve::{Obs, Step};
+        let mut app = app(Config::default());
+        let mut failed = yutani::launch_eve::Launch::start(app.now_ms(), "Ctrl+Alt", [], []);
+        failed.observe(Obs::SpawnFailed("No such file or directory".into()));
+        assert!(!failed.expired(app.now_ms()), "still lingering");
+        app.launch = Some(failed);
+        let mut spawned = false;
+        assert_eq!(
+            app.start_launch_with(|| {
+                spawned = true;
+                Ok(())
+            }),
+            Ok(None)
+        );
+        assert!(spawned, "Steam was asked again");
+        let state = app.launch.as_ref().unwrap().state();
+        assert_eq!(state.steps[0], Step::Running);
+        assert!(!state.is_failed());
+    }
+
     /// The backend's events reach the state machine: a new client becomes
     /// the target (an update of an existing one does not), a Steam window
     /// that pops up is recorded, and the target closing fails step 4.
@@ -2832,6 +2869,25 @@ mod tests {
         let _ = app.update(Msg::LaunchTick);
         assert!(!app.launch.as_ref().unwrap().state().finished(), "not placed yet");
         app.clients.get_mut(&new).unwrap().placed = true;
+        let _ = app.update(Msg::LaunchTick);
+        let state = app.launch.as_ref().unwrap().state();
+        assert!(state.finished());
+        assert_eq!(state.hotkey, "CTRL+ALT+1");
+    }
+
+    /// Dock mode never sets `placed`: there the target is ready once its
+    /// thumbnail surface exists.
+    #[test]
+    fn in_dock_mode_a_tick_finishes_the_launch_once_the_new_client_has_a_surface() {
+        let fake = Fake::new();
+        let mut app = app(Config { mode: Mode::Dock, ..Config::default() });
+        app.launch = Some(yutani::launch_eve::Launch::start(app.now_ms(), "Ctrl+Alt", [], []));
+        let new = fake.handle();
+        let _ = app.on_backend(Event::ClientAdded(new.clone(), info(false, Vec::new())));
+        let _ = app.update(Msg::LaunchTick);
+        assert!(!app.launch.as_ref().unwrap().state().finished(), "no surface yet");
+        app.clients.get_mut(&new).unwrap().surface = Some(SurfaceId::unique());
+        assert!(!app.clients[&new].placed, "Dock mode leaves `placed` alone");
         let _ = app.update(Msg::LaunchTick);
         let state = app.launch.as_ref().unwrap().state();
         assert!(state.finished());
