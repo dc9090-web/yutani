@@ -5,6 +5,7 @@
 
 pub mod client;
 pub mod display;
+pub mod fonts;
 pub mod format;
 pub mod history;
 pub mod icon;

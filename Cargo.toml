@@ -7,6 +7,8 @@ license = "GPL-3.0-only"
 description = "Live thumbnails and client switching for EVE Online on COSMIC"
 
 [dependencies]
+# Glyph advances for the popover's tracked text (already in the tree via cosmic-text).
+ttf-parser = "0.25"
 libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "a401af8b1c54a8abd393b8c5b7c8809402f83850", default-features = false, features = [
     "tokio",
     "wayland",
