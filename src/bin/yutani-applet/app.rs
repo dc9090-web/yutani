@@ -17,7 +17,7 @@ use yutani::applet::client::{self, IpcError};
 use yutani::applet::console::{Console, Inputs, console};
 use yutani::applet::console::degrade;
 use yutani::applet::host::{HostReading, HostSampler, Sources};
-use yutani::applet::ping::PingWindow;
+use yutani::applet::ping::{self, PingWindow};
 use yutani::applet::rate::{Rates, Sampler};
 use yutani::applet::{
     Action, PENDING_S, Poll, clip_note, note_visible, pending_done, poll_interval, start_command,
@@ -55,8 +55,12 @@ pub struct Applet {
     /// The HOST card's sampler, read at 1 Hz while the popover is open.
     pub host: HostSampler,
     pub host_reading: HostReading,
-    /// Ping samples (Phase 2 feeds it; empty until then).
+    /// Ping samples, fed by the worker's probe.
     pub ping: PingWindow,
+    /// The probe sequence last seen and when it last moved: a sequence
+    /// that stands still for `ping::STALE_AFTER` (a paused, frozen or
+    /// killed probe) clears the window, so the row reads IDLE.
+    pub ping_seen: Option<(u64, Instant)>,
     /// Session totals `(rx, tx)`: the counters while connected, frozen
     /// otherwise.
     pub totals: (u64, u64),
@@ -250,6 +254,40 @@ impl Applet {
         cosmic::task::future(async { Msg::Status(client::status().await) })
     }
 
+    /// `watch`: the popover is open, so the daemon renews the ping lease.
+    /// Fire-and-forget — outside the `Poll` guard, never a note, and an
+    /// `err` from a daemon that predates it is as good as `ok`.
+    fn watch_task() -> Task<Msg> {
+        cosmic::iced::Task::future(async {
+            let _ = client::send(yutani::ipc::Request::Watch).await;
+        })
+        .discard()
+    }
+
+    /// Take the probe's newest sample if its sequence moved; if it has
+    /// stood still for longer than `ping::STALE_AFTER`, clear the window.
+    fn take_ping(&mut self, seq: u64, rtt_us: Option<u32>, now: Instant) {
+        if seq == 0 {
+            return; // no probe has run yet
+        }
+        match self.ping_seen {
+            Some((last, at)) if last == seq => {
+                if ping::stale(Some(at), now) {
+                    self.ping.clear();
+                }
+            }
+            _ => {
+                self.ping_seen = Some((seq, now));
+                self.ping.push_seq(seq, rtt_us.map(|us| us as f32 / 1000.0));
+            }
+        }
+    }
+
+    fn forget_ping(&mut self) {
+        self.ping.clear();
+        self.ping_seen = None;
+    }
+
     /// A `status` reply landed: release the guard, and issue whatever was
     /// deferred behind it.
     fn replied(&mut self) -> Task<Msg> {
@@ -316,6 +354,7 @@ impl cosmic::Application for Applet {
             host: HostSampler::new(Sources::discover()),
             host_reading: HostReading::default(),
             ping: PingWindow::default(),
+            ping_seen: None,
             totals: (0, 0),
             starting: None,
         };
@@ -343,10 +382,14 @@ impl cosmic::Application for Applet {
                 if self.note.is_some() && self.visible_note().is_none() {
                     self.note = None;
                 }
-                if self.popover_open() {
+                let watch = if self.popover_open() {
                     self.host_reading = self.host.sample();
-                }
-                if self.poll.tick() { Self::status_task() } else { Task::none() }
+                    Self::watch_task()
+                } else {
+                    Task::none()
+                };
+                let poll = if self.poll.tick() { Self::status_task() } else { Task::none() };
+                Task::batch([poll, watch])
             }
             Msg::Status(Ok(mut status)) => {
                 // The daemon is still answering while it winds down after
@@ -360,12 +403,9 @@ impl cosmic::Application for Applet {
                 }
                 let live = status.tunnel.connected;
                 if live {
-                    let t = &status.tunnel;
-                    if t.ping_seq > 0 {
-                        self.ping.push_seq(t.ping_seq, t.ping_us.map(|us| us as f32 / 1000.0));
-                    }
+                    self.take_ping(status.tunnel.ping_seq, status.tunnel.ping_us, Instant::now());
                 } else {
-                    self.ping.clear();
+                    self.forget_ping();
                 }
                 if live {
                     self.totals = (status.tunnel.rx_bytes, status.tunnel.tx_bytes);
@@ -393,7 +433,7 @@ impl cosmic::Application for Applet {
             }
             Msg::Status(Err(IpcError::Offline)) => {
                 self.status = None;
-                self.ping.clear();
+                self.forget_ping();
                 self.sampler.reset();
                 self.rates = Rates::default();
                 self.pending = None;
@@ -500,7 +540,8 @@ impl cosmic::Application for Applet {
                 if self.popup.is_none() {
                     // The HOST card would otherwise show the last reading from before it closed.
                     self.host_reading = self.host.sample();
-                    Task::batch([surface, self.poll()])
+                    // And the probe starts now, not at the next tick.
+                    Task::batch([surface, self.poll(), Self::watch_task()])
                 } else {
                     surface
                 }
@@ -772,6 +813,31 @@ mod tests {
         s.tunnel.connected = false;
         let _ = applet.update(Msg::Status(Ok(s)));
         assert_eq!(applet.ping.summary(true).quality, yutani::applet::ping::Quality::Idle, "cleared: no samples");
+    }
+
+    /// A sequence that stands still for more than 3 s (the probe paused for
+    /// want of a lease, or froze) clears the window: the row reads IDLE,
+    /// and the next new probe starts it again.
+    #[test]
+    fn a_stalled_probe_sequence_clears_the_window() {
+        let mut applet = applet();
+        let mut s = connected();
+        s.tunnel.ping_us = Some(360_000);
+        s.tunnel.ping_seq = 5;
+        let _ = applet.update(Msg::Status(Ok(s.clone())));
+        let _ = applet.update(Msg::Status(Ok(s.clone())));
+        assert_eq!(applet.ping.summary(true).value, "360", "a repeat within 3 s keeps the window");
+        let (seq, at) = applet.ping_seen.unwrap();
+        applet.ping_seen = Some((seq, at - Duration::from_millis(3_100)));
+        let _ = applet.update(Msg::Status(Ok(s.clone())));
+        let idle = applet.ping.summary(true);
+        assert_eq!((idle.quality, idle.dots.len()), (yutani::applet::ping::Quality::Idle, 0));
+        // Still the same seq: stays cleared rather than re-taking the old sample.
+        let _ = applet.update(Msg::Status(Ok(s.clone())));
+        assert!(applet.ping.summary(true).dots.is_empty());
+        s.tunnel.ping_seq = 6;
+        let _ = applet.update(Msg::Status(Ok(s)));
+        assert_eq!(applet.ping.summary(true).value, "360", "a new probe starts a fresh window");
     }
 
     /// M1: `quit` is acknowledged at once but the daemon spends up to 10 s

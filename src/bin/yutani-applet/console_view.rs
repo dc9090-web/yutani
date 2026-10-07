@@ -287,8 +287,10 @@ fn ping_row<'a>(n: &Network) -> Element<'a, Msg> {
     // The quality word alone on the right; JIT · LOSS sits under the
     // MIN/AVG/MAX line instead. The handoff's three columns (64 · 240 · 74)
     // do not fit a 360 px popover with three-digit pings: the sparkline was
-    // clipped and both stat lines wrapped.
-    let right = Row::new().spacing(6).align_y(Alignment::Center).push(t(p.quality.word(), skin::QUALITY_WORD, q)).push(led(q, false, 6.0));
+    // clipped and both stat lines wrapped. A fixed width, right-aligned,
+    // so NOMINAL → DEGRADED → IDLE does not reflow the sparkline.
+    let word = Row::new().spacing(6).align_y(Alignment::Center).push(t(p.quality.word(), skin::QUALITY_WORD, q)).push(led(q, false, 6.0));
+    let right = widget::container(word).width(Length::Fixed(skin::QUALITY_W)).align_x(Horizontal::Right);
     Row::new().width(Length::Fill).padding(skin::ROW_PAD).spacing(skin::ROW_GAP).align_y(Alignment::Center).push(left).push(middle).push(right).into()
 }
 

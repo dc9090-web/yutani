@@ -5,11 +5,33 @@
 //! absolute thresholds.
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 pub const WINDOW: usize = 34;
 pub const SPARK_W: f32 = 240.0;
 pub const SPARK_H: f32 = 22.0;
 const DASH: &str = "—";
+/// A probe sequence that has not moved for longer than this (the probe is
+/// paused for want of a lease, frozen or gone) means the window is stale.
+pub const STALE_AFTER: Duration = Duration::from_secs(3);
+
+/// Whether a sequence that last advanced at `last_advance` is stale at
+/// `now`. One that never advanced has nothing to go stale.
+pub fn stale(last_advance: Option<Instant>, now: Instant) -> bool {
+    last_advance.is_some_and(|at| now.saturating_duration_since(at) > STALE_AFTER)
+}
+
+/// The median of `ok` (unsorted); 0 when empty, the mean of the middle
+/// two for an even count.
+fn median(ok: &[f32]) -> f32 {
+    let mut sorted = ok.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    match sorted.len() {
+        0 => 0.0,
+        l if l % 2 == 1 => sorted[l / 2],
+        l => (sorted[l / 2 - 1] + sorted[l / 2]) / 2.0,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quality {
@@ -137,15 +159,7 @@ impl PingWindow {
             })
             .collect();
         let latest = ok.last().copied();
-        let median = {
-            let mut sorted = ok.clone();
-            sorted.sort_by(f32::total_cmp);
-            match sorted.len() {
-                0 => 0.0,
-                l if l % 2 == 1 => sorted[l / 2],
-                l => (sorted[l / 2 - 1] + sorted[l / 2]) / 2.0,
-            }
-        };
+        let median = median(&ok);
         let int = |v: f32| format!("{}", v.round() as i64);
         if ok.is_empty() {
             return PingSummary {
@@ -240,6 +254,28 @@ mod tests {
         assert_eq!((s.value.as_str(), s.dots.len()), ("7", 1), "old samples dropped");
         w.push_seq(1, Some(9.0));
         assert_eq!(w.summary(true).value, "7", "equal is still ignored");
+    }
+
+    #[test]
+    fn an_even_count_takes_the_mean_of_the_middle_two() {
+        assert_eq!(median(&[330.0, 300.0, 320.0, 310.0]), 315.0);
+        assert_eq!(median(&[5.0, 1.0, 3.0]), 3.0);
+        assert_eq!(median(&[]), 0.0);
+        // Through `judge`: [300, 310, 320, x] has median 315 for x > 320, so the
+        // DEGRADED line is 1.25 × 315 + 10 = 403.75 — not 397.5 (the lower
+        // middle, 310) or 410 (the upper, 320).
+        let q = |x: f32| window(&[Some(300.0), Some(310.0), Some(320.0), Some(x)]).summary(true).quality;
+        assert_eq!(q(403.0), Quality::Nominal);
+        assert_eq!(q(404.0), Quality::Degraded);
+    }
+
+    #[test]
+    fn a_sequence_is_stale_only_after_three_quiet_seconds() {
+        let t0 = Instant::now();
+        assert!(!stale(None, t0), "never advanced: nothing to clear");
+        assert!(!stale(Some(t0), t0 + STALE_AFTER), "3 s is not more than 3 s");
+        assert!(stale(Some(t0), t0 + STALE_AFTER + Duration::from_millis(1)));
+        assert!(!stale(Some(t0 + Duration::from_secs(1)), t0), "a clock read before the advance is not stale");
     }
 
     /// Newest at the right edge, 3 px and opaque; oldest 2 px at .3.

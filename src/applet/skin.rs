@@ -108,6 +108,10 @@ pub const SCOPE_HEIGHT: f32 = 104.0;
 pub const SCOPE_INSET: f32 = 12.0;
 pub const CORNER_MARK_PX: f32 = 7.0;
 pub const PING_LEFT_W: f32 = 64.0;
+/// The ping row's right column (quality word, 6 px gap, 6 px LED), sized
+/// for its longest word, `DEGRADED`, so the row does not reflow as the
+/// word changes. Checked against the bundled font in the tests.
+pub const QUALITY_W: f32 = 57.0;
 pub const FACTS_PAD: Padding = pad(7.0, 12.0, 8.0, 12.0);
 
 pub const HOST_PAD: Padding = pad(8.0, 12.0, 9.0, 12.0);
@@ -362,6 +366,18 @@ mod tests {
         assert_eq!(hex(QUIT_HOVER), (0xff, 0x4a, 0x3d, 0x1a));
         assert_eq!(hex(OVERFLOW_OPEN), (0x7c, 0xe3, 0x8b, 0x1a));
         assert_eq!(hex(LAUNCH_GLOW), (0x7c, 0xe3, 0x8b, 0x40));
+    }
+
+    /// `DEGRADED` (8 glyphs of 8.5 px B612 Mono Bold) + the 6 px gap + the
+    /// 6 px LED, rounded up to a whole pixel so the word never wraps.
+    #[test]
+    fn the_quality_column_fits_degraded_and_its_led() {
+        let word: f32 = "DEGRADED".chars().map(|c| crate::applet::fonts::advance_em(Face::MonoBold, c)).sum::<f32>() * QUALITY_WORD.size;
+        let eight = crate::applet::fonts::advance_em(Face::MonoBold, 'D') * QUALITY_WORD.size * 8.0;
+        assert!((word - eight).abs() < 1e-3, "a monospace face");
+        let need = eight + 6.0 + 6.0;
+        assert!(QUALITY_W >= need && QUALITY_W < need + 1.0, "QUALITY_W {QUALITY_W} for {need}");
+        assert_eq!(QUALITY_WORD.track, 0.0, "an untracked word: the sum above is its width");
     }
 
     #[test]
