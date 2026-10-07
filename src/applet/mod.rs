@@ -16,6 +16,7 @@ pub mod ping;
 pub mod rate;
 pub mod rocker;
 pub mod sand;
+pub mod skin;
 pub mod theme;
 
 use std::time::{Duration, Instant};
