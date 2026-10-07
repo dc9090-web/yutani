@@ -101,16 +101,17 @@ pub fn mark_class() -> cosmic::theme::Svg {
     cosmic::theme::Svg::custom(|theme| cosmic::iced::widget::svg::Style { color: Some(mark_ink(theme.cosmic())) })
 }
 
-/// The status badge's fill on a dark panel, and whether it glows.
-pub fn badge_fill(badge: super::icon::Badge) -> (Color, bool) {
+/// The status badge's fill on a dark panel. No glow: Daniel asked for a
+/// plain dot in the tray (2026-10-07).
+pub fn badge_fill(badge: super::icon::Badge) -> Color {
     use super::icon::Badge;
     match badge {
-        Badge::Connected => (crate::applet::skin::PHOSPHOR, true),
-        Badge::Attention | Badge::Sync => (crate::applet::skin::AMBER, false),
+        Badge::Connected => crate::applet::skin::PHOSPHOR,
+        Badge::Attention | Badge::Sync => crate::applet::skin::AMBER,
     }
 }
 
-/// The status badge: phosphor (glowing) or amber on a dark panel, the
+/// The status badge: phosphor or amber on a dark panel, the
 /// theme's success/warning on a light one (phosphor on a light grey is
 /// under 2:1); a 1.5 px ring in the panel's own colour; Sync is a hollow
 /// outline.
@@ -119,16 +120,17 @@ pub fn badge_class(badge: super::icon::Badge) -> cosmic::theme::Container<'stati
     cosmic::theme::Container::custom(move |theme| {
         let c = theme.cosmic();
         let panel = panel_bg(c);
-        let (fill, glow) = if c.is_dark {
+        let fill = if c.is_dark {
             badge_fill(badge)
+        } else if badge == Badge::Connected {
+            success(c)
         } else {
-            (if badge == Badge::Connected { success(c) } else { warning(c) }, false)
+            warning(c)
         };
         let (bg, ring) = if badge == Badge::Sync { (panel, fill) } else { (fill, panel) };
         container::Style {
             background: Some(Background::Color(bg)),
             border: Border { radius: Radius::from(1.0), width: BADGE_RING_PX, color: ring },
-            shadow: if glow { cosmic::iced::Shadow { color: Color { a: 0.5, ..fill }, offset: cosmic::iced::Vector::ZERO, blur_radius: 3.0 } } else { Default::default() },
             ..Default::default()
         }
     })
@@ -146,8 +148,8 @@ mod tests {
         assert_eq!(badge_px(64.0), 10.0);
         assert_eq!(BADGE_RING_PX, 1.5);
         assert_eq!(DIM_OPACITY, 0.40);
-        assert_eq!(badge_fill(crate::applet::icon::Badge::Connected), (crate::applet::skin::PHOSPHOR, true));
-        assert_eq!(badge_fill(crate::applet::icon::Badge::Attention), (crate::applet::skin::AMBER, false));
+        assert_eq!(badge_fill(crate::applet::icon::Badge::Connected), crate::applet::skin::PHOSPHOR);
+        assert_eq!(badge_fill(crate::applet::icon::Badge::Attention), crate::applet::skin::AMBER);
     }
 
     #[test]
