@@ -177,10 +177,14 @@ mod tests {
     #[test]
     fn a_closed_port_is_a_loss() {
         block_on(async {
-            // Bind and drop: the port is now closed and refuses at once.
-            let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-            let target = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            // Bound but never listening, and held for the whole test: the
+            // port refuses at once and no other test can take it meanwhile
+            // (binding and dropping raced a parallel listener, 2026-10-07).
+            let held = tokio::net::TcpSocket::new_v4().unwrap();
+            held.bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+            let target = held.local_addr().unwrap();
             assert_eq!(connect_rtt(Ipv4Addr::LOCALHOST, target, TIMEOUT).await, None);
+            drop(held);
         });
     }
 
