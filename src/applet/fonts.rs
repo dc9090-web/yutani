@@ -93,17 +93,35 @@ mod tests {
 
     #[test]
     fn every_face_parses_and_has_the_glyphs_it_is_used_for() {
+        // B612 Mono has no ▲ or ◄ (it does have ▼ ▶); those would fall back.
         for face in [Face::Mono, Face::MonoBold] {
-            for ch in "YUTANI 0123456789·—▲▼◄▶…%°/+:.".chars() {
-                assert!(advance_em(face, ch) > 0.0, "{face:?} {ch:?}");
+            for ch in "YUTANI 0123456789·—▼▶…%°/+:.".chars() {
+                assert!(raw_advance(face, ch).is_some(), "{face:?} {ch:?}");
             }
         }
         for ch in "YUTANI01234".chars() {
-            assert!(advance_em(Face::Display, ch) > 0.0, "{ch:?}");
+            assert!(raw_advance(Face::Display, ch).is_some(), "Display {ch:?}");
         }
         for ch in "ユタニ重工".chars() {
-            assert!(advance_em(Face::Jp, ch) > 0.0, "{ch:?}");
+            assert!(raw_advance(Face::Jp, ch).is_some(), "Jp {ch:?}");
         }
+    }
+
+    /// Each embedded font's family (typographic ID 16 if present, else ID 1)
+    /// is the name `font()` asks for.
+    #[test]
+    fn embedded_family_names_match_the_constants() {
+        fn family(bytes: &[u8]) -> String {
+            let face = ttf_parser::Face::parse(bytes, 0).unwrap();
+            let find = |id| {
+                face.names().into_iter().find(|n| n.name_id == id && n.is_unicode()).and_then(|n| n.to_string())
+            };
+            find(16).or_else(|| find(1)).expect("family name")
+        }
+        assert_eq!(family(B612_MONO), FAMILY_MONO);
+        assert_eq!(family(B612_MONO_BOLD), FAMILY_MONO);
+        assert_eq!(family(MICHROMA), FAMILY_DISPLAY);
+        assert_eq!(family(NOTO_JP), FAMILY_JP);
     }
 
     /// B612 Mono is monospaced: every digit has the same advance, so the
@@ -120,7 +138,13 @@ mod tests {
     /// collapsing to zero width.
     #[test]
     fn a_missing_glyph_falls_back_to_a_digit_width() {
-        assert_eq!(advance_em(Face::Jp, 'Q'), advance_em(Face::Jp, '0').max(advance_em(Face::Mono, '0')));
+        let mono0 = raw_advance(Face::Mono, '0').unwrap();
+        let jp0 = raw_advance(Face::Jp, '0').unwrap_or(0.0);
+        assert!(raw_advance(Face::Jp, 'Q').is_none());
+        assert_eq!(advance_em(Face::Jp, 'Q'), jp0.max(mono0));
+        let display0 = raw_advance(Face::Display, '0').unwrap();
+        assert!(raw_advance(Face::Display, 'ユ').is_none());
+        assert_eq!(advance_em(Face::Display, 'ユ'), display0.max(mono0));
     }
 
     #[test]
