@@ -65,12 +65,24 @@ fn process_name_matches(comm: &str, argv0: &str, patterns: &[String]) -> bool {
     is_eve_process(comm.trim(), patterns) || is_eve_process(argv0, patterns)
 }
 
+/// The kernel keeps `comm` to `TASK_COMM_LEN - 1` = 15 bytes, cutting a
+/// longer name there. So only a `comm` of exactly 15 bytes may be a cut
+/// one; a shorter `comm` is the whole name, and argv[0] cannot add a match
+/// to it. (`evelauncher.exe` is itself 15 characters and matches through
+/// `comm` directly.)
+fn needs_argv0(comm: &str) -> bool {
+    comm.trim_end_matches('\n').len() == 15
+}
+
 /// The matching name of the process at `dir` (`/proc/<pid>`), or `None`.
-/// argv[0] is read only when `comm` does not match (a few hundred
-/// processes per tick otherwise).
+/// argv[0] (`cmdline`) is read only when `comm` does not match and may be
+/// truncated ([`needs_argv0`]): a few hundred processes per tick otherwise.
 fn process_name(dir: &std::path::Path, comm: &str, patterns: &[String]) -> Option<String> {
     if is_eve_process(comm.trim(), patterns) {
         return Some(comm.trim().to_string());
+    }
+    if !needs_argv0(comm) {
+        return None;
     }
     let cmdline = std::fs::read(dir.join("cmdline")).unwrap_or_default();
     let argv0 = cmdline.split(|b| *b == 0).next().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
@@ -290,6 +302,15 @@ mod tests {
         assert!(is_eve_process("/some/pfx/drive_c/EVE/eve-online.exe", &pats()));
         assert!(!is_eve_process("wineserver", &pats()));
         assert!(!is_eve_process("exefile.exe.old", &pats()));
+    }
+
+    #[test]
+    fn argv0_is_read_only_for_a_comm_the_kernel_may_have_cut() {
+        assert!(needs_argv0("evelauncher.exe"), "15 bytes: may be cut");
+        assert!(needs_argv0("exefile-long-na\n"), "the trailing newline does not count");
+        assert!(!needs_argv0("wineserver\n"), "shorter: the whole name");
+        assert!(!needs_argv0("exefile.exe"));
+        assert!(!needs_argv0(""));
     }
 
     #[test]

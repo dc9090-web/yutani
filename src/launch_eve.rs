@@ -78,6 +78,9 @@ pub struct Launch<H> {
     known: HashSet<H>,
     /// Steam windows that were visible when the launch started: left alone.
     steam_open: HashSet<H>,
+    /// Steam windows this launch has minimised: never again, so one the
+    /// user restores stays restored.
+    minimised: HashSet<H>,
     launcher_seen: bool,
     launcher_gone_since: Option<u64>,
     target: Option<H>,
@@ -110,6 +113,7 @@ impl<H: Clone + Eq + Hash> Launch<H> {
             now_ms,
             steam_open: steam.into_iter().filter(|(_, v)| *v).map(|(h, _)| h).collect(),
             known,
+            minimised: HashSet::new(),
             launcher_seen: false,
             launcher_gone_since: None,
             target: None,
@@ -127,8 +131,18 @@ impl<H: Clone + Eq + Hash> Launch<H> {
         self.target.as_ref()
     }
 
-    fn active(&self) -> bool {
+    /// Still running: neither finished nor failed. A launch that ended
+    /// but is still shown is not active.
+    pub fn active(&self) -> bool {
         !self.state.finished() && !self.state.is_failed()
+    }
+
+    /// Does the next tick need to know whether the EVE Launcher is alive?
+    /// Only while step 1 (it is how Steam handing EVE on is seen) or step 3
+    /// (its 10 s "launcher gone" timer) runs; otherwise the daemon skips
+    /// the `/proc` walk.
+    pub fn wants_launcher(&self) -> bool {
+        self.active() && (self.state.steps[0] == Step::Running || self.state.steps[2] == Step::Running)
     }
 
     fn end(&mut self) {
@@ -213,8 +227,16 @@ impl<H: Clone + Eq + Hash> Launch<H> {
                 }
                 Vec::new()
             }
+            // A Steam window that pops up while Steam is the step being
+            // waited on is minimised, once. After Steam handed EVE on, its
+            // windows (a dialog that needs an answer, say) are the user's.
             Obs::SteamWindow { handle, visible } => {
-                if visible && !self.steam_open.contains(&handle) { vec![Effect::Minimise(handle)] } else { Vec::new() }
+                let steam_step = self.state.steps[0] != Step::Done || self.state.steps[1] != Step::Done;
+                if visible && steam_step && !self.steam_open.contains(&handle) && self.minimised.insert(handle.clone()) {
+                    vec![Effect::Minimise(handle)]
+                } else {
+                    Vec::new()
+                }
             }
         }
     }
@@ -383,7 +405,58 @@ mod tests {
         // Once the launch is over, Steam is the user's again.
         l.observe(Obs::ClientAppeared(7));
         l.observe(Obs::ClientPlaced { handle: 7, slot: 3 });
-        assert!(l.observe(Obs::SteamWindow { handle: 51, visible: true }).is_empty());
+        assert!(l.observe(Obs::SteamWindow { handle: 53, visible: true }).is_empty());
+    }
+
+    /// The backend reports a visible Steam window on every update: one the
+    /// user restores after it was minimised must stay restored.
+    #[test]
+    fn a_restored_steam_window_is_not_minimised_again() {
+        let mut l = started();
+        assert_eq!(l.observe(Obs::SteamWindow { handle: 52, visible: true }), vec![Effect::Minimise(52)]);
+        assert!(l.observe(Obs::SteamWindow { handle: 52, visible: false }).is_empty());
+        assert!(l.observe(Obs::SteamWindow { handle: 52, visible: true }).is_empty(), "restored by the user");
+        assert!(l.observe(Obs::SteamWindow { handle: 52, visible: true }).is_empty(), "any later update");
+    }
+
+    /// Once Steam handed EVE on (step 1 done), a Steam window that pops up
+    /// — a dialog that wants an answer — is left alone.
+    #[test]
+    fn a_steam_window_after_step_one_is_left_alone() {
+        let mut l = started();
+        l.observe(tick(1_000, true));
+        assert_eq!(l.state().steps[0], Done);
+        assert!(l.observe(Obs::SteamWindow { handle: 52, visible: true }).is_empty());
+    }
+
+    #[test]
+    fn the_launcher_is_wanted_only_while_step_one_or_three_runs() {
+        let mut l = started();
+        assert!(l.wants_launcher(), "step 1: the launcher is how Steam handing on is seen");
+        l.observe(tick(1_000, true));
+        assert_eq!(l.state().steps[2], Running);
+        assert!(l.wants_launcher(), "step 3: the launcher-gone timer");
+        l.observe(Obs::ClientAppeared(7));
+        assert_eq!(l.state().steps[3], Running);
+        assert!(!l.wants_launcher(), "step 4: only placement matters");
+        l.observe(Obs::ClientPlaced { handle: 7, slot: 1 });
+        assert!(!l.wants_launcher(), "finished");
+        let mut f = started();
+        f.observe(Obs::SpawnFailed("x".into()));
+        assert!(!f.wants_launcher(), "failed");
+    }
+
+    #[test]
+    fn active_until_finished_or_failed() {
+        let mut l = started();
+        assert!(l.active());
+        l.observe(Obs::ClientAppeared(7));
+        assert!(l.active());
+        l.observe(Obs::ClientPlaced { handle: 7, slot: 1 });
+        assert!(!l.active());
+        let mut f = started();
+        f.observe(Obs::SpawnFailed("x".into()));
+        assert!(!f.active());
     }
 
     #[test]
