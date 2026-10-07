@@ -14,7 +14,10 @@ use cosmic::iced::{Rectangle, Subscription};
 use cosmic::surface::action::{app_popup, destroy_popup};
 
 use yutani::applet::client::{self, IpcError};
-use yutani::applet::display::{Popover, degrade, popover};
+use yutani::applet::console::{Console, Inputs, console};
+use yutani::applet::display::degrade;
+use yutani::applet::host::{HostReading, HostSampler, Sources};
+use yutani::applet::ping::PingWindow;
 use yutani::applet::history::History;
 use yutani::applet::rate::{Rates, Sampler};
 use yutani::applet::{
@@ -52,6 +55,19 @@ pub struct Applet {
     /// The last `err …` reply, shown for 3 s — or what a tunnel action is
     /// still doing, shown until the daemon answers it.
     pub note: Option<Note>,
+    /// The HOST card's sampler, read at 1 Hz while the popover is open.
+    pub host: HostSampler,
+    pub host_reading: HostReading,
+    /// Ping samples (Phase 2 feeds it; empty until then).
+    pub ping: PingWindow,
+    /// Session totals `(rx, tx)`: the counters while connected, frozen
+    /// otherwise.
+    pub totals: (u64, u64),
+    /// "Start" was pressed: the service rocker shows pending until a
+    /// status reply arrives or this deadline passes.
+    pub starting: Option<Instant>,
+    /// The popover's scanline overlay (cached geometry).
+    pub glass: crate::widgets::Glass,
 }
 
 /// A one-line note under a menu row (spec §7): what went wrong, when it was
@@ -85,6 +101,10 @@ pub enum Msg {
     /// Popup create/destroy, handled by libcosmic.
     Surface(cosmic::surface::Action<Msg>),
     PopupClosed(Id),
+    /// The bundled fonts finished loading (`false`: at least one failed).
+    FontsLoaded(bool),
+    /// The primary button's Launch EVE (Phase 3 handles it).
+    Launch,
 }
 
 /// How long "Start Yutani" watches the child before taking silence as
@@ -193,10 +213,10 @@ impl Applet {
             .is_some_and(|(want, until)| still_pending(until, Instant::now(), pending_done(want, observed)))
     }
 
-    pub fn popover(&self) -> Popover {
-        // The panel's own output (the daemon lists them all); the height
-        // left for the popover is that output's minus the panel strip.
-        let available = self.status.as_ref().and_then(|s| {
+    /// The panel's own output (the daemon lists them all); the height
+    /// left for the popover is that output's minus the panel strip.
+    pub fn available(&self) -> Option<i32> {
+        self.status.as_ref().and_then(|s| {
             let mine = &self.core.applet.output_name;
             s.outputs
                 .iter()
@@ -204,8 +224,23 @@ impl Applet {
                 .map(|o| o.height)
                 .or_else(|| s.outputs.iter().map(|o| o.height).filter(|h| *h > 0).min())
                 .map(|h| h - PANEL_RESERVE)
-        });
-        popover(self.status.as_ref(), self.rates, self.history.bars(), available, self.menu_open)
+        })
+    }
+
+    pub fn console(&self) -> Console {
+        let available = self.available();
+        let starting = self.starting.is_some_and(|until| Instant::now() < until);
+        let inputs = Inputs {
+            rates: self.rates,
+            totals: self.totals,
+            host: &self.host_reading,
+            ping: &self.ping,
+            tunnel_pending: self.pending.filter(|_| self.pending()).map(|(want, _)| want),
+            service_pending: starting || self.quitting.is_some(),
+            available,
+            menu_open: self.menu_open,
+        };
+        console(self.status.as_ref(), &inputs)
     }
 
     /// Ask for a `status` now, or — if one is already outstanding — leave
@@ -284,11 +319,18 @@ impl cosmic::Application for Applet {
             history: History::new(),
             menu_open: false,
             note: None,
+            host: HostSampler::new(Sources::discover()),
+            host_reading: HostReading::default(),
+            ping: PingWindow::default(),
+            totals: (0, 0),
+            starting: None,
+            glass: Default::default(),
         };
         // Through the guard like every other poll, so the very first reply
         // releases it instead of finding it never armed.
         let first = applet.poll();
-        (applet, first)
+        let fonts = yutani::applet::fonts::load_all().map(|ok| cosmic::Action::App(Msg::FontsLoaded(ok)));
+        (applet, Task::batch([first, fonts]))
     }
 
     fn on_close_requested(&self, id: Id) -> Option<Msg> {
@@ -309,6 +351,9 @@ impl cosmic::Application for Applet {
                 if self.note.is_some() && self.visible_note().is_none() {
                     self.note = None;
                 }
+                if self.popup.is_some() {
+                    self.host_reading = self.host.sample();
+                }
                 if self.poll.tick() { Self::status_task() } else { Task::none() }
             }
             Msg::Status(Ok(mut status)) => {
@@ -322,6 +367,10 @@ impl cosmic::Application for Applet {
                     }
                 }
                 let live = status.tunnel.connected;
+                if live {
+                    self.totals = (status.tunnel.rx_bytes, status.tunnel.tx_bytes);
+                }
+                self.starting = None;
                 if live {
                     let now = self.now_ms();
                     self.rates =
@@ -383,13 +432,16 @@ impl cosmic::Application for Applet {
                 // Watch it for the window off the UI thread: a start that
                 // fails is a note under the row, not a menu stuck on
                 // "Start Yutani" with the reason in /dev/null.
-                Ok(exit) => Task::batch([
+                Ok(exit) => {
+                    self.starting = Some(Instant::now() + Duration::from_secs(PENDING_S));
+                    Task::batch([
                     self.poll(),
                     cosmic::task::future(async move {
                         let exit = tokio::time::timeout(START_WINDOW, exit).await.ok().and_then(Result::ok);
                         Msg::Done(Action::StartDaemon, start_outcome(exit))
                     }),
-                ]),
+                    ])
+                }
                 Err(err) => {
                     self.note(format!("cannot start yutani: {err}"), Some(Action::StartDaemon));
                     Task::none()
@@ -432,6 +484,9 @@ impl cosmic::Application for Applet {
                 self.poll()
             }
             Msg::Done(action, Err(msg)) => {
+                if action == Action::StartDaemon {
+                    self.starting = None;
+                }
                 if matches!(action, Action::Connect | Action::Disconnect) {
                     self.pending = None;
                 }
@@ -454,6 +509,14 @@ impl cosmic::Application for Applet {
                 }
                 Task::none()
             }
+            Msg::FontsLoaded(ok) => {
+                if !ok {
+                    yutani::applet::fonts::set_missing();
+                    tracing::warn!("a bundled font failed to load; using the COSMIC monospace");
+                }
+                Task::none()
+            }
+            Msg::Launch => Task::none(),
         }
     }
 
@@ -503,7 +566,7 @@ pub fn open_popup_message(bounds: Rectangle, offset: cosmic::iced::Vector) -> Ms
             settings
         },
         Some(Box::new(move |state: &Applet| {
-            cosmic::Element::from(state.core.applet.popup_container(view::popup(state)))
+            cosmic::Element::from(state.core.applet.popup_container(crate::console_view::popup(state)))
                 .map(cosmic::Action::App)
         })),
     ))
@@ -801,5 +864,36 @@ mod tests {
         assert!(applet.note.as_ref().is_some_and(|n| n.progress));
         let _ = applet.update(Msg::Status(Err(IpcError::Offline)));
         assert!(applet.note.is_none(), "no row owns the wait once the daemon is gone");
+    }
+
+    /// Totals are the counters while connected and freeze — not reset —
+    /// when the tunnel or the service goes away.
+    #[test]
+    fn session_totals_freeze_when_the_tunnel_goes_down() {
+        let mut applet = applet();
+        let mut s = connected();
+        s.tunnel.rx_bytes = 5_000_000;
+        s.tunnel.tx_bytes = 1_000_000;
+        let _ = applet.update(Msg::Status(Ok(s.clone())));
+        assert_eq!(applet.totals, (5_000_000, 1_000_000));
+        s.tunnel.connected = false;
+        s.tunnel.rx_bytes = 0;
+        s.tunnel.tx_bytes = 0;
+        let _ = applet.update(Msg::Status(Ok(s)));
+        assert_eq!(applet.totals, (5_000_000, 1_000_000));
+        let _ = applet.update(Msg::Status(Err(IpcError::Offline)));
+        assert_eq!(applet.totals, (5_000_000, 1_000_000));
+    }
+
+    /// Starting the service shows the pending rocker until a status reply
+    /// proves the daemon is up.
+    #[test]
+    fn the_service_rocker_is_pending_until_the_daemon_answers() {
+        let mut applet = applet();
+        let _ = applet.update(Msg::Status(Err(IpcError::Offline)));
+        applet.starting = Some(Instant::now() + Duration::from_secs(PENDING_S));
+        assert!(applet.console().control[0].rocker == yutani::applet::console::RockerState::Pending);
+        let _ = applet.update(Msg::Status(Ok(connected())));
+        assert!(applet.starting.is_none());
     }
 }

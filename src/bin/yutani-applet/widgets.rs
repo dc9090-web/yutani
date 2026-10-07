@@ -1,0 +1,320 @@
+//! The popover's drawn pieces (Nostromo handoff): the sand-field scope,
+//! the ping sparkline, the rockers, dotted section rules, corner brackets,
+//! the glass overlay and the footer's blinking cursor. Anything that moves
+//! animates inside its own canvas — `RedrawRequested` steps it and asks for
+//! the next frame — so the popover's `view()` is not rebuilt per frame.
+
+use std::time::{Duration, Instant};
+
+use cosmic::Renderer;
+use cosmic::iced::mouse;
+use cosmic::iced::widget::canvas::{self, Action, Event, Frame, Geometry, Path, Stroke};
+use cosmic::iced::{Color, Point, Rectangle, Size, window};
+
+use yutani::applet::console::RockerState;
+use yutani::applet::ping::{Dot, SPARK_H, SPARK_W};
+use yutani::applet::rocker::knob_left;
+use yutani::applet::sand::{Drive, Sand, Tint};
+use yutani::applet::skin::{self, AMBER, BG, CORNER_MARK_PX, DIM, DIMMER, LINE, LINE_2, PHOSPHOR, WHITE};
+
+fn alpha(c: Color, a: f32) -> Color {
+    Color { a, ..c }
+}
+
+// ---- scope ---------------------------------------------------------------------
+
+/// The sand field behind the network readouts.
+pub struct Scope {
+    pub drive: Drive,
+}
+
+#[derive(Default)]
+pub struct ScopeState {
+    sand: Option<Sand>,
+    last: Option<Instant>,
+}
+
+impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Scope {
+    type State = ScopeState;
+
+    fn update(&self, state: &mut ScopeState, event: &Event, bounds: Rectangle, _: mouse::Cursor) -> Option<Action<M>> {
+        let Event::Window(window::Event::RedrawRequested(now)) = event else { return None };
+        let dt = state.last.map_or(0.0, |l| now.saturating_duration_since(l).as_secs_f32());
+        state.last = Some(*now);
+        let sand = state.sand.get_or_insert_with(|| Sand::new(bounds.width, bounds.height, 0x5EED));
+        sand.resize(bounds.width, bounds.height);
+        sand.step(dt, self.drive);
+        Some(Action::request_redraw())
+    }
+
+    fn draw(&self, state: &ScopeState, renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        if let Some(sand) = &state.sand {
+            for (x, y, size, tint, level) in sand.dots(self.drive) {
+                if level == 0 {
+                    continue;
+                }
+                let base = match tint {
+                    Tint::Downlink => PHOSPHOR,
+                    Tint::Uplink => AMBER,
+                    Tint::Spark => WHITE,
+                };
+                frame.fill_rectangle(Point::new(x, y), Size::new(size, size), alpha(base, f32::from(level) / 10.0));
+            }
+        }
+        // 7×7 phosphor corner marks inside each corner.
+        let (w, h, m) = (bounds.width, bounds.height, CORNER_MARK_PX);
+        for (x, y, dx, dy) in [(0.0, 0.0, 1.0, 1.0), (w, 0.0, -1.0, 1.0), (0.0, h, 1.0, -1.0), (w, h, -1.0, -1.0)] {
+            let path = Path::new(|p| {
+                p.move_to(Point::new(x + dx * m, y + dy * 0.5));
+                p.line_to(Point::new(x + dx * 0.5, y + dy * 0.5));
+                p.line_to(Point::new(x + dx * 0.5, y + dy * m));
+            });
+            frame.stroke(&path, Stroke::default().with_color(PHOSPHOR).with_width(1.0));
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+// ---- ping sparkline -------------------------------------------------------------
+
+pub struct Sparkline {
+    pub dots: Vec<Dot>,
+    pub avg_y: f32,
+    pub color: Color,
+    pub live: bool,
+}
+
+impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Sparkline {
+    type State = ();
+
+    fn draw(&self, _: &(), renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        let base = SPARK_H - 0.5;
+        frame.stroke(&Path::line(Point::new(0.0, base), Point::new(SPARK_W, base)), Stroke::default().with_color(LINE).with_width(1.0));
+        if self.live {
+            // The average: white 30 %, dashed 1 4.
+            let mut x = 0.0;
+            while x < SPARK_W {
+                frame.fill_rectangle(Point::new(x, self.avg_y - 0.5), Size::new(1.0, 1.0), alpha(WHITE, 0.3));
+                x += 5.0;
+            }
+        }
+        for d in &self.dots {
+            frame.fill_rectangle(Point::new(d.x, d.y), Size::new(d.size, d.size), alpha(self.color, d.opacity));
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+// ---- rocker ---------------------------------------------------------------------
+
+/// The 38×19 rocker. The knob slides for 120 ms whenever `on` flips.
+pub struct Rocker {
+    pub state: RockerState,
+}
+
+#[derive(Default)]
+pub struct RockerAnim {
+    shown: Option<bool>,
+    flipped: Option<Instant>,
+}
+
+impl Rocker {
+    fn on(&self) -> bool {
+        matches!(self.state, RockerState::On | RockerState::Pending)
+    }
+}
+
+impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Rocker {
+    type State = RockerAnim;
+
+    fn update(&self, s: &mut RockerAnim, event: &Event, _: Rectangle, _: mouse::Cursor) -> Option<Action<M>> {
+        let Event::Window(window::Event::RedrawRequested(now)) = event else { return None };
+        let on = self.on();
+        if s.shown.is_some_and(|shown| shown != on) {
+            s.flipped = Some(*now);
+        }
+        s.shown = Some(on);
+        let moving = s.flipped.is_some_and(|f| now.saturating_duration_since(f) < Duration::from_millis(yutani::applet::rocker::KNOB_MS));
+        moving.then(Action::request_redraw)
+    }
+
+    fn draw(&self, s: &RockerAnim, renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        let (fill, edge, knob_ink, opacity) = match self.state {
+            RockerState::Off => (None, LINE_2, DIM, 1.0),
+            RockerState::On => (Some(PHOSPHOR), PHOSPHOR, BG, 1.0),
+            RockerState::Pending => (Some(AMBER), AMBER, BG, 1.0),
+            RockerState::Disabled => (None, LINE, DIMMER, 0.45),
+        };
+        let rect = Path::rounded_rectangle(Point::new(0.5, 0.5), Size::new(skin::TOGGLE_W - 1.0, skin::TOGGLE_H - 1.0), 2.0.into());
+        if let Some(f) = fill {
+            frame.fill(&rect, alpha(f, opacity));
+        }
+        frame.stroke(&rect, Stroke::default().with_color(alpha(edge, opacity)).with_width(1.0));
+        let since = s.flipped.map(|f| Instant::now().saturating_duration_since(f));
+        let left = knob_left(self.on(), since);
+        let knob = Path::rounded_rectangle(Point::new(left, 3.0), Size::new(skin::KNOB_PX, skin::KNOB_PX), 1.0.into());
+        frame.fill(&knob, alpha(knob_ink, opacity));
+        vec![frame.into_geometry()]
+    }
+}
+
+// ---- dotted rule ------------------------------------------------------------------
+
+/// The section header's dotted rule: 2 px `LINE_2`, 3 px gap, 1 px high.
+pub struct DottedRule;
+
+impl<M> canvas::Program<M, cosmic::Theme, Renderer> for DottedRule {
+    type State = ();
+
+    fn draw(&self, _: &(), renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        let y = (bounds.height / 2.0).floor();
+        let mut x = 0.0;
+        while x < bounds.width {
+            frame.fill_rectangle(Point::new(x, y), Size::new(2.0, 1.0), LINE_2);
+            x += 5.0;
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+// ---- corner brackets ----------------------------------------------------------------
+
+/// 8×8 phosphor brackets, top-left and bottom-right, on the two
+/// interactive cards.
+pub struct Brackets;
+
+impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Brackets {
+    type State = ();
+
+    fn draw(&self, _: &(), renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        let (w, h, b) = (bounds.width, bounds.height, skin::BRACKET_PX);
+        frame.fill_rectangle(Point::ORIGIN, Size::new(b, 1.0), PHOSPHOR);
+        frame.fill_rectangle(Point::ORIGIN, Size::new(1.0, b), PHOSPHOR);
+        frame.fill_rectangle(Point::new(w - b, h - 1.0), Size::new(b, 1.0), PHOSPHOR);
+        frame.fill_rectangle(Point::new(w - 1.0, h - b), Size::new(1.0, b), PHOSPHOR);
+        vec![frame.into_geometry()]
+    }
+}
+
+// ---- glass -----------------------------------------------------------------------------
+
+/// Scanlines (one dark row in three) and the 70 % phosphor top line, over
+/// the whole popover. Cached: redrawn only when the size changes. Never
+/// handles an event, so the controls under it get every click.
+#[derive(Default)]
+pub struct Glass {
+    cache: canvas::Cache,
+}
+
+impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Glass {
+    type State = ();
+
+    fn draw(&self, _: &(), renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
+        vec![self.cache.draw(renderer, bounds.size(), |frame| {
+            let mut y = 2.0;
+            while y < bounds.height {
+                frame.fill_rectangle(Point::new(0.0, y), Size::new(bounds.width, 1.0), skin::SCANLINE);
+                y += 3.0;
+            }
+            frame.fill_rectangle(Point::ORIGIN, Size::new(bounds.width, 1.0), skin::TOP_LINE);
+        })]
+    }
+}
+
+// ---- cursor ----------------------------------------------------------------------------
+
+/// The footer's 6×9 block cursor, blinking at 1 Hz, stepped.
+pub struct Cursor;
+
+impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Cursor {
+    type State = Option<Instant>;
+
+    fn update(&self, start: &mut Option<Instant>, event: &Event, _: Rectangle, _: mouse::Cursor) -> Option<Action<M>> {
+        let Event::Window(window::Event::RedrawRequested(now)) = event else { return None };
+        let s = *start.get_or_insert(*now);
+        let ms = now.saturating_duration_since(s).as_millis() as u64;
+        Some(Action::request_redraw_at(*now + Duration::from_millis(500 - ms % 500)))
+    }
+
+    fn draw(&self, start: &Option<Instant>, renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        let on = start.is_none_or(|s| (Instant::now().saturating_duration_since(s).as_millis() / 500).is_multiple_of(2));
+        if on {
+            frame.fill_rectangle(Point::ORIGIN, bounds.size(), PHOSPHOR);
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+// ---- hazard stripe ---------------------------------------------------------------------
+
+/// The Steam notice's hazard stripe: 135° amber/black, 6 px each.
+pub struct Hazard;
+
+impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Hazard {
+    type State = ();
+
+    fn draw(&self, _: &(), renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        frame.fill_rectangle(Point::ORIGIN, bounds.size(), BG);
+        let h = bounds.height;
+        let mut x = -h;
+        while x < bounds.width + h {
+            let band = Path::new(|p| {
+                p.move_to(Point::new(x, 0.0));
+                p.line_to(Point::new(x + 6.0, 0.0));
+                p.line_to(Point::new(x + 6.0 - h, h));
+                p.line_to(Point::new(x - h, h));
+                p.close();
+            });
+            frame.fill(&band, AMBER);
+            x += 12.0;
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+// ---- arrow -----------------------------------------------------------------------------
+
+/// Which way an [`Arrow`] points.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Up,
+    Down,
+    Left,
+}
+
+/// A filled triangle standing in for ▲ ▼ ◄, which B612 Mono lacks (▲ ◄)
+/// or draws at a different weight than the drawn ones (▼): the readout
+/// labels and the focused tag draw all three here so they match.
+pub struct Arrow {
+    pub direction: Direction,
+    pub color: Color,
+}
+
+impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Arrow {
+    type State = ();
+
+    fn draw(&self, _: &(), renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        let (w, h) = (bounds.width, bounds.height);
+        let [a, b, c] = match self.direction {
+            Direction::Up => [Point::new(w / 2.0, 0.0), Point::new(w, h), Point::new(0.0, h)],
+            Direction::Down => [Point::new(0.0, 0.0), Point::new(w, 0.0), Point::new(w / 2.0, h)],
+            Direction::Left => [Point::new(0.0, h / 2.0), Point::new(w, 0.0), Point::new(w, h)],
+        };
+        let path = Path::new(|p| {
+            p.move_to(a);
+            p.line_to(b);
+            p.line_to(c);
+            p.close();
+        });
+        frame.fill(&path, self.color);
+        vec![frame.into_geometry()]
+    }
+}

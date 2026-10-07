@@ -3,7 +3,9 @@
 //! single-instance handling here — that belongs to the daemon.
 
 mod app;
+mod console_view;
 mod view;
+mod widgets;
 
 fn main() -> cosmic::iced::Result {
     tracing_subscriber::fmt()

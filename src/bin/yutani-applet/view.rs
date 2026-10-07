@@ -449,8 +449,10 @@ fn menu<'a>(running: bool) -> Element<'a, Msg> {
 /// The popover's contents. libcosmic's `popup_container` supplies the
 /// surface, its theme background, blur and shadow; everything here sits on
 /// the theme's own colours, so a light COSMIC theme gets a light popover.
+// v5 popover, deleted in the cleanup task
+#[allow(dead_code)]
 pub fn popup(state: &Applet) -> Element<'_, Msg> {
-    let p = state.popover();
+    let p = yutani::applet::display::popover(state.status.as_ref(), state.rates, state.history.bars(), state.available(), state.menu_open);
     let mut content = Column::new().width(Length::Fill).push(header(&p)).push(accounts_card(&p)).push(tunnel_section(&p));
     if p.graph {
         content = content.push(throughput_card(&p));
