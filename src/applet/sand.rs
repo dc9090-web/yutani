@@ -28,8 +28,17 @@ pub fn wind_target(d: Drive) -> f32 {
 /// The uplink's share of the traffic; 30 % when there is none.
 pub fn up_share(d: Drive) -> f32 {
     let total = d.up_kbps + d.down_kbps;
-    if d.live && total > 0.0 { d.up_kbps / total } else { 0.3 }
+    if d.live && total >= IDLE_KBPS { d.up_kbps / total } else { 0.3 }
 }
+
+/// Below this much traffic the colour mix is the idle 30 %: an idle link's
+/// trickle is all-up one second and all-down the next, which flipped the
+/// whole field between amber and phosphor every poll (seen 2026-10-07).
+pub const IDLE_KBPS: f32 = 1.0;
+
+/// How fast the field's colour mix follows the traffic: about 1 s to
+/// close most of a change, so the grains drift between colours.
+const SHARE_EASE_PER_S: f32 = 1.5;
 
 #[derive(Clone, Copy, Debug)]
 struct Grain {
@@ -47,13 +56,15 @@ pub struct Sand {
     h: f32,
     t: f32,
     wind: Option<f32>,
+    /// The eased uplink share the tints follow (`None` before the first step).
+    share: Option<f32>,
     grains: Vec<Grain>,
     rng: u64,
 }
 
 impl Sand {
     pub fn new(w: f32, h: f32, seed: u64) -> Self {
-        let mut s = Sand { w, h, t: 0.0, wind: None, grains: Vec::with_capacity(GRAINS), rng: seed.max(1) };
+        let mut s = Sand { w, h, t: 0.0, wind: None, share: None, grains: Vec::with_capacity(GRAINS), rng: seed.max(1) };
         s.seed_grains();
         s
     }
@@ -114,6 +125,11 @@ impl Sand {
             Some(w) => w + (target - w) * (dt * 2.5).min(1.0),
         };
         self.wind = Some(wind);
+        let target = up_share(d);
+        self.share = Some(match self.share {
+            None => target,
+            Some(s) => s + (target - s) * (dt * SHARE_EASE_PER_S).min(1.0),
+        });
         let t = self.t;
         for i in 0..self.grains.len() {
             let g = self.grains[i];
@@ -131,7 +147,7 @@ impl Sand {
 
     /// Every grain as `(x, y, size, tint, alpha level 0..=10)`.
     pub fn dots(&self, d: Drive) -> impl Iterator<Item = (f32, f32, f32, Tint, u8)> + '_ {
-        let share = up_share(d);
+        let share = self.share.unwrap_or_else(|| up_share(d));
         let dim = if d.live { 1.0 } else { 0.45 };
         let t = self.t;
         self.grains.iter().map(move |g| {
@@ -164,6 +180,29 @@ mod tests {
         assert_eq!(up_share(LIVE), 0.3);
         assert_eq!(up_share(DOWN), 0.3, "idle: 30 % amber");
         assert_eq!(up_share(Drive { live: true, up_kbps: 0.0, down_kbps: 0.0 }), 0.3);
+        assert_eq!(up_share(Drive { live: true, up_kbps: 0.4, down_kbps: 0.0 }), 0.3, "a trickle is idle");
+    }
+
+    /// One poll all-up, the next all-down: the field must not flip colour
+    /// wholesale — the mix eases toward the new share.
+    #[test]
+    fn the_colour_mix_eases_instead_of_flipping() {
+        let up = Drive { live: true, up_kbps: 50.0, down_kbps: 0.0 };
+        let down = Drive { live: true, up_kbps: 0.0, down_kbps: 50.0 };
+        let mut s = Sand::new(338.0, 104.0, 4);
+        for _ in 0..60 {
+            s.step(0.033, up);
+        }
+        let amber = |s: &Sand, d| s.dots(d).filter(|(.., t, _)| *t == Tint::Uplink).count();
+        let before = amber(&s, up);
+        assert!(before > 900, "{before}");
+        s.step(0.033, down);
+        let after = amber(&s, down);
+        assert!(after > before * 8 / 10, "one frame after the flip most grains are still amber: {after} of {before}");
+        for _ in 0..90 {
+            s.step(0.033, down);
+        }
+        assert!(amber(&s, down) < 100, "three seconds later the mix has followed");
     }
 
     #[test]
