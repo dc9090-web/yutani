@@ -4,6 +4,7 @@
 //! See docs/superpowers/specs/2026-09-12-yutani-applet-design.md.
 
 pub mod client;
+pub mod console;
 pub mod display;
 pub mod fonts;
 pub mod format;
