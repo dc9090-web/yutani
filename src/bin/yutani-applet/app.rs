@@ -360,6 +360,14 @@ impl cosmic::Application for Applet {
                 }
                 let live = status.tunnel.connected;
                 if live {
+                    let t = &status.tunnel;
+                    if t.ping_seq > 0 {
+                        self.ping.push_seq(t.ping_seq, t.ping_us.map(|us| us as f32 / 1000.0));
+                    }
+                } else {
+                    self.ping.clear();
+                }
+                if live {
                     self.totals = (status.tunnel.rx_bytes, status.tunnel.tx_bytes);
                 }
                 self.starting = None;
@@ -385,6 +393,7 @@ impl cosmic::Application for Applet {
             }
             Msg::Status(Err(IpcError::Offline)) => {
                 self.status = None;
+                self.ping.clear();
                 self.sampler.reset();
                 self.rates = Rates::default();
                 self.pending = None;
@@ -743,6 +752,26 @@ mod tests {
         use yutani::tunnel::status::{Status, TunnelStatus};
         let tunnel = TunnelStatus { installed: true, connected: true, handshake_age_s: Some(4), ..Default::default() };
         Status { clients: vec![], hidden: false, tunnel, shortcuts: None, outputs: Vec::new(), steam: Vec::new() }
+    }
+
+    /// Each new probe becomes one sample; a repeated sequence adds nothing;
+    /// a dropped tunnel clears the window.
+    #[test]
+    fn ping_samples_follow_the_probe_sequence() {
+        let mut applet = applet();
+        let mut s = connected();
+        s.tunnel.ping_us = Some(360_000);
+        s.tunnel.ping_seq = 1;
+        let _ = applet.update(Msg::Status(Ok(s.clone())));
+        let _ = applet.update(Msg::Status(Ok(s.clone())));
+        assert_eq!(applet.ping.summary(true).value, "360");
+        s.tunnel.ping_us = None;
+        s.tunnel.ping_seq = 2;
+        let _ = applet.update(Msg::Status(Ok(s.clone())));
+        assert!(applet.ping.summary(true).jitter_loss.ends_with("LOSS 50.0%"), "{}", applet.ping.summary(true).jitter_loss);
+        s.tunnel.connected = false;
+        let _ = applet.update(Msg::Status(Ok(s)));
+        assert_eq!(applet.ping.summary(true).quality, yutani::applet::ping::Quality::Idle, "cleared: no samples");
     }
 
     /// M1: `quit` is acknowledged at once but the daemon spends up to 10 s

@@ -1,7 +1,8 @@
 //! The ping row (Nostromo handoff "Ping row"): the last 34 probes to
 //! Tranquility, their stats, the quality word and the sparkline's dots.
-//! Samples arrive with the daemon's probe sequence number (Phase 2); in
-//! Phase 1 the window is never fed and the row reads IDLE.
+//! Samples are fed by the daemon's probe, keyed by its sequence number
+//! (Phase 2); quality is judged relative to the session's own median, not
+//! absolute thresholds.
 
 use std::collections::VecDeque;
 
@@ -28,13 +29,17 @@ impl Quality {
         }
     }
 
-    fn of(ms: f32) -> Self {
-        if ms < 30.0 {
-            Quality::Nominal
-        } else if ms < 100.0 {
+    /// The quality word for the newest success `latest`, judged against the
+    /// window's own median `baseline`, with the window's jitter and loss
+    /// (Nostromo spec, Phase 2). The `+ n` floors keep a few-ms ping from
+    /// flapping on noise.
+    pub fn judge(latest: f32, baseline: f32, jitter: f32, loss_pct: f32) -> Self {
+        if loss_pct > 5.0 || latest > 1.6 * baseline + 20.0 {
+            Quality::Poor
+        } else if loss_pct > 0.0 || latest > 1.25 * baseline + 10.0 || jitter > 0.15 * baseline + 5.0 {
             Quality::Degraded
         } else {
-            Quality::Poor
+            Quality::Nominal
         }
     }
 }
@@ -129,6 +134,15 @@ impl PingWindow {
             })
             .collect();
         let latest = ok.last().copied();
+        let median = {
+            let mut sorted = ok.clone();
+            sorted.sort_by(f32::total_cmp);
+            match sorted.len() {
+                0 => 0.0,
+                l if l % 2 == 1 => sorted[l / 2],
+                l => (sorted[l / 2 - 1] + sorted[l / 2]) / 2.0,
+            }
+        };
         let int = |v: f32| format!("{}", v.round() as i64);
         if ok.is_empty() {
             return PingSummary {
@@ -142,7 +156,7 @@ impl PingWindow {
         }
         PingSummary {
             value: latest.map_or_else(|| DASH.into(), int),
-            quality: latest.map_or(Quality::Poor, Quality::of),
+            quality: latest.map_or(Quality::Poor, |l| Quality::judge(l, median, jitter, loss)),
             stats: format!("MIN {} · AVG {} · MAX {}", int(min), int(avg), int(max)),
             jitter_loss: format!("JIT {jitter:.1} · LOSS {loss:.1}%"),
             dots,
@@ -179,16 +193,28 @@ mod tests {
         assert_eq!(s.stats, "MIN 3 · AVG 6 · MAX 12");
         // jitter = mean |Δ| over consecutive successes: (2 + 7 + 8) / 3
         assert_eq!(s.jitter_loss, "JIT 5.7 · LOSS 20.0%");
-        assert_eq!(s.quality, Quality::Nominal);
+        assert_eq!(s.quality, Quality::Poor, "20 % loss is over the 5 % line");
+    }
+
+    /// Quality is judged against the session's own median, so 360 ms from
+    /// the far side of the world is NOMINAL when that is normal (Nostromo spec, Phase 2).
+    #[test]
+    fn quality_is_relative_to_the_sessions_normal() {
+        let q = Quality::judge;
+        assert_eq!(q(360.0, 360.0, 3.0, 0.0), Quality::Nominal);
+        assert_eq!(q(5.0, 4.0, 1.0, 0.0), Quality::Nominal, "the +10 ms floor keeps a tiny ping calm");
+        assert_eq!(q(460.0, 360.0, 3.0, 0.0), Quality::Nominal, "1.25 × 360 + 10 = 460: equal is not above");
+        assert_eq!(q(461.0, 360.0, 3.0, 0.0), Quality::Degraded);
+        assert_eq!(q(360.0, 360.0, 60.0, 0.0), Quality::Degraded, "jitter above 0.15 × 360 + 5 = 59");
+        assert_eq!(q(360.0, 360.0, 3.0, 2.9), Quality::Degraded, "any loss");
+        assert_eq!(q(597.0, 360.0, 3.0, 0.0), Quality::Poor, "> 1.6 × 360 + 20 = 596");
+        assert_eq!(q(360.0, 360.0, 3.0, 5.9), Quality::Poor, "loss above 5 %");
     }
 
     #[test]
-    fn quality_boundaries_follow_the_latest_success() {
-        let q = |ms: f32| window(&[Some(ms)]).summary(true).quality;
-        assert_eq!(q(29.9), Quality::Nominal);
-        assert_eq!(q(30.0), Quality::Degraded);
-        assert_eq!(q(99.9), Quality::Degraded);
-        assert_eq!(q(100.0), Quality::Poor);
+    fn a_steady_long_ping_reads_nominal_and_a_lost_window_reads_poor() {
+        let steady = window(&[Some(360.0), Some(361.0), Some(359.5), Some(360.4)]).summary(true);
+        assert_eq!((steady.value.as_str(), steady.quality), ("360", Quality::Nominal));
         assert_eq!(window(&[None, None]).summary(true).quality, Quality::Poor, "all lost");
         assert_eq!(Quality::Nominal.word(), "NOMINAL");
     }
