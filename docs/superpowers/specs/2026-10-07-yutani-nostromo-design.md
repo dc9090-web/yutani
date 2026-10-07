@@ -111,32 +111,56 @@ each compared with `previews/01–05`:
 
 ## Phase 2 — ping to Tranquility
 
-- **Probe (root tunnel worker):**
-  - Once per tick (1 s) while the link is up, the worker resolves
-    `tranquility.servers.eveonline.com`. It caches the result for 5 min and
-    resolves through the tunnel's DNS (resolved's per-link route already
-    covers `~eveonline.com`).
-  - It then times a non-blocking TCP `connect` to port 26000. The socket has
-    `SO_MARK` set to the tunnel's routing mark, so the probe takes the tunnel
-    path, not the home link.
-  - Timeout 1 s. Success records the connect RTT in ms; timeout or refusal
-    records a loss. The socket is closed immediately.
-  - The probe runs on its own thread, so a slow connect never delays the
-    worker's other duties.
+Revised 2026-10-07 after measuring. From a home far from London a TCP
+connect to `tranquility.servers.eveonline.com:26000` (Cloudflare,
+172.65.201.188) takes ≈16 ms over the home link — it ends at the local
+Cloudflare edge — and ≈360 ms through the tunnel, whose exit is London.
+The tunnel figure is the one EVE's traffic actually pays, so it is the one
+shown.
+
+- **Probe (root tunnel worker, `src/tunnel/probe.rs`):**
+  - A task spawned beside the 1 s status loop, while the link is up.
+  - Once a second it times a `tokio::net::TcpSocket` connect from the
+    tunnel address (`bind(<conf.address>:0)`), to TQ port 26000. The
+    source address is what routes it down `yutani0`, through the
+    `from <address>` policy rule the exit-IP lookup already relies on, so
+    no socket mark is needed.
+  - Timeout 1.5 s. Success records the RTT; a timeout, refusal or failed
+    resolution records a loss. The socket is dropped at once, before any
+    data is sent.
+  - The hostname is resolved with `tokio::net::lookup_host` and cached for
+    5 min (resolved's `~eveonline.com` routing domain already sends that
+    lookup through the tunnel).
 - **Wire:**
-  - `TunnelFile` gains `ping_ms: Option<f32>` (the latest sample, `None` =
-    loss) and `ping_seq: u64` (incremented per probe).
-  - `TunnelStatus` gains the same two fields, both `serde(default)`.
+  - `TunnelFile` and `TunnelStatus` gain `ping_us: Option<u32>` (the latest
+    probe, whole microseconds, `None` = lost) and `ping_seq: u64`
+    (incremented per probe, 0 = none yet). Both are `serde(default)`.
+  - The value is an integer because `TunnelStatus` is `Eq`.
+  - `assemble` passes them on only while connected.
 - **Applet:**
-  - `ping.rs` keeps 34 samples. A new sample is pushed when `ping_seq`
-    advances.
-  - Derived values: min/avg/max (integers), jitter = mean absolute delta
-    between consecutive successes (1 dp), loss % over the window (1 dp).
-  - Quality: < 30 NOMINAL, < 100 DEGRADED, else POOR, tunnel down IDLE.
-  - The sparkline is a small `canvas`, per the handoff.
-- **Tests:** stats on fixed windows; quality boundaries; serde back-compat
-  for the new fields. The probe's mark/route behaviour is verified live:
-  probe RTT vs `ping` from inside the slice.
+  - `PingWindow::push_seq(seq, ms)` on every status reply while the tunnel
+    is up; the window clears when the link goes down or the daemon goes
+    away.
+  - MIN/AVG/MAX, jitter and loss are as before.
+- **Quality is relative to the session's own normal (Daniel's choice).**
+  The baseline is the median of the window's successful samples. With
+  `latest` the newest success:
+
+  | Quality | Condition |
+  |---|---|
+  | POOR | loss > 5 %, or `latest > 1.6 × baseline + 20` ms, or no success at all |
+  | DEGRADED | any loss, or `latest > 1.25 × baseline + 10` ms, or jitter > `0.15 × baseline + 5` ms |
+  | NOMINAL | otherwise |
+  | IDLE | tunnel down |
+
+  The absolute thresholds in the handoff (< 30 / < 100 ms) would read POOR
+  permanently from the far side of the world.
+- **Tests:**
+  - the probe against a local listener (success) and a closed port (loss);
+  - the sequence increments and the latest value is kept;
+  - serde back-compat for the new fields;
+  - the quality table on fixed windows.
+- **Live check:** after install, the popover's ping reads ≈360 ms NOMINAL.
 
 ## Phase 3 — Launch EVE
 
