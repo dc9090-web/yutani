@@ -3,6 +3,7 @@ mod backend;
 mod cli;
 mod doctor;
 mod launch;
+mod launch_steam;
 mod shortcuts;
 mod ui;
 

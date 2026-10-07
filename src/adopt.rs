@@ -83,7 +83,6 @@ fn process_name(dir: &std::path::Path, comm: &str, patterns: &[String]) -> Optio
 /// Is a process owned by `uid` and matching `patterns` alive right now?
 /// No cgroup filter: the EVE Launcher counts wherever it runs. Stops at the
 /// first match.
-#[allow(dead_code)] // driven by the Launch EVE flow in the next task
 pub fn process_running(patterns: &[String], uid: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
     let Ok(dir) = std::fs::read_dir("/proc") else { return false };

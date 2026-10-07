@@ -113,6 +113,11 @@ impl<H: Clone + Eq + Hash> Launch<H> {
         &self.state
     }
 
+    /// The new client this launch is waiting to see placed, once it appeared.
+    pub fn target(&self) -> Option<&H> {
+        self.target.as_ref()
+    }
+
     fn active(&self) -> bool {
         !self.state.finished() && !self.state.is_failed()
     }
@@ -257,6 +262,16 @@ mod tests {
         assert!(f.state().is_failed());
         assert!(!f.expired(4_999));
         assert!(f.expired(5_000));
+    }
+
+    #[test]
+    fn the_target_is_the_new_client_once_it_appears() {
+        let mut l = started();
+        assert_eq!(l.target(), None);
+        l.observe(Obs::ClientAppeared(2));
+        assert_eq!(l.target(), None, "an existing client is not the target");
+        l.observe(Obs::ClientAppeared(7));
+        assert_eq!(l.target(), Some(&7));
     }
 
     #[test]

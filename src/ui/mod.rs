@@ -114,6 +114,11 @@ pub struct App {
     /// Steam's windows and whether each is visible (not minimised); the
     /// Launch EVE flow minimises the one that pops up.
     pub steam_windows: HashMap<Handle, bool>,
+    /// The Launch EVE run in progress, or finished/failed and still shown
+    /// (`yutani::launch_eve`); `None` when there is none.
+    pub launch: Option<yutani::launch_eve::Launch<Handle>>,
+    /// The zero of the launch state machine's millisecond clock.
+    pub launch_epoch: Instant,
     pub outputs: Vec<Output>,
     pub layout: Layout,
     /// Set at startup when `current.ron` exists but failed to parse (spec
@@ -196,6 +201,9 @@ pub enum Msg {
     /// [`rules::FOCUS_GRACE`] has passed since focus left EVE: hide the
     /// thumbnails if it has not come back.
     FocusGraceOver,
+    /// 500 ms while a Launch EVE run is active: look for the EVE Launcher,
+    /// let the state machine time out, notice the new client placed.
+    LaunchTick,
     Adopt(adopt::AdoptEvent),
     /// The Steam launch-line scan finished (the periodic subscription, or a
     /// re-check when the settings window opens or shows its Steam page).
@@ -585,6 +593,7 @@ impl App {
                     .map(|o| crate::tunnel::status::OutputStatus { name: o.name.clone(), height: o.logical_size.1 })
                     .collect();
                 let steam = self.steam_findings.clone();
+                let launch = self.launch.as_ref().map(|l| l.state().clone());
                 let reply = reply.clone();
                 let task = cosmic::iced::Task::perform(
                     async move {
@@ -592,7 +601,7 @@ impl App {
                             tokio::task::spawn_blocking(move || crate::tunnel::control::current_tunnel_status(&location))
                                 .await
                                 .map_err(|e| format!("status task failed: {e}"))?;
-                        let status = crate::tunnel::status::Status { clients, hidden, tunnel, shortcuts, outputs, steam, launch: None };
+                        let status = crate::tunnel::status::Status { clients, hidden, tunnel, shortcuts, outputs, steam, launch };
                         serde_json::to_string(&status).map(Some).map_err(|e| format!("status: {e}"))
                     },
                     move |result| cosmic::Action::App(Msg::IpcReplyLater(reply, result)),
@@ -601,8 +610,7 @@ impl App {
             }
             // The popover is open: keep the ping probe running (an open and
             // a `set_modified`, cheap enough to do inline).
-            // Task 3 drives the launch state machine from here.
-            Request::Launch => (Reply::Now(Err("launch: not yet".into())), cosmic::iced::Task::none()),
+            Request::Launch => (Reply::Now(self.start_launch()), Task::none()),
             Request::Watch => {
                 crate::tunnel::touch_ping_lease();
                 (Reply::Now(Ok(None)), cosmic::iced::Task::none())
@@ -631,6 +639,88 @@ impl App {
                 );
                 (Reply::Later, task)
             }
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.launch_epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// IPC `launch`: start Launch EVE (Nostromo Phase 3) and ask Steam for
+    /// EVE. A run already in progress is left alone; a Steam that cannot be
+    /// run is a failed step 1, which the applet reads from `status`.
+    fn start_launch(&mut self) -> Result<Option<String>, String> {
+        let now_ms = self.now_ms();
+        if self.launch.as_ref().is_some_and(|l| !l.expired(now_ms)) {
+            return Ok(None);
+        }
+        if self.clients.len() >= 9 {
+            return Err("all 9 slots in use".into());
+        }
+        let mut launch = yutani::launch_eve::Launch::start(
+            now_ms,
+            &self.config.shortcuts.prefix_label(),
+            self.clients.keys().cloned(),
+            self.steam_windows.iter().map(|(h, v)| (h.clone(), *v)),
+        );
+        match crate::launch_steam::spawn("steam") {
+            Ok(()) => tracing::info!("launch: asked Steam for EVE ({})", crate::launch_steam::URL),
+            Err(e) => {
+                tracing::warn!("launch: cannot run steam: {e}");
+                launch.observe(yutani::launch_eve::Obs::SpawnFailed(e.to_string()));
+            }
+        }
+        self.launch = Some(launch);
+        Ok(None)
+    }
+
+    /// Feed the running launch (if any) one observation and apply what it
+    /// asks for.
+    fn observe_launch(&mut self, obs: yutani::launch_eve::Obs<Handle>) {
+        let Some(launch) = self.launch.as_mut() else { return };
+        let effects = launch.observe(obs);
+        self.apply_launch(effects);
+    }
+
+    fn apply_launch(&self, effects: Vec<yutani::launch_eve::Effect<Handle>>) {
+        use yutani::launch_eve::Effect;
+        for effect in effects {
+            match effect {
+                Effect::Minimise(h) => {
+                    self.send(Cmd::Minimize(h));
+                }
+                Effect::Focus(h) => {
+                    let _ = self.activate(h);
+                }
+            }
+        }
+    }
+
+    /// `Msg::LaunchTick`: the clock, the EVE Launcher's presence, and the
+    /// new client's slot once its thumbnail is placed.
+    fn launch_tick(&mut self) {
+        use yutani::launch_eve::Obs;
+        if self.launch.is_none() {
+            return;
+        }
+        let now_ms = self.now_ms();
+        // A /proc walk of a few ms, at 2 Hz and only while launching; move
+        // it to spawn_blocking if it ever shows in a profile.
+        let launcher_alive = crate::adopt::process_running(&["evelauncher.exe".to_string()], crate::ipc::uid());
+        self.observe_launch(Obs::Tick { now_ms, launcher_alive });
+        let placed = self
+            .launch
+            .as_ref()
+            .and_then(|l| l.target())
+            .filter(|t| self.clients.get(*t).is_some_and(|c| c.placed))
+            .cloned();
+        if let Some(target) = placed
+            && let Some(i) = self.focus_order().iter().position(|x| x == &target)
+        {
+            self.observe_launch(Obs::ClientPlaced { handle: target, slot: i + 1 });
+        }
+        if self.launch.as_ref().is_some_and(|l| l.expired(now_ms)) {
+            self.launch = None;
         }
     }
 
@@ -1215,6 +1305,7 @@ impl App {
                 // Taken before the update lands: whether focus *leaves*
                 // EVE with it is what starts the grace.
                 let was_focused = self.any_client_activated();
+                let is_new = !self.clients.contains_key(&handle);
                 let entry = self.clients.entry(handle.clone()).or_insert_with(|| Client {
                     info: info.clone(),
                     image: None,
@@ -1233,6 +1324,9 @@ impl App {
                 entry.info = info;
                 let became_named = !was_named && matches!(entry.info.login, Login::LoggedIn(_));
                 let grace = self.note_activation(was_focused);
+                if is_new {
+                    self.observe_launch(yutani::launch_eve::Obs::ClientAppeared(handle.clone()));
+                }
                 // An activation change on one client can hide/show others, so
                 // reconcile every client's surface, not just this one's.
                 let reconciled = Task::batch([grace, self.reconcile_surfaces()]);
@@ -1252,6 +1346,7 @@ impl App {
                 let was_focused = self.any_client_activated();
                 let task = self.destroy_surface(&handle);
                 self.clients.remove(&handle);
+                self.observe_launch(yutani::launch_eve::Obs::ClientGone(handle.clone()));
                 // The activated client may be the one that closed.
                 let grace = self.note_activation(was_focused);
                 // The layout order changed; the saved position stays, so the
@@ -1281,7 +1376,8 @@ impl App {
                 }
             }
             Event::SteamWindow(handle, visible) => {
-                self.steam_windows.insert(handle, visible);
+                self.steam_windows.insert(handle.clone(), visible);
+                self.observe_launch(yutani::launch_eve::Obs::SteamWindow { handle, visible });
                 Task::none()
             }
             Event::SteamWindowGone(handle) => {
@@ -2284,6 +2380,8 @@ impl Application for App {
             cmd: None,
             clients: HashMap::new(),
             steam_windows: HashMap::new(),
+            launch: None,
+            launch_epoch: Instant::now(),
             outputs: Vec::new(),
             layout,
             layout_poisoned,
@@ -2392,6 +2490,10 @@ impl Application for App {
             // and refusing to would leave them with a daemon they cannot
             // close. `yutani tunnel disconnect` still works afterwards.
             Msg::FocusGraceOver => self.reconcile_surfaces(),
+            Msg::LaunchTick => {
+                self.launch_tick();
+                Task::none()
+            }
             Msg::QuitAfterTunnel(result) => {
                 if let Err(err) = result {
                     tracing::warn!("stopping the tunnel before quitting failed: {err}");
@@ -2459,6 +2561,9 @@ impl Application for App {
                 backend::subscription(conn, self.config.app_ids.clone(), self.config.fps)
                     .map(Msg::Backend),
             );
+        }
+        if self.launch.is_some() {
+            subs.push(cosmic::iced::time::every(Duration::from_millis(500)).map(|_| Msg::LaunchTick));
         }
         if self.config.tunnel.auto_adopt {
             subs.push(adopt::subscription(self.config.tunnel.adopt_processes.clone()).map(Msg::Adopt));
@@ -2602,6 +2707,8 @@ mod tests {
             cmd: None,
             clients: HashMap::new(),
             steam_windows: HashMap::new(),
+            launch: None,
+            launch_epoch: Instant::now(),
             outputs: Vec::new(),
             layout: Layout::default(),
             layout_poisoned: false,
@@ -2661,6 +2768,74 @@ mod tests {
         let (reply, _rx) = ipc::Responder::detached();
         let (how, _task) = app.handle_request(&crate::ipc::Request::Watch, &reply);
         assert!(matches!(how, Reply::Now(Ok(None))));
+    }
+
+    /// Launch EVE (Phase 3): with nine clients there is no hotkey left, so
+    /// `launch` is refused before anything is started.
+    #[test]
+    fn launch_is_refused_with_nine_clients() {
+        let fake = Fake::new();
+        let mut app = app(Config::default());
+        for _ in 0..9 {
+            let _ = app.on_backend(Event::ClientAdded(fake.handle(), info(false, Vec::new())));
+        }
+        let (reply, _rx) = ipc::Responder::detached();
+        let (how, _task) = app.handle_request(&crate::ipc::Request::Launch, &reply);
+        assert!(matches!(how, Reply::Now(Err(ref m)) if m == "all 9 slots in use"));
+        assert!(app.launch.is_none());
+    }
+
+    /// A second `launch` while one runs is a no-op `ok` (it must not ask
+    /// Steam again — nothing here spawns it).
+    #[test]
+    fn launch_while_one_runs_is_ok_and_changes_nothing() {
+        let mut app = app(Config::default());
+        app.launch = Some(yutani::launch_eve::Launch::start(app.now_ms(), "Ctrl+Alt", [], []));
+        let (reply, _rx) = ipc::Responder::detached();
+        let (how, _task) = app.handle_request(&crate::ipc::Request::Launch, &reply);
+        assert!(matches!(how, Reply::Now(Ok(None))));
+        assert_eq!(app.launch.as_ref().unwrap().state().current(), 1);
+    }
+
+    /// The backend's events reach the state machine: a new client becomes
+    /// the target (an update of an existing one does not), a Steam window
+    /// that pops up is recorded, and the target closing fails step 4.
+    #[test]
+    fn backend_events_drive_the_launch() {
+        use yutani::launch_eve::Step;
+        let fake = Fake::new();
+        let mut app = app(Config::default());
+        let old = fake.handle();
+        let _ = app.on_backend(Event::ClientAdded(old.clone(), info(false, Vec::new())));
+        app.launch = Some(yutani::launch_eve::Launch::start(app.now_ms(), "Ctrl+Alt", app.clients.keys().cloned(), []));
+        let _ = app.on_backend(Event::ClientUpdated(old.clone(), info(true, Vec::new())));
+        assert_eq!(app.launch.as_ref().unwrap().target(), None, "an update is not a new client");
+        let steam = fake.handle();
+        let _ = app.on_backend(Event::SteamWindow(steam.clone(), true));
+        assert_eq!(app.steam_windows.get(&steam), Some(&true));
+        let new = fake.handle();
+        let _ = app.on_backend(Event::ClientAdded(new.clone(), info(false, Vec::new())));
+        assert_eq!(app.launch.as_ref().unwrap().target(), Some(&new));
+        assert_eq!(app.launch.as_ref().unwrap().state().hotkey, "CTRL+ALT+2");
+        let _ = app.on_backend(Event::ClientRemoved(new));
+        assert_eq!(app.launch.as_ref().unwrap().state().steps[3], Step::Failed);
+    }
+
+    /// A tick sees the target placed: step 4 is done with its real slot.
+    #[test]
+    fn a_tick_finishes_the_launch_once_the_new_client_is_placed() {
+        let fake = Fake::new();
+        let mut app = app(Config::default());
+        app.launch = Some(yutani::launch_eve::Launch::start(app.now_ms(), "Ctrl+Alt", [], []));
+        let new = fake.handle();
+        let _ = app.on_backend(Event::ClientAdded(new.clone(), info(false, Vec::new())));
+        let _ = app.update(Msg::LaunchTick);
+        assert!(!app.launch.as_ref().unwrap().state().finished(), "not placed yet");
+        app.clients.get_mut(&new).unwrap().placed = true;
+        let _ = app.update(Msg::LaunchTick);
+        let state = app.launch.as_ref().unwrap().state();
+        assert!(state.finished());
+        assert_eq!(state.hotkey, "CTRL+ALT+1");
     }
 
     /// Opacity-and-centre spec §2.2/§2.5: each output is its own group
