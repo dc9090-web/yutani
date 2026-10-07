@@ -120,7 +120,8 @@ Set the overview, window positions and chat layout up once on one character, the
 
 | | |
 | --- | --- |
-| 🧭 **Panel applet** | A MU/TH/UR-style phosphor console: service and tunnel switches, accounts (click to focus), the network scope and ping, and CPU/GPU/RAM load with temperatures. Bundles its own fonts (B612 Mono, Michroma). Drops the scope first on short screens. |
+| 🧭 **Panel applet** | A MU/TH/UR-style phosphor console: service and tunnel switches, accounts (click to focus), the network scope and ping, CPU/GPU/RAM load with temperatures, and a **▶ Launch EVE** button. Bundles its own fonts (B612 Mono, Michroma). Drops the scope first on short screens. |
+| 🚀 **Launch EVE** | One press in the applet asks Steam to start EVE, minimises Steam's window if it popped up, waits while you click Play in the launcher, then shows the new client's hotkey and focuses it. A four-line log in the popover follows each step. |
 | ⚙️ **Settings window** | Display, Behavior, Layouts, Characters, Tunnel and Steam pages. Every change is live; the file it writes is plain RON at `~/.config/yutani/config.ron`. |
 | 🎮 **Steam integration** | One launch-options line makes Steam start EVE *through* Yutani so the tunnel and thumbnails see it from the first frame. The Steam page prints it with a Copy button. |
 | 🛰️ **Steam launch check** | If that line ever points at a `yutani` that is not there any more, Play fails silently. Yutani checks every 30 s and warns on the panel icon, in the popover and on the Steam page. |
@@ -134,7 +135,7 @@ Set the overview, window positions and chat layout up once on one character, the
 ### Requirements
 
 - COSMIC **1.9** on a Wayland session (CachyOS or Arch). It is what Yutani is developed and tested on; 1.8 should still work but is no longer tested.
-- Proton with Wayland support for the clients. Tested with **GE-Proton11-7**.
+- Proton with Wayland support for the clients. Tested with **GE-Proton11-6**.
 - For the tunnel: `wireguard-tools`, `nftables`, `polkit`, `curl` (all declared by the package).
 - A stable Rust toolchain to build (`rustup default stable`).
 
