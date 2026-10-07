@@ -15,10 +15,9 @@ use cosmic::surface::action::{app_popup, destroy_popup};
 
 use yutani::applet::client::{self, IpcError};
 use yutani::applet::console::{Console, Inputs, console};
-use yutani::applet::display::degrade;
+use yutani::applet::console::degrade;
 use yutani::applet::host::{HostReading, HostSampler, Sources};
 use yutani::applet::ping::PingWindow;
-use yutani::applet::history::History;
 use yutani::applet::rate::{Rates, Sampler};
 use yutani::applet::{
     Action, PENDING_S, Poll, clip_note, note_visible, pending_done, poll_interval, start_command,
@@ -48,8 +47,6 @@ pub struct Applet {
     /// (or this deadline passes) describes a tunnel on its way down, so it
     /// is degraded rather than believed. See `Msg::Done(Action::Quit, ..)`.
     pub quitting: Option<Instant>,
-    /// The throughput graph's last 34 samples, one per poll.
-    pub history: History,
     /// The `⋯` overflow menu is showing; closes with the popup.
     pub menu_open: bool,
     /// The last `err …` reply, shown for 3 s — or what a tunnel action is
@@ -93,9 +90,6 @@ pub enum Msg {
     Press(Action),
     /// A pressed action finished.
     Done(Action, Result<(), String>),
-    /// The header's master switch: on starts the daemon, off quits it
-    /// (which takes the tunnel down first).
-    ToggleService(bool),
     /// The `⋯` button.
     ToggleMenu,
     /// Popup create/destroy, handled by libcosmic.
@@ -316,7 +310,6 @@ impl cosmic::Application for Applet {
             pending: None,
             poll: Poll::default(),
             quitting: None,
-            history: History::new(),
             menu_open: false,
             note: None,
             host: HostSampler::new(Sources::discover()),
@@ -381,7 +374,6 @@ impl cosmic::Application for Applet {
                     self.sampler.reset();
                     self.rates = Rates::default();
                 }
-                self.history.push(self.rates);
                 // The deadline is the upper bound; the daemon agreeing ends
                 // it sooner, which is the common case.
                 if let Some((want, until)) = self.pending
@@ -396,7 +388,6 @@ impl cosmic::Application for Applet {
                 self.status = None;
                 self.sampler.reset();
                 self.rates = Rates::default();
-                self.history.clear();
                 self.pending = None;
                 self.quitting = None;
                 // The rows a wait sits under are gone with the daemon; its
@@ -415,7 +406,6 @@ impl cosmic::Application for Applet {
                 }
                 self.sampler.reset();
                 self.rates = Rates::default();
-                self.history.push(Rates::default());
                 // A wait that is still on outranks a poll error: its reply
                 // is what ends it, and it must find its own note to clear.
                 if !self.note.as_ref().is_some_and(|n| n.progress) {
@@ -423,7 +413,6 @@ impl cosmic::Application for Applet {
                 }
                 after_reply
             }
-            Msg::ToggleService(on) => self.update(Msg::Press(if on { Action::StartDaemon } else { Action::Quit })),
             Msg::ToggleMenu => {
                 self.menu_open = !self.menu_open;
                 Task::none()
@@ -435,11 +424,11 @@ impl cosmic::Application for Applet {
                 Ok(exit) => {
                     self.starting = Some(Instant::now() + Duration::from_secs(PENDING_S));
                     Task::batch([
-                    self.poll(),
-                    cosmic::task::future(async move {
-                        let exit = tokio::time::timeout(START_WINDOW, exit).await.ok().and_then(Result::ok);
-                        Msg::Done(Action::StartDaemon, start_outcome(exit))
-                    }),
+                        self.poll(),
+                        cosmic::task::future(async move {
+                            let exit = tokio::time::timeout(START_WINDOW, exit).await.ok().and_then(Result::ok);
+                            Msg::Done(Action::StartDaemon, start_outcome(exit))
+                        }),
                     ])
                 }
                 Err(err) => {
@@ -500,12 +489,19 @@ impl cosmic::Application for Applet {
             // close it is `Some`.)
             Msg::Surface(action) => {
                 let surface = cosmic::task::message(cosmic::Action::Surface(action));
-                if self.popup.is_none() { Task::batch([surface, self.poll()]) } else { surface }
+                if self.popup.is_none() {
+                    // The HOST card would otherwise show the last reading from before it closed.
+                    self.host_reading = self.host.sample();
+                    Task::batch([surface, self.poll()])
+                } else {
+                    surface
+                }
             }
             Msg::PopupClosed(id) => {
                 if self.popup == Some(id) {
                     self.popup = None;
                     self.menu_open = false;
+                    self.host.forget_cpu();
                 }
                 Task::none()
             }
@@ -894,6 +890,15 @@ mod tests {
         applet.starting = Some(Instant::now() + Duration::from_secs(PENDING_S));
         assert!(applet.console().control[0].rocker == yutani::applet::console::RockerState::Pending);
         let _ = applet.update(Msg::Status(Ok(connected())));
+        assert!(applet.starting.is_none());
+    }
+
+    /// A start that fails ends the pending rocker at once.
+    #[test]
+    fn a_failed_start_ends_the_pending_rocker() {
+        let mut applet = applet();
+        applet.starting = Some(Instant::now() + Duration::from_secs(PENDING_S));
+        let _ = applet.update(Msg::Done(Action::StartDaemon, Err("x".into())));
         assert!(applet.starting.is_none());
     }
 }

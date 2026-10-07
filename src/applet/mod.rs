@@ -5,10 +5,8 @@
 
 pub mod client;
 pub mod console;
-pub mod display;
 pub mod fonts;
 pub mod format;
-pub mod history;
 pub mod host;
 pub mod icon;
 pub mod install;

@@ -329,6 +329,20 @@ pub fn console(status: Option<&Status>, i: &Inputs) -> Console {
     c
 }
 
+
+
+/// Stale the last good reply so it presents as disconnected (spec §7).
+///
+/// A poll that fails after a success keeps the daemon's last `status` on
+/// screen — the totals are counters and must not jump back to zero — but
+/// that reply is now old news, so it may not go on claiming a live tunnel
+/// with a fresh handshake.
+pub fn degrade(status: &mut Status) {
+    status.tunnel.connected = false;
+    status.tunnel.handshake_age_s = None;
+    status.tunnel.up_for_s = None;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,5 +490,13 @@ mod tests {
         assert_eq!(full - console_height(&short, false), SCOPE_BAND_PX);
         let unknown = console(Some(&s), &Inputs { available: None, ..inputs(&h, &p) });
         assert!(unknown.network.scope);
+    }
+
+    #[test]
+    fn degrade_takes_the_link_down_but_keeps_the_counters() {
+        let mut s = status(true, Some(4), 0);
+        degrade(&mut s);
+        assert!(!s.tunnel.connected && s.tunnel.handshake_age_s.is_none() && s.tunnel.up_for_s.is_none());
+        assert_eq!(s.tunnel.rx_bytes, 693_600_000);
     }
 }

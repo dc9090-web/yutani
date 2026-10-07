@@ -120,6 +120,14 @@ impl HostSampler {
         HostSampler { sources, prev_cpu: None, eased: HostReading::default() }
     }
 
+    /// Drop the CPU baseline and its easing (the popup closed): the next
+    /// CPU reading would otherwise average over the closed period. The
+    /// first one after this is taken as is, like the very first.
+    pub fn forget_cpu(&mut self) {
+        self.prev_cpu = None;
+        self.eased.cpu = None;
+    }
+
     /// One 1 Hz reading, eased. Blocking file reads of a few bytes each.
     pub fn sample(&mut self) -> HostReading {
         let s = &self.sources;
@@ -212,6 +220,25 @@ mod tests {
         let r = s.sample();
         assert_eq!(r.cpu, Some(50.0), "first CPU reading is taken as is");
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn forgetting_the_cpu_baseline_restarts_the_reading() {
+        let root = std::env::temp_dir().join(format!("yutani-host-forget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (sys, proc_) = (root.join("sys"), root.join("proc"));
+        write(&proc_.join("stat"), STAT);
+        let mut s = HostSampler::new(Sources::discover_in(&sys, &proc_));
+        s.sample();
+        write(&proc_.join("stat"), "cpu  150 20 50 850 30 0 10 0 0 0\n");
+        assert_eq!(s.sample().cpu, Some(50.0));
+        s.forget_cpu();
+        // Much later: a long closed period of mostly idle time.
+        write(&proc_.join("stat"), "cpu  160 20 50 9850 30 0 10 0 0 0\n");
+        assert_eq!(s.sample().cpu, None, "no baseline: nothing to average over the gap");
+        write(&proc_.join("stat"), "cpu  210 20 50 9900 30 0 10 0 0 0\n");
+        assert_eq!(s.sample().cpu, Some(50.0), "taken as is, not eased from the old value");
         let _ = std::fs::remove_dir_all(&root);
     }
 
