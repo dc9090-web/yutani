@@ -384,6 +384,8 @@ mod tests {
                 up_for_s: connected.then_some(5_880),
                 failed: false,
                 exit_address: None,
+                ping_us: None,
+                ping_seq: 0,
                 rx_bytes: 693_600_000,
                 tx_bytes: 105_800_000,
             },

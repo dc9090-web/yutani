@@ -205,6 +205,8 @@ mod tests {
                 up_for_s: None,
                 failed: false,
                 exit_address: None,
+                ping_us: None,
+                ping_seq: 0,
                 rx_bytes: 413_100_000,
                 tx_bytes: 2_790_000_000,
             },

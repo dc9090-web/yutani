@@ -141,6 +141,8 @@ mod tests {
             up_for_s: connected.then_some(1),
             failed: false,
             exit_address: None,
+            ping_us: None,
+            ping_seq: 0,
             rx_bytes: 0,
             tx_bytes: 0,
         }

@@ -565,6 +565,8 @@ fn write_status(x: &dyn Exec, conf: &WgConf, since: u64, exit: &mut ExitIp) -> a
         tx_bytes: tx,
         since_unix: since,
         exit_address: exit.address.clone(),
+        ping_us: None,
+        ping_seq: 0,
     };
     // `write_with_mode` creates the temporary with 0644 from the start and
     // renames it into place, so the file is never briefly unreadable and a

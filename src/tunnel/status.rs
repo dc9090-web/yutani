@@ -24,6 +24,15 @@ pub struct TunnelFile {
     /// that has not looked yet) must still parse.
     #[serde(default)]
     pub exit_address: Option<String>,
+    /// The latest round trip to Tranquility through the tunnel, in whole
+    /// microseconds (`probe.rs`); `None` when that probe was lost.
+    /// `serde(default)`: files and replies from before the probe.
+    #[serde(default)]
+    pub ping_us: Option<u32>,
+    /// Incremented once per probe; 0 before the first. The applet takes a
+    /// sample only when this advances.
+    #[serde(default)]
+    pub ping_seq: u64,
 }
 
 /// Peer line of `wg show <iface> dump`: endpoint, latest handshake (unix
@@ -85,6 +94,15 @@ pub struct TunnelStatus {
     /// `serde(default)` for the same reason as `up_for_s`.
     #[serde(default)]
     pub exit_address: Option<String>,
+    /// The latest round trip to Tranquility through the tunnel, in whole
+    /// microseconds (`probe.rs`); `None` when that probe was lost.
+    /// `serde(default)`: files and replies from before the probe.
+    #[serde(default)]
+    pub ping_us: Option<u32>,
+    /// Incremented once per probe; 0 before the first. The applet takes a
+    /// sample only when this advances.
+    #[serde(default)]
+    pub ping_seq: u64,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
 }
@@ -182,6 +200,8 @@ pub fn assemble(
         // Nothing is connected, so there is no exit to report — a stale
         // address from the last session would read as a live one.
         exit_address: if connected { file.and_then(|f| f.exit_address.clone()) } else { None },
+        ping_us: if connected { file.and_then(|f| f.ping_us) } else { None },
+        ping_seq: if connected { file.map_or(0, |f| f.ping_seq) } else { 0 },
         rx_bytes: rx,
         tx_bytes: tx,
     }
@@ -234,6 +254,8 @@ mod tests {
             tx_bytes: 7,
             since_unix: 900,
             exit_address: Some("198.51.100.10".into()),
+            ping_us: None,
+            ping_seq: 0,
         }
     }
 
@@ -307,6 +329,32 @@ mod tests {
         assert!(!s.failed);
         let s = assemble(None, false, None, true, true, "London", 1021);
         assert!(s.failed);
+    }
+
+    /// The worker's latest probe reaches the applet only while the link is
+    /// up: a stale file must not keep a ping alive after a disconnect.
+    #[test]
+    fn the_ping_is_passed_on_only_while_connected() {
+        let f = TunnelFile { ping_us: Some(361_500), ping_seq: 42, ..file() };
+        let up = assemble(Some(&f), true, None, true, false, "London", 1_789_180_010);
+        assert_eq!((up.ping_us, up.ping_seq), (Some(361_500), 42));
+        let down = assemble(Some(&f), false, None, true, false, "London", 1_789_180_010);
+        assert_eq!((down.ping_us, down.ping_seq), (None, 0));
+    }
+
+    /// Files and replies from before Phase 2 have no ping fields.
+    #[test]
+    fn ping_fields_default_when_absent() {
+        let mut v = serde_json::to_value(file()).unwrap();
+        v.as_object_mut().unwrap().remove("ping_us");
+        v.as_object_mut().unwrap().remove("ping_seq");
+        let f: TunnelFile = serde_json::from_value(v).unwrap();
+        assert_eq!((f.ping_us, f.ping_seq), (None, 0));
+        let mut s = serde_json::to_value(TunnelStatus::default()).unwrap();
+        s.as_object_mut().unwrap().remove("ping_us");
+        s.as_object_mut().unwrap().remove("ping_seq");
+        let s: TunnelStatus = serde_json::from_value(s).unwrap();
+        assert_eq!((s.ping_us, s.ping_seq), (None, 0));
     }
 
     /// The same across the worker/daemon boundary: a `tunnel.json` written
