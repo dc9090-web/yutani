@@ -260,7 +260,7 @@ pub fn notice_class() -> cosmic::theme::Container<'static> {
 
 /// The ready launch button's glow, worn by a wrapper container
 /// (cosmic buttons have no shadow).
-pub fn glow_wrap_class() -> cosmic::theme::Container<'static> {
+pub fn launch_glow_class() -> cosmic::theme::Container<'static> {
     class(container::Style { shadow: Shadow { color: LAUNCH_GLOW, offset: Vector::ZERO, blur_radius: 14.0 }, ..boxed(None, None, CARD_RADIUS) })
 }
 
