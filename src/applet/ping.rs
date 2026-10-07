@@ -77,8 +77,11 @@ fn baseline(size: f32) -> f32 {
 impl PingWindow {
     /// Take `sample` if `seq` is a probe this window has not seen.
     pub fn push_seq(&mut self, seq: u64, sample: Option<f32>) {
-        if self.last_seq.is_some_and(|last| seq <= last) {
-            return;
+        match self.last_seq {
+            Some(last) if seq == last => return,
+            // The probe restarted (tunnel worker restart): a new session.
+            Some(last) if seq < last => self.clear(),
+            _ => {}
         }
         self.last_seq = Some(seq);
         if self.samples.len() == WINDOW {
@@ -227,6 +230,16 @@ mod tests {
         assert_eq!(w.summary(true).value, "1", "seq 40 was already taken");
         w.push_seq(41, Some(500.0));
         assert_eq!(w.summary(true).value, "500");
+    }
+
+    #[test]
+    fn a_lower_sequence_is_a_new_probe_session() {
+        let mut w = window(&[Some(1.0); 41]);
+        w.push_seq(1, Some(7.0));
+        let s = w.summary(true);
+        assert_eq!((s.value.as_str(), s.dots.len()), ("7", 1), "old samples dropped");
+        w.push_seq(1, Some(9.0));
+        assert_eq!(w.summary(true).value, "7", "equal is still ignored");
     }
 
     /// Newest at the right edge, 3 px and opaque; oldest 2 px at .3.
