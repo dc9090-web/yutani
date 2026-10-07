@@ -164,48 +164,54 @@ shown.
 
 ## Phase 3 — Launch EVE
 
-- **IPC:** `Request::Launch` (`launch\n`). The status reply gains
-  `launch: Option<LaunchState>` (`serde(default)`).
+Revised 2026-10-07 after mapping the daemon. The daemon already sees every
+toplevel and can minimise or activate any of them; `classify` already keeps
+the "EVE Launcher" window out of the clients; an IPC reply can be held. What
+is new is a daemon-side `steam` spawn, a view of Steam's own window, and a
+"launcher still alive" check.
 
-  ```rust
-  LaunchState {
-      step: u8,
-      steps: [StepState; 4],
-      next_hotkey: String,
-      failed: Option<String>,
-  }
-  ```
+- **IPC:** `Request::Launch` (`launch\n`), answered at once (`ok`, or `err`
+  when all 9 slots are in use or `steam` cannot be spawned). Progress travels
+  in `Status.launch: Option<LaunchState>` (`serde(default)`), polled by the
+  applet as usual.
+- **Wire (`src/launch_eve.rs`, lib):** `LaunchState { steps: [Step; 4],
+  hotkey: String, failed: Option<String> }`, `Step = Pending | Running | Done
+  | Failed`. `hotkey` is the predicted `CTRL+ALT+n` (clients + 1) until the
+  real slot is known.
+- **The machine (`Launch<H>`, pure, generic over the handle so it is tested
+  without Wayland):** fed observations, returns effects.
 
-  `StepState` is `Pending | Running | Done | Failed`.
-- **Daemon state machine (`launch_eve.rs`)**, advanced on the existing
-  scan tick:
-  1. **STEAM · APPLAUNCH 8500.** Spawn `steam steam://rungameid/8500`
-     detached. Done when a Steam toplevel exists (it usually already does).
-     Fail after 30 s.
-  2. **STEAM · WINDOW MINIMISED.** Minimise Steam's toplevels through the
-     toplevel-management protocol the backend already binds. If that is
-     unsupported, mark the step Done anyway and log it, because this step is
-     cosmetic.
-  3. **EVE CLIENT · STARTING.** Done when a client that was not in the
-     snapshot taken at step 1 is adopted. No timeout while an EVE Launcher
-     process is alive. Fail if neither a launcher nor a new client appears
-     within 60 s, or if the launcher exits with no new client.
-  4. **HOTKEY ASSIGNED · {prefix}+{n}.** Done when the new client has its
-     slot. The daemon then focuses it.
-- **After the steps:**
-  - The state stays visible for 2 s after the last step, then clears.
-  - A failure shows on its line in red with the reason for 5 s, then
-    clears.
-  - Only one launch runs at a time. A second `launch` while one runs is a
-    no-op that returns the current state.
-- **Button:**
-  - ready "▶ LAUNCH EVE";
-  - launching "LAUNCHING…" / "STEP n / 4";
-  - inert "START YUTANI TO LAUNCH" when the service is stopped;
-  - inert "ALL 9 SLOTS IN USE" when there are 9 clients.
-- **Tests:** a state-machine unit test driven with fake observations
-  (toplevels, adopted clients, launcher pid alive/dead, elapsed time). The
-  real run is verified live.
+  | Step | Done when | Fails when |
+  |---|---|---|
+  | 1 STEAM · APPLAUNCH 8500 | an `evelauncher.exe` process is seen, or a new client appears | neither within 60 s |
+  | 2 STEAM · WINDOW MINIMISED | right after step 1 | — (cosmetic) |
+  | 3 EVE CLIENT · STARTING | a client handle not present at the start appears | the launcher has been gone 10 s with no new client |
+  | 4 HOTKEY ASSIGNED · CTRL+ALT+n | that client's thumbnail is placed; its slot is its position in the focus order; the daemon then focuses it | the client closes first |
+
+  - **Steam's window (Daniel's choice: minimise only if it popped up):** the
+    daemon tracks toplevels whose app_id is `steam` (any case). From the
+    start of a launch until it ends, any Steam window that becomes visible
+    (new, or un-minimised) and was not visible at the start is minimised.
+    One that was already open is left alone.
+  - A slot above 9 has no hotkey: step 4 reads `HOTKEY ASSIGNED · —`.
+  - Finished: the state stays 2 s, then clears. Failed: the failed line
+    shows the reason for 5 s, then clears. One launch at a time; a second
+    `launch` while one runs is a no-op `ok`.
+- **Daemon wiring:**
+  - `steam steam://rungameid/8500` spawned with null stdio in its own
+    process group, reaped on a thread.
+  - `Event::SteamWindow(handle, visible)` / `SteamWindowGone(handle)` from
+    the backend for `steam` toplevels.
+  - A 500 ms `LaunchTick` subscription only while a launch is active; it
+    scans `/proc` for `evelauncher.exe` and checks the target's placement.
+- **Applet:**
+  - Button: ready "▶ LAUNCH EVE"; while launching "LAUNCHING…" /
+    "STEP n / 4"; inert "START YUTANI TO LAUNCH" when stopped; inert "ALL 9
+    SLOTS IN USE" at 9 clients.
+  - The launch log card under the action row: done lines phosphor + `OK`,
+    the running one amber + `…`, pending dimmer, a failed one red + `FAIL`
+    with the reason as an extra red line.
+  - The card counts in `console_height`.
 
 ## Error handling
 
