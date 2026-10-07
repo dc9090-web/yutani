@@ -50,8 +50,8 @@ fn arrowed<'a>(dir: Direction, word: &'static str, ty: Type, color: Color) -> El
 /// A canvas in a renderer layer of its own. On the panel's popup surface
 /// only the last canvas drawn into a layer showed up (2026-10-07: the
 /// rockers, dotted rules, uplink arrow and scope were missing while the
-/// footer cursor — the last canvas — and the stacked brackets and glass
-/// drew); the same view in an ordinary window drew every one. A stack draws
+/// footer cursor — the last canvas — and the stacked brackets drew); the
+/// same view in an ordinary window drew every one. A stack draws
 /// each child after its first in a layer of its own, so each canvas gets a
 /// stack whose first child is an empty space of the same size.
 fn layered<'a, P>(program: P, w: Length, h: Length) -> Element<'a, Msg>
@@ -475,8 +475,11 @@ pub fn popup(state: &Applet) -> Element<'_, Msg> {
         col = col.push(menu(c.running));
     }
     col = col.push(footer(&c));
-    let glass = widget::canvas(&state.glass).width(Length::Fill).height(Length::Fill);
-    widget::container(cosmic::iced::widget::stack([col.into(), glass.into()]))
+    // The handoff's 70 % phosphor line along the top edge. Its scanlines
+    // are left out: on the panel's popup surface they garbled the 8–9 px
+    // type at 1× (2026-10-07), and the handoff makes them optional.
+    let top_line = widget::container(widget::space().width(Length::Fill).height(Length::Fixed(1.0))).class(skin::hairline_class(skin::TOP_LINE));
+    widget::container(Column::new().width(Length::Fill).push(top_line).push(col))
         .width(Length::Fill)
         .class(skin::popover_class())
         .into()

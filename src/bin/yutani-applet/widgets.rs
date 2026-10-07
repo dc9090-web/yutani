@@ -1,6 +1,6 @@
 //! The popover's drawn pieces (Nostromo handoff): the sand-field scope,
 //! the ping sparkline, the rockers, dotted section rules, corner brackets,
-//! the glass overlay and the footer's blinking cursor. Anything that moves
+//! and the footer's blinking cursor. Anything that moves
 //! animates inside its own canvas — `RedrawRequested` steps it and asks for
 //! the next frame — so the popover's `view()` is not rebuilt per frame.
 
@@ -198,31 +198,6 @@ impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Brackets {
         frame.fill_rectangle(Point::new(w - b, h - 1.0), Size::new(b, 1.0), PHOSPHOR);
         frame.fill_rectangle(Point::new(w - 1.0, h - b), Size::new(1.0, b), PHOSPHOR);
         vec![frame.into_geometry()]
-    }
-}
-
-// ---- glass -----------------------------------------------------------------------------
-
-/// Scanlines (one dark row in three) and the 70 % phosphor top line, over
-/// the whole popover. Cached: redrawn only when the size changes. Never
-/// handles an event, so the controls under it get every click.
-#[derive(Default)]
-pub struct Glass {
-    cache: canvas::Cache,
-}
-
-impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Glass {
-    type State = ();
-
-    fn draw(&self, _: &(), renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
-        vec![self.cache.draw(renderer, bounds.size(), |frame| {
-            let mut y = 2.0;
-            while y < bounds.height {
-                frame.fill_rectangle(Point::new(0.0, y), Size::new(bounds.width, 1.0), skin::SCANLINE);
-                y += 3.0;
-            }
-            frame.fill_rectangle(Point::ORIGIN, Size::new(bounds.width, 1.0), skin::TOP_LINE);
-        })]
     }
 }
 

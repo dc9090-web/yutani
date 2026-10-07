@@ -63,8 +63,6 @@ pub struct Applet {
     /// "Start" was pressed: the service rocker shows pending until a
     /// status reply arrives or this deadline passes.
     pub starting: Option<Instant>,
-    /// The popover's scanline overlay (cached geometry).
-    pub glass: crate::widgets::Glass,
 }
 
 /// A one-line note under the action row (spec §7): what went wrong, when it
@@ -320,7 +318,6 @@ impl cosmic::Application for Applet {
             ping: PingWindow::default(),
             totals: (0, 0),
             starting: None,
-            glass: Default::default(),
         };
         // Through the guard like every other poll, so the very first reply
         // releases it instead of finding it never armed.
