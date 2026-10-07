@@ -83,6 +83,8 @@ pub enum Request {
     SettingsPage(String),
     Quit,
     Status,
+    /// The applet's popover is open, so the ping is wanted: renew the lease.
+    Watch,
     TunnelConnect,
     TunnelDisconnect,
 }
@@ -123,12 +125,13 @@ impl Request {
             ("settings", Some(page)) => Ok(Request::SettingsPage(page.to_string())),
             ("quit", None) => Ok(Request::Quit),
             ("status", None) => Ok(Request::Status),
+            ("watch", None) => Ok(Request::Watch),
             ("tunnel", Some("connect")) => Ok(Request::TunnelConnect),
             ("tunnel", Some("disconnect")) => Ok(Request::TunnelDisconnect),
             ("tunnel", _) => Err("tunnel needs connect or disconnect".into()),
             ("", _) => Err("empty request".into()),
             (cmd, Some(_))
-                if matches!(cmd, "next" | "prev" | "show" | "hide" | "toggle" | "layouts" | "quit" | "status") =>
+                if matches!(cmd, "next" | "prev" | "show" | "hide" | "toggle" | "layouts" | "quit" | "status" | "watch") =>
             {
                 Err(format!("{cmd} takes no argument"))
             }
@@ -150,6 +153,7 @@ impl Request {
             Request::SettingsPage(page) => format!("settings {page}\n"),
             Request::Quit => "quit\n".into(),
             Request::Status => "status\n".into(),
+            Request::Watch => "watch\n".into(),
             Request::TunnelConnect => "tunnel connect\n".into(),
             Request::TunnelDisconnect => "tunnel disconnect\n".into(),
         }
@@ -202,6 +206,7 @@ mod tests {
         assert_eq!(Request::parse("settings layouts"), Ok(Request::SettingsPage("layouts".into())));
         assert_eq!(Request::parse("quit"), Ok(Request::Quit));
         assert_eq!(Request::parse("status"), Ok(Request::Status));
+        assert_eq!(Request::parse("watch"), Ok(Request::Watch));
         assert_eq!(Request::parse("tunnel connect"), Ok(Request::TunnelConnect));
         assert_eq!(Request::parse("tunnel disconnect"), Ok(Request::TunnelDisconnect));
     }
@@ -213,6 +218,7 @@ mod tests {
         assert!(Request::parse("focus").unwrap_err().contains("client number"));
         assert_eq!(Request::parse("layout").unwrap_err(), "layout needs a name");
         assert_eq!(Request::parse("next now").unwrap_err(), "next takes no argument");
+        assert_eq!(Request::parse("watch on").unwrap_err(), "watch takes no argument");
         assert_eq!(Request::parse("dance").unwrap_err(), "unknown command \"dance\"");
         assert_eq!(Request::parse("").unwrap_err(), "empty request");
         assert_eq!(Request::parse("tunnel").unwrap_err(), "tunnel needs connect or disconnect");
@@ -242,6 +248,7 @@ mod tests {
             Request::SettingsPage("layouts".into()),
             Request::Quit,
             Request::Status,
+            Request::Watch,
             Request::TunnelConnect,
             Request::TunnelDisconnect,
         ] {

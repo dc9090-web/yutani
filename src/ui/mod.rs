@@ -564,6 +564,11 @@ impl App {
                     .filter_map(|h| self.clients.get(h))
                     .map(|c| crate::tunnel::status::ClientStatus { name: c.info.login.label().to_string(), active: c.info.activated })
                     .collect();
+                // An EVE client is running, so the ping is wanted: the applet
+                // polls at least every 5 s, inside the lease's 10 s term.
+                if !clients.is_empty() {
+                    crate::tunnel::touch_ping_lease();
+                }
                 let hidden = self.hidden;
                 let location = self.config.tunnel.location.clone();
                 let shortcuts = Some(crate::tunnel::status::ShortcutHint {
@@ -590,6 +595,12 @@ impl App {
                     move |result| cosmic::Action::App(Msg::IpcReplyLater(reply, result)),
                 );
                 (Reply::Later, task)
+            }
+            // The popover is open: keep the ping probe running (an open and
+            // a `set_modified`, cheap enough to do inline).
+            Request::Watch => {
+                crate::tunnel::touch_ping_lease();
+                (Reply::Now(Ok(None)), cosmic::iced::Task::none())
             }
             // `systemctl start|stop` is a synchronous subprocess that can
             // take up to the unit's TimeoutStopSec (10 s). Running it here
@@ -2625,6 +2636,16 @@ mod tests {
         let (how, _task) = app.handle_request(&crate::ipc::Request::Status, &reply);
         assert!(matches!(how, Reply::Later), "answered on the update thread");
         assert!(rx.try_recv().is_err(), "the reply must come from the task, not from this call");
+    }
+
+    /// `watch` (the applet's popover is open) renews the ping lease and is
+    /// answered at once with a plain `ok`.
+    #[test]
+    fn watch_is_answered_at_once() {
+        let mut app = app(Config::default());
+        let (reply, _rx) = ipc::Responder::detached();
+        let (how, _task) = app.handle_request(&crate::ipc::Request::Watch, &reply);
+        assert!(matches!(how, Reply::Now(Ok(None))));
     }
 
     /// Opacity-and-centre spec §2.2/§2.5: each output is its own group

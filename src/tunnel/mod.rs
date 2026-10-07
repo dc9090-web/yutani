@@ -106,6 +106,28 @@ pub fn lease_fresh(path: &std::path::Path, now: std::time::SystemTime) -> bool {
     }
 }
 
+/// Renew the ping lease (the daemon, as the user): create or open
+/// `$XDG_RUNTIME_DIR/yutani-ping.lease` 0600 and set its mtime to now. No
+/// `XDG_RUNTIME_DIR`, nothing to do; any error is logged at debug and
+/// otherwise ignored — the worst case is an IDLE ping row.
+pub fn touch_ping_lease() {
+    // Tests drive the daemon's handlers; they must not wake the real worker.
+    if cfg!(test) {
+        return;
+    }
+    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") else { return };
+    let path = ping_lease_in(std::path::Path::new(&dir));
+    if let Err(e) = touch(&path) {
+        tracing::debug!("ping lease {}: {e}", path.display());
+    }
+}
+
+fn touch(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let f = std::fs::OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(path)?;
+    f.set_modified(std::time::SystemTime::now())
+}
+
 /// Write `path` with exactly `mode`, atomically.
 ///
 /// The temporary is created in the target's directory with `mode` from the
@@ -244,6 +266,23 @@ mod tests {
         std::os::unix::fs::symlink(&path, &link).unwrap();
         let link_mtime = std::fs::symlink_metadata(&link).unwrap().modified().unwrap();
         assert!(!lease_fresh(&link, link_mtime + Duration::from_secs(PING_LEASE_S + 1)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The daemon's touch makes a fresh, user-only lease and renews an old one.
+    #[test]
+    fn a_touch_makes_the_lease_fresh_and_user_only() {
+        use std::time::{Duration, SystemTime};
+        let dir = temp_dir("touch");
+        let path = ping_lease_in(&dir);
+        touch(&path).unwrap();
+        assert!(lease_fresh(&path, SystemTime::now()));
+        assert_eq!(mode_of(path.to_str().unwrap()) & 0o077, 0, "the lease is the user's alone");
+        let old = SystemTime::now() - Duration::from_secs(PING_LEASE_S * 6);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+        assert!(!lease_fresh(&path, SystemTime::now()));
+        touch(&path).unwrap();
+        assert!(lease_fresh(&path, SystemTime::now()));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
