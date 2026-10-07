@@ -8,7 +8,7 @@ use cosmic::widget::{self, Column, Row};
 use cosmic::Element;
 
 use yutani::applet::Action;
-use yutani::applet::console::{AccountRow, Accounts, Console, ControlRow, Gauge, LaunchButton, Level, Network};
+use yutani::applet::console::{AccountRow, Accounts, Console, ControlRow, Gauge, LaunchButton, Level, LogLine, Network, Step};
 use yutani::applet::fonts::{self, advance_em};
 use yutani::applet::menu::MenuRow;
 use yutani::applet::ping::{Quality, SPARK_H};
@@ -370,22 +370,16 @@ fn action_row<'a>(c: &Console, menu_open: bool) -> Element<'a, Msg> {
         .class(skin::overflow_class(menu_open))
         .on_press(Msg::ToggleMenu);
     let mut row = Row::new().width(Length::Fill).spacing(skin::ACTION_GAP);
-    row = match c.launch {
-        // Phase 1: the ⋯ alone, at the right.
-        LaunchButton::Hidden => row.push(fill_x()),
-        LaunchButton::Ready | LaunchButton::Launching { .. } | LaunchButton::Inert(_) => row.push(primary(c.launch)),
-    };
+    row = row.push(primary(c.launch));
     margin(row.push(overflow))
 }
 
-/// The primary button. Phase 1 never produces anything but `Hidden`; the
-/// other looks are Phase 3's, drawn here so the skin is complete.
+/// The primary button: ready, launching (step n / 4) or inert.
 fn primary<'a>(l: LaunchButton) -> Element<'a, Msg> {
     let (label, sub, look) = match l {
         LaunchButton::Ready => ("▶ LAUNCH EVE".to_string(), None, PrimaryLook::Ready),
         LaunchButton::Launching { step } => ("LAUNCHING…".to_string(), Some(format!("STEP {step} / 4")), PrimaryLook::Busy),
         LaunchButton::Inert(why) => (why.to_string(), None, PrimaryLook::Inert),
-        LaunchButton::Hidden => unreachable!("not drawn"),
     };
     let ink = match look {
         PrimaryLook::Ready => skin::BG,
@@ -407,6 +401,30 @@ fn primary<'a>(l: LaunchButton) -> Element<'a, Msg> {
     } else {
         button.into()
     }
+}
+
+/// The launch log: one line per step, then the failure reason if any.
+fn launch_card<'a>(lines: &[LogLine], failed: Option<&str>) -> Element<'a, Msg> {
+    let mut col = Column::new().width(Length::Fill).spacing(3);
+    for l in lines {
+        let (ink, word) = match l.status {
+            Step::Done => (skin::PHOSPHOR, "OK"),
+            Step::Running => (skin::AMBER, "…"),
+            Step::Pending => (skin::DIMMER, ""),
+            Step::Failed => (skin::RED, "FAIL"),
+        };
+        col = col.push(
+            Row::new()
+                .width(Length::Fill)
+                .push(t(format!("▸ {}", l.text), skin::LOG, ink))
+                .push(fill_x())
+                .push(t(word, skin::LOG, ink)),
+        );
+    }
+    if let Some(why) = failed {
+        col = col.push(t(why, skin::LOG, skin::RED));
+    }
+    margin(widget::container(col).width(Length::Fill).padding(skin::pad(7.0, 12.0, 8.0, 12.0)).class(skin::log_class()))
 }
 
 fn menu_row<'a>(r: &MenuRow) -> Element<'a, Msg> {
@@ -470,6 +488,9 @@ pub fn popup(state: &Applet) -> Element<'_, Msg> {
         col = col.push(notice(n));
     }
     col = col.push(action_row(&c, state.menu_open));
+    if let Some(log) = &c.launch_log {
+        col = col.push(launch_card(log, c.launch_failed.as_deref()));
+    }
     if let Some(note) = state.visible_note() {
         col = col.push(note_line(note));
     }

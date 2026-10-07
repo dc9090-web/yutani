@@ -9,6 +9,7 @@ use crate::applet::icon::HANDSHAKE_STALE_S;
 use crate::applet::ping::{PingSummary, PingWindow};
 use crate::applet::rate::Rates;
 use crate::applet::skin::Ink;
+pub use crate::launch_eve::Step;
 use crate::tunnel::status::Status;
 
 pub const DASH: &str = "—";
@@ -100,12 +101,19 @@ pub struct Gauge {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaunchButton {
-    /// Phase 1: no Launch EVE yet.
-    Hidden,
     Ready,
     Launching { step: u8 },
     Inert(&'static str),
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LogLine {
+    pub text: String,
+    pub status: Step,
+}
+
+/// The log card's height: padding, 4 lines, gaps, border and margin.
+pub const LOG_CARD_PX: i32 = 7 + 4 * 13 + 3 * 3 + 8 + 2 + 10;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Console {
@@ -121,6 +129,9 @@ pub struct Console {
     pub host: [Gauge; 3],
     pub notice: Option<String>,
     pub launch: LaunchButton,
+    /// The four-step Launch EVE log, while a launch is on show.
+    pub launch_log: Option<Vec<LogLine>>,
+    pub launch_failed: Option<String>,
     pub footer: String,
 }
 
@@ -262,6 +273,7 @@ pub fn console_height(c: &Console, menu_open: bool) -> i32 {
     let scope = if c.network.scope { SCOPE_BAND_PX } else { 0 };
     let notice = c.notice.as_ref().map_or(0, |n| 4 + 7 + 8 + 13 * n.chars().count().div_ceil(52).max(1) as i32 + 2 + GAP);
     let menu = if menu_open { MENU } else { 0 };
+    let log = if c.launch_log.is_some() { LOG_CARD_PX + if c.launch_failed.is_some() { 13 } else { 0 } } else { 0 };
     HEADER
         + 4 * SECTION_HEAD
         + CONTROL + GAP
@@ -270,8 +282,30 @@ pub fn console_height(c: &Console, menu_open: bool) -> i32 {
         + HOST + GAP
         + notice
         + ACTION + GAP
+        + log
         + menu
         + FOOTER
+}
+
+fn launch_button(status: Option<&Status>) -> LaunchButton {
+    let Some(s) = status else { return LaunchButton::Inert("START YUTANI TO LAUNCH") };
+    if s.clients.len() >= 9 {
+        return LaunchButton::Inert("ALL 9 SLOTS IN USE");
+    }
+    match &s.launch {
+        Some(l) if !l.finished() && !l.is_failed() => LaunchButton::Launching { step: l.current() },
+        _ => LaunchButton::Ready,
+    }
+}
+
+fn launch_log(l: &crate::launch_eve::LaunchState) -> Vec<LogLine> {
+    let texts = [
+        "STEAM · APPLAUNCH 8500".to_string(),
+        "STEAM · WINDOW MINIMISED".to_string(),
+        "EVE CLIENT · STARTING".to_string(),
+        format!("HOTKEY ASSIGNED · {}", l.hotkey),
+    ];
+    texts.into_iter().zip(l.steps).map(|(text, status)| LogLine { text, status }).collect()
 }
 
 /// The Steam notice, shouted like the rest of the popover, except that a
@@ -344,7 +378,9 @@ pub fn console(status: Option<&Status>, i: &Inputs) -> Console {
         host_meta: format!("{ram_total} · 1 HZ"),
         host: host_gauges(i.host),
         notice,
-        launch: LaunchButton::Hidden,
+        launch: launch_button(status),
+        launch_log: status.and_then(|s| s.launch.as_ref()).map(launch_log),
+        launch_failed: status.and_then(|s| s.launch.as_ref()).and_then(|l| l.failed.clone()),
         footer: format!("YUTANI OS · BUILD {}", env!("YUTANI_BUILD")),
     };
     c.network.scope = i.available.is_none_or(|h| console_height(&c, i.menu_open) <= h);
@@ -401,6 +437,51 @@ mod tests {
         Inputs { rates: Rates { tx: 1_000.0, rx: 8_000.0 }, totals: (693_600_000, 105_800_000), host, ping, tunnel_pending: None, service_pending: false, available: None, menu_open: false }
     }
 
+    fn launching(steps: [Step; 4], failed: Option<&str>) -> Status {
+        let mut s = status(true, Some(4), 2);
+        s.launch = Some(crate::launch_eve::LaunchState { steps, hotkey: "CTRL+ALT+3".into(), failed: failed.map(Into::into) });
+        s
+    }
+
+    #[test]
+    fn the_button_follows_the_service_the_slots_and_the_launch() {
+        let (h, p) = (HostReading::default(), PingWindow::default());
+        let i = inputs(&h, &p);
+        assert_eq!(console(None, &i).launch, LaunchButton::Inert("START YUTANI TO LAUNCH"));
+        assert_eq!(console(Some(&status(true, Some(4), 2)), &i).launch, LaunchButton::Ready);
+        assert_eq!(console(Some(&status(true, Some(4), 9)), &i).launch, LaunchButton::Inert("ALL 9 SLOTS IN USE"));
+        use Step::*;
+        let c = console(Some(&launching([Done, Done, Running, Pending], None)), &i);
+        assert_eq!(c.launch, LaunchButton::Launching { step: 3 });
+        assert_eq!(console(Some(&launching([Done; 4], None)), &i).launch, LaunchButton::Ready);
+        assert_eq!(console(Some(&launching([Done, Done, Failed, Pending], Some("LAUNCHER CLOSED"))), &i).launch, LaunchButton::Ready);
+    }
+
+    #[test]
+    fn the_log_names_each_step_and_the_hotkey() {
+        let (h, p) = (HostReading::default(), PingWindow::default());
+        use Step::*;
+        let c = console(Some(&launching([Done, Done, Running, Pending], None)), &inputs(&h, &p));
+        let log = c.launch_log.expect("log while launching");
+        let texts: Vec<&str> = log.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, ["STEAM · APPLAUNCH 8500", "STEAM · WINDOW MINIMISED", "EVE CLIENT · STARTING", "HOTKEY ASSIGNED · CTRL+ALT+3"]);
+        assert_eq!(log[2].status, Running);
+        assert!(console(Some(&status(true, Some(4), 2)), &inputs(&h, &p)).launch_log.is_none());
+        let f = console(Some(&launching([Done, Done, Failed, Pending], Some("LAUNCHER CLOSED"))), &inputs(&h, &p));
+        assert_eq!(f.launch_failed.as_deref(), Some("LAUNCHER CLOSED"));
+    }
+
+    #[test]
+    fn the_log_card_counts_in_the_height() {
+        let (h, p) = (HostReading::default(), PingWindow::default());
+        use Step::*;
+        let plain = console(Some(&status(true, Some(4), 2)), &inputs(&h, &p));
+        let busy = console(Some(&launching([Done, Done, Running, Pending], None)), &inputs(&h, &p));
+        assert_eq!(console_height(&busy, false) - console_height(&plain, false), LOG_CARD_PX);
+        let failed = console(Some(&launching([Done, Done, Failed, Pending], Some("LAUNCHER CLOSED"))), &inputs(&h, &p));
+        assert_eq!(console_height(&failed, false) - console_height(&busy, false), 13);
+    }
+
     #[test]
     fn running_and_connected_fills_every_section() {
         let (h, p) = (HostReading::default(), PingWindow::default());
@@ -421,7 +502,7 @@ mod tests {
         assert_eq!((n.endpoint.as_str(), n.peer.as_str()), ("203.0.113.42", "yutani0"));
         assert_eq!((n.uptime.as_str(), n.uptime_ink), ("T+ 1H 38M", Ink::Phosphor));
         assert!(n.live && n.scope);
-        assert_eq!(c.launch, LaunchButton::Hidden, "Phase 1");
+        assert_eq!(c.launch, LaunchButton::Ready);
         assert!(c.footer.starts_with("YUTANI OS · BUILD "));
     }
 

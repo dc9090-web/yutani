@@ -110,7 +110,7 @@ mod tests {
     fn every_face_parses_and_has_the_glyphs_it_is_used_for() {
         // B612 Mono has no ▲ or ◄ (it does have ▼ ▶); those would fall back.
         for face in [Face::Mono, Face::MonoBold] {
-            for ch in "YUTANI 0123456789·—▼▶…%°/+:.".chars() {
+            for ch in "YUTANI 0123456789·—▼▶▸…%°/+:.".chars() {
                 assert!(raw_advance(face, ch).is_some(), "{face:?} {ch:?}");
             }
         }

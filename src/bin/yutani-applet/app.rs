@@ -554,7 +554,7 @@ impl cosmic::Application for Applet {
                 }
                 Task::none()
             }
-            Msg::Launch => Task::none(),
+            Msg::Launch => self.update(Msg::Press(Action::Launch)),
         }
     }
 

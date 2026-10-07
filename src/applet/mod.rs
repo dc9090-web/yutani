@@ -60,6 +60,8 @@ pub enum Action {
     LayoutsAndCharacters,
     /// Spawn the daemon (offline state only).
     StartDaemon,
+    /// Launch EVE through Steam (Phase 3).
+    Launch,
 }
 
 impl Action {
@@ -73,6 +75,7 @@ impl Action {
             Action::Preferences => Some(Request::Settings),
             Action::LayoutsAndCharacters => Some(Request::SettingsPage("layouts".into())),
             Action::StartDaemon => None,
+            Action::Launch => Some(crate::ipc::Request::Launch),
         }
     }
 }
@@ -203,6 +206,7 @@ mod tests {
         assert_eq!(Action::Preferences.request(), Some(crate::ipc::Request::Settings));
         assert_eq!(Action::LayoutsAndCharacters.request(), Some(crate::ipc::Request::SettingsPage("layouts".into())));
         assert_eq!(Action::StartDaemon.request(), None);
+        assert_eq!(Action::Launch.request(), Some(Request::Launch));
     }
 
     /// I2: only the two tunnel actions keep the user waiting.
@@ -216,6 +220,7 @@ mod tests {
             Action::Preferences,
             Action::LayoutsAndCharacters,
             Action::StartDaemon,
+            Action::Launch,
         ] {
             assert_eq!(waiting_note(action), None, "{action:?}");
         }
