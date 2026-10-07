@@ -4,3 +4,7 @@ target/
 vpn/
 design/*.zip
 design/unpacked/
+# local scratch, design screenshots and package checksums
+temp/
+design/screenshots/
+packaging/*.sha256
