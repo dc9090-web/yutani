@@ -50,8 +50,6 @@ pub fn clip_note(text: &str) -> String {
 pub enum Action {
     Connect,
     Disconnect,
-    ShowThumbs,
-    HideThumbs,
     /// 1-based index in the daemon's layout order — the order `status`
     /// lists clients in.
     Focus(usize),
@@ -70,8 +68,6 @@ impl Action {
         match self {
             Action::Connect => Some(Request::TunnelConnect),
             Action::Disconnect => Some(Request::TunnelDisconnect),
-            Action::ShowThumbs => Some(Request::Show),
-            Action::HideThumbs => Some(Request::Hide),
             Action::Focus(n) => Some(Request::Focus(*n)),
             Action::Quit => Some(Request::Quit),
             Action::Preferences => Some(Request::Settings),
@@ -202,8 +198,6 @@ mod tests {
     fn actions_map_onto_the_ipc_protocol() {
         assert_eq!(Action::Connect.request(), Some(Request::TunnelConnect));
         assert_eq!(Action::Disconnect.request(), Some(Request::TunnelDisconnect));
-        assert_eq!(Action::ShowThumbs.request(), Some(Request::Show));
-        assert_eq!(Action::HideThumbs.request(), Some(Request::Hide));
         assert_eq!(Action::Focus(3).request(), Some(Request::Focus(3)));
         assert_eq!(Action::Quit.request(), Some(Request::Quit));
         assert_eq!(Action::Preferences.request(), Some(crate::ipc::Request::Settings));
@@ -217,8 +211,6 @@ mod tests {
         assert_eq!(waiting_note(Action::Connect).as_deref(), Some("connecting… (up to 15 s)"));
         assert_eq!(waiting_note(Action::Disconnect).as_deref(), Some("disconnecting… (up to 15 s)"));
         for action in [
-            Action::ShowThumbs,
-            Action::HideThumbs,
             Action::Focus(1),
             Action::Quit,
             Action::Preferences,

@@ -96,7 +96,7 @@ pub fn mark_class() -> cosmic::theme::Svg {
 }
 
 /// The status badge's fill on a dark panel, and whether it glows.
-pub fn badge_fill(_is_dark: bool, badge: super::icon::Badge) -> (Color, bool) {
+pub fn badge_fill(badge: super::icon::Badge) -> (Color, bool) {
     use super::icon::Badge;
     match badge {
         Badge::Connected => (crate::applet::skin::PHOSPHOR, true),
@@ -114,7 +114,7 @@ pub fn badge_class(badge: super::icon::Badge) -> cosmic::theme::Container<'stati
         let c = theme.cosmic();
         let panel = panel_bg(c);
         let (fill, glow) = if c.is_dark {
-            badge_fill(true, badge)
+            badge_fill(badge)
         } else {
             (if badge == Badge::Connected { success(c) } else { warning(c) }, false)
         };
@@ -138,8 +138,8 @@ mod tests {
         assert_eq!(BADGE_SQUARE_PX, 7.0);
         assert_eq!(BADGE_RING_PX, 1.5);
         assert_eq!(DIM_OPACITY, 0.40);
-        assert_eq!(badge_fill(true, crate::applet::icon::Badge::Connected), (crate::applet::skin::PHOSPHOR, true));
-        assert_eq!(badge_fill(true, crate::applet::icon::Badge::Attention), (crate::applet::skin::AMBER, false));
+        assert_eq!(badge_fill(crate::applet::icon::Badge::Connected), (crate::applet::skin::PHOSPHOR, true));
+        assert_eq!(badge_fill(crate::applet::icon::Badge::Attention), (crate::applet::skin::AMBER, false));
     }
 
     #[test]
