@@ -9,9 +9,21 @@ use cosmic::cctk::{
 };
 use std::collections::HashSet;
 
-use super::{AppData, Event, Handle};
+use super::{AppData, Event, Handle, State, is_steam_window};
 
 impl AppData {
+    /// Launch EVE minimises a Steam window that pops up, so a non-client
+    /// toplevel whose app_id is `steam` is reported (and tracked, so its
+    /// close can be reported once `info()` is gone).
+    fn report_steam(&mut self, handle: &Handle, info: &cctk::toplevel_info::ToplevelInfo) {
+        if is_steam_window(&info.app_id) {
+            self.steam_windows.insert(handle.clone());
+            self.send_event(Event::SteamWindow(handle.clone(), !info.state.contains(&State::Minimized)));
+        } else if self.steam_windows.remove(handle) {
+            self.send_event(Event::SteamWindowGone(handle.clone()));
+        }
+    }
+
     /// Re-run classification for every known toplevel (after `SetAppIds`).
     pub fn reclassify_all(&mut self) {
         let infos: Vec<_> = self
@@ -51,6 +63,8 @@ impl ToplevelInfoHandler for AppData {
             tracing::info!(title = %info.title, "client added");
             self.send_event(Event::ClientAdded(handle.clone(), client));
             self.start_capture(handle);
+        } else {
+            self.report_steam(handle, &info);
         }
     }
 
@@ -69,6 +83,7 @@ impl ToplevelInfoHandler for AppData {
                     self.stop_capture(handle);
                     self.send_event(Event::ClientRemoved(handle.clone()));
                 }
+                self.report_steam(handle, &info);
             }
         }
     }
@@ -82,6 +97,9 @@ impl ToplevelInfoHandler for AppData {
             tracing::info!("toplevel closed");
             self.stop_capture(handle);
             self.send_event(Event::ClientRemoved(handle.clone()));
+        }
+        if self.steam_windows.remove(handle) {
+            self.send_event(Event::SteamWindowGone(handle.clone()));
         }
     }
 }

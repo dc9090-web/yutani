@@ -59,6 +59,47 @@ pub fn busctl_adopt_argv(pid: u32) -> Vec<String> {
     .collect()
 }
 
+/// Does a process with this `comm` and `argv0` match `patterns`? `comm` is
+/// truncated to 15 bytes, so argv[0] is the fallback.
+fn process_name_matches(comm: &str, argv0: &str, patterns: &[String]) -> bool {
+    is_eve_process(comm.trim(), patterns) || is_eve_process(argv0, patterns)
+}
+
+/// The matching name of the process at `dir` (`/proc/<pid>`), or `None`.
+/// argv[0] is read only when `comm` does not match (a few hundred
+/// processes per tick otherwise).
+fn process_name(dir: &std::path::Path, comm: &str, patterns: &[String]) -> Option<String> {
+    if is_eve_process(comm.trim(), patterns) {
+        return Some(comm.trim().to_string());
+    }
+    let cmdline = std::fs::read(dir.join("cmdline")).unwrap_or_default();
+    let argv0 = cmdline.split(|b| *b == 0).next().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
+    if !process_name_matches(comm, &argv0, patterns) {
+        return None;
+    }
+    Some(argv0.rsplit(['/', '\\']).next().unwrap_or(&argv0).to_string())
+}
+
+/// Is a process owned by `uid` and matching `patterns` alive right now?
+/// No cgroup filter: the EVE Launcher counts wherever it runs. Stops at the
+/// first match.
+#[allow(dead_code)] // driven by the Launch EVE flow in the next task
+pub fn process_running(patterns: &[String], uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(dir) = std::fs::read_dir("/proc") else { return false };
+    dir.flatten().any(|entry| {
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+            return false;
+        }
+        let Ok(meta) = entry.metadata() else { return false };
+        if meta.uid() != uid {
+            return false;
+        }
+        let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+        process_name(&entry.path(), &comm, patterns).is_some()
+    })
+}
+
 /// EVE processes owned by `uid` that are not yet in the slice, and every
 /// pid that was alive during the walk (all users: it feeds
 /// [`Tracker::retain_live`], and a second `/proc` walk per tick just for
@@ -76,18 +117,7 @@ pub fn scan(patterns: &[String], uid: u32) -> (Vec<Candidate>, HashSet<u32>) {
             continue;
         }
         let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
-        let name = if is_eve_process(comm.trim(), patterns) {
-            comm.trim().to_string()
-        } else {
-            // `comm` is truncated to 15 bytes; only then is argv[0] worth
-            // the extra read (a few hundred processes per tick otherwise).
-            let cmdline = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
-            let argv0 = cmdline.split(|b| *b == 0).next().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
-            if !is_eve_process(&argv0, patterns) {
-                continue;
-            }
-            argv0.rsplit(['/', '\\']).next().unwrap_or(&argv0).to_string()
-        };
+        let Some(name) = process_name(&entry.path(), &comm, patterns) else { continue };
         let cgroup = std::fs::read_to_string(entry.path().join("cgroup")).unwrap_or_default();
         if in_slice(&cgroup) {
             continue;
@@ -261,6 +291,14 @@ mod tests {
         assert!(is_eve_process("/some/pfx/drive_c/EVE/eve-online.exe", &pats()));
         assert!(!is_eve_process("wineserver", &pats()));
         assert!(!is_eve_process("exefile.exe.old", &pats()));
+    }
+
+    #[test]
+    fn process_name_matches_comm_or_argv0() {
+        let p = vec!["evelauncher.exe".to_string()];
+        assert!(process_name_matches("evelauncher.exe", "", &p));
+        assert!(process_name_matches("wineserver", r"C:\EVE\Launcher\evelauncher.exe", &p));
+        assert!(!process_name_matches("bash", "/usr/bin/bash", &p));
     }
 
     #[test]

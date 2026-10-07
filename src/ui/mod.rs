@@ -111,6 +111,9 @@ pub struct App {
     pub conn: Option<Connection>,
     pub cmd: Option<calloop::channel::Sender<Cmd>>,
     pub clients: HashMap<Handle, Client>,
+    /// Steam's windows and whether each is visible (not minimised); the
+    /// Launch EVE flow minimises the one that pops up.
+    pub steam_windows: HashMap<Handle, bool>,
     pub outputs: Vec<Output>,
     pub layout: Layout,
     /// Set at startup when `current.ron` exists but failed to parse (spec
@@ -598,6 +601,8 @@ impl App {
             }
             // The popover is open: keep the ping probe running (an open and
             // a `set_modified`, cheap enough to do inline).
+            // Task 3 drives the launch state machine from here.
+            Request::Launch => (Reply::Now(Err("launch: not yet".into())), cosmic::iced::Task::none()),
             Request::Watch => {
                 crate::tunnel::touch_ping_lease();
                 (Reply::Now(Ok(None)), cosmic::iced::Task::none())
@@ -1274,6 +1279,14 @@ impl App {
                     let create = self.create_surface(&handle);
                     Task::batch([create, self.relayout_dock()])
                 }
+            }
+            Event::SteamWindow(handle, visible) => {
+                self.steam_windows.insert(handle, visible);
+                Task::none()
+            }
+            Event::SteamWindowGone(handle) => {
+                self.steam_windows.remove(&handle);
+                Task::none()
             }
             Event::CaptureUnavailable(handle) => {
                 if let Some(c) = self.clients.get_mut(&handle) {
@@ -2270,6 +2283,7 @@ impl Application for App {
             conn: None,
             cmd: None,
             clients: HashMap::new(),
+            steam_windows: HashMap::new(),
             outputs: Vec::new(),
             layout,
             layout_poisoned,
@@ -2587,6 +2601,7 @@ mod tests {
             conn: None,
             cmd: None,
             clients: HashMap::new(),
+            steam_windows: HashMap::new(),
             outputs: Vec::new(),
             layout: Layout::default(),
             layout_poisoned: false,

@@ -86,6 +86,29 @@ pub enum Event {
     /// Capture for this client could not be (re)started; the UI should grey it out
     /// until the next `Frame`.
     CaptureUnavailable(Handle),
+    /// A Steam window (not an EVE client) appeared or changed; `true` when
+    /// it is not minimised. Launch EVE minimises the window Steam pops up.
+    SteamWindow(Handle, bool),
+    /// A Steam window closed.
+    SteamWindowGone(Handle),
+}
+
+/// Steam's own window: app_id `steam`, ignoring case.
+pub fn is_steam_window(app_id: &str) -> bool {
+    app_id.eq_ignore_ascii_case("steam")
+}
+
+#[cfg(test)]
+mod steam_tests {
+    use super::*;
+
+    #[test]
+    fn steam_window_is_app_id_steam_only() {
+        assert!(is_steam_window("steam"));
+        assert!(is_steam_window("Steam"));
+        assert!(!is_steam_window("steam_app_8500"));
+        assert!(!is_steam_window(""));
+    }
 }
 
 #[derive(Debug)]
@@ -171,6 +194,9 @@ pub struct AppData {
     pub capabilities: HashSet<zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1>,
     pub gl: GlState,
     pub thumb_sizes: HashMap<Handle, ThumbSpec>,
+    /// Toplevels reported as Steam windows, so their close can be reported
+    /// after `info()` is gone.
+    pub steam_windows: HashSet<Handle>,
 }
 
 impl AppData {
@@ -411,6 +437,7 @@ fn start(conn: Connection, app_ids: Vec<String>, fps: u32) -> mpsc::Receiver<Eve
                     capabilities: HashSet::new(),
                     gl: GlState::Untried,
                     thumb_sizes: HashMap::new(),
+                    steam_windows: HashSet::new(),
                 };
 
                 let (cmd_sender, cmd_channel) = calloop::channel::channel();

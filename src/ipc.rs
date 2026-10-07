@@ -87,6 +87,8 @@ pub enum Request {
     Watch,
     TunnelConnect,
     TunnelDisconnect,
+    /// Start EVE through Steam and follow it to a hotkey-assigned client.
+    Launch,
 }
 
 impl Request {
@@ -124,6 +126,7 @@ impl Request {
             ("settings", None) => Ok(Request::Settings),
             ("settings", Some(page)) => Ok(Request::SettingsPage(page.to_string())),
             ("quit", None) => Ok(Request::Quit),
+            ("launch", None) => Ok(Request::Launch),
             ("status", None) => Ok(Request::Status),
             ("watch", None) => Ok(Request::Watch),
             ("tunnel", Some("connect")) => Ok(Request::TunnelConnect),
@@ -156,6 +159,7 @@ impl Request {
             Request::Watch => "watch\n".into(),
             Request::TunnelConnect => "tunnel connect\n".into(),
             Request::TunnelDisconnect => "tunnel disconnect\n".into(),
+            Request::Launch => "launch\n".into(),
         }
     }
 }
@@ -209,6 +213,8 @@ mod tests {
         assert_eq!(Request::parse("watch"), Ok(Request::Watch));
         assert_eq!(Request::parse("tunnel connect"), Ok(Request::TunnelConnect));
         assert_eq!(Request::parse("tunnel disconnect"), Ok(Request::TunnelDisconnect));
+        assert_eq!(Request::parse("launch"), Ok(Request::Launch));
+        assert_eq!(Request::Launch.to_line(), "launch\n");
     }
 
     #[test]
