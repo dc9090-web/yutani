@@ -219,9 +219,11 @@ impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Cursor {
     fn draw(&self, start: &Option<Instant>, renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
         let on = start.is_none_or(|s| (Instant::now().saturating_duration_since(s).as_millis() / 500).is_multiple_of(2));
-        if on {
-            frame.fill_rectangle(Point::ORIGIN, bounds.size(), PHOSPHOR);
-        }
+        // Off is a block in the popover's ground, never an empty frame: on
+        // the panel's popup surface the frames where this canvas drew
+        // nothing made the sand field flash brighter and dimmer at the
+        // blink's rhythm (2026-10-07).
+        frame.fill_rectangle(Point::ORIGIN, bounds.size(), if on { PHOSPHOR } else { BG });
         vec![frame.into_geometry()]
     }
 }
