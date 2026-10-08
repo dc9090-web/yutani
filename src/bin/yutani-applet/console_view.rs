@@ -375,8 +375,8 @@ fn action_row<'a>(c: &Console, menu_open: bool) -> Element<'a, Msg> {
     margin(row.push(overflow))
 }
 
-/// The primary button: ready, launching (step n / 4) or inert. A console
-/// plate (`widgets::LaunchPlate`) under a drawn ▶ — B612 Mono's own sits
+/// The primary button: ready, launching (step n / 4) or inert. An
+/// engraved rule (`widgets::LaunchPlate`) round a drawn ▶ — B612 Mono's own sits
 /// small and low — the label, and the four step cells on the right.
 fn primary<'a>(l: LaunchButton) -> Element<'a, Msg> {
     let (label, sub, look, done) = match l {
@@ -384,10 +384,10 @@ fn primary<'a>(l: LaunchButton) -> Element<'a, Msg> {
         LaunchButton::Launching { step } => ("LAUNCHING".to_string(), Some(format!("STEP {step} / 4")), PrimaryLook::Busy, step.saturating_sub(1)),
         LaunchButton::Inert(why) => (why.to_string(), None, PrimaryLook::Inert, 0),
     };
-    let (ink, strength) = match look {
-        PrimaryLook::Ready => (skin::BG, 0.45),
-        PrimaryLook::Busy => (skin::PHOSPHOR, 0.35),
-        PrimaryLook::Inert => (skin::DIMMER, 0.25),
+    let (ink, ground, strength) = match look {
+        PrimaryLook::Ready => (skin::BG, skin::PHOSPHOR, 0.45),
+        PrimaryLook::Busy => (skin::PHOSPHOR, skin::BG, 0.35),
+        PrimaryLook::Inert => (skin::DIMMER, skin::BG, 0.25),
     };
     let mut content = Row::new().width(Length::Fill).spacing(8).align_y(Alignment::Center);
     if look != PrimaryLook::Inert {
@@ -402,7 +402,7 @@ fn primary<'a>(l: LaunchButton) -> Element<'a, Msg> {
         content = content.push(layered(widgets::StepCells { done, ink }, Length::Fixed(widgets::StepCells::WIDTH), Length::Fixed(widgets::STEP_CELL.1)));
     }
     let face = cosmic::iced::widget::stack([
-        layered(widgets::LaunchPlate { ink, strength }, Length::Fill, Length::Fixed(skin::PRIMARY_HEIGHT)),
+        layered(widgets::LaunchPlate { ink, ground, strength }, Length::Fill, Length::Fixed(skin::PRIMARY_HEIGHT)),
         centered(widget::container(content).padding([0.0, skin::PRIMARY_PAD_X]), Horizontal::Left),
     ])
     .width(Length::Fill)

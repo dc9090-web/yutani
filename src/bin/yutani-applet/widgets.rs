@@ -268,13 +268,16 @@ impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Hazard {
 
 // ---- launch plate -----------------------------------------------------------------------
 
-/// The primary button's face, under its label: an engraved rule 3 px
-/// inside the edge, as on the Nostromo's console plates, and faint CRT
-/// scanlines every 3 px. Drawn in the label's ink, so it reads dark on
-/// the phosphor slab and phosphor on the outlined looks.
+/// The primary button's engraved rule, 3 px inside the edge, as on the
+/// Nostromo's console plates. Solid, not translucent: `ink` mixed into
+/// `ground` by `strength`. On the panel's popup surface this canvas lands
+/// *over* the label (the preview window draws it under) and its alpha came
+/// out far darker, so CRT scanlines struck through the text (2026-10-08) —
+/// nothing here may cross the label, and nothing relies on blending.
 pub struct LaunchPlate {
     pub ink: Color,
-    /// The engraved rule's opacity; the scanlines are a fifth of it.
+    /// What the rule sits on: the slab's fill, or the popover ground.
+    pub ground: Color,
     pub strength: f32,
 }
 
@@ -284,13 +287,8 @@ impl<M> canvas::Program<M, cosmic::Theme, Renderer> for LaunchPlate {
     fn draw(&self, _: &(), renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
         let (w, h) = (bounds.width.floor(), bounds.height.floor());
-        let scan = alpha(self.ink, self.strength / 5.0);
-        let mut y = 1.0;
-        while y < h - 1.0 {
-            frame.fill_rectangle(Point::new(1.0, y), Size::new(w - 2.0, 1.0), scan);
-            y += 3.0;
-        }
-        let rule = alpha(self.ink, self.strength);
+        let mix = |a: f32, b: f32| b + (a - b) * self.strength;
+        let rule = Color::from_rgb(mix(self.ink.r, self.ground.r), mix(self.ink.g, self.ground.g), mix(self.ink.b, self.ground.b));
         let i = 3.0;
         frame.fill_rectangle(Point::new(i, i), Size::new(w - 2.0 * i, 1.0), rule);
         frame.fill_rectangle(Point::new(i, h - i - 1.0), Size::new(w - 2.0 * i, 1.0), rule);
@@ -326,7 +324,7 @@ impl<M> canvas::Program<M, cosmic::Theme, Renderer> for StepCells {
             if n < self.done {
                 frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), self.ink);
             } else {
-                let edge = alpha(self.ink, 0.55);
+                let edge = self.ink;
                 frame.fill_rectangle(Point::new(x, y), Size::new(cw, 1.0), edge);
                 frame.fill_rectangle(Point::new(x, y + ch - 1.0), Size::new(cw, 1.0), edge);
                 frame.fill_rectangle(Point::new(x, y + 1.0), Size::new(1.0, ch - 2.0), edge);
