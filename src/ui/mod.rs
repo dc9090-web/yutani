@@ -2748,6 +2748,8 @@ mod tests {
             settings: None,
             tunnel_in_flight: None,
             steam_findings: Vec::new(),
+            direct_ping: Default::default(),
+            _direct_probe: None,
             keepalive: None,
             last_config_write: None,
         }
