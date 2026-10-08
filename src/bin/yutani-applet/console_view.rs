@@ -377,8 +377,9 @@ fn action_row<'a>(c: &Console, menu_open: bool) -> Element<'a, Msg> {
 
 /// The primary button: ready, launching (step n / 4) or inert. A dark
 /// plate with a phosphor edge, the label centred between two short
-/// amber/black hazard caps (the Steam notice's stripe) — Daniel's pick of
-/// four directions, 2026-10-08. Inert drops the caps: nothing to warn of.
+/// hazard caps — Daniel's pick of four directions, 2026-10-08, then green,
+/// glowing and slowly pulsing (`widgets::GlowHazard`). Inert drops the
+/// caps: nothing to warn of.
 fn primary<'a>(l: LaunchButton) -> Element<'a, Msg> {
     let (label, look) = match l {
         LaunchButton::Ready => ("LAUNCH EVE".to_string(), PrimaryLook::Ready),
@@ -387,7 +388,7 @@ fn primary<'a>(l: LaunchButton) -> Element<'a, Msg> {
     };
     let ink = if look == PrimaryLook::Inert { skin::DIMMER } else { skin::PHOSPHOR };
     let inner = skin::PRIMARY_HEIGHT - 2.0;
-    let cap = || layered(widgets::Hazard, Length::Fixed(skin::PRIMARY_CAP_W), Length::Fixed(inner));
+    let cap = || layered(widgets::GlowHazard, Length::Fixed(skin::PRIMARY_CAP_W), Length::Fixed(inner));
     let mut row = Row::new().width(Length::Fill).height(Length::Fixed(inner)).align_y(Alignment::Center);
     if look != PrimaryLook::Inert {
         row = row.push(cap());

@@ -266,6 +266,59 @@ impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Hazard {
     }
 }
 
+/// The Launch EVE button's hazard caps: the [`Hazard`] stripe in
+/// phosphor, each band with a softer halo either side, breathing slowly
+/// between dim and full. Every colour is mixed solid over `BG` — on the
+/// panel's popup surface canvas alpha renders far darker than intended.
+pub struct GlowHazard;
+
+/// One breath, dim → bright → dim.
+const PULSE: Duration = Duration::from_millis(3200);
+/// Redraw step while it breathes: smooth enough at this pace.
+const PULSE_FRAME: Duration = Duration::from_millis(50);
+
+fn mix(over: Color, ink: Color, t: f32) -> Color {
+    Color::from_rgb(over.r + (ink.r - over.r) * t, over.g + (ink.g - over.g) * t, over.b + (ink.b - over.b) * t)
+}
+
+impl<M> canvas::Program<M, cosmic::Theme, Renderer> for GlowHazard {
+    type State = Option<Instant>;
+
+    fn update(&self, start: &mut Option<Instant>, event: &Event, _: Rectangle, _: mouse::Cursor) -> Option<Action<M>> {
+        let Event::Window(window::Event::RedrawRequested(now)) = event else { return None };
+        start.get_or_insert(*now);
+        Some(Action::request_redraw_at(*now + PULSE_FRAME))
+    }
+
+    fn draw(&self, start: &Option<Instant>, renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        frame.fill_rectangle(Point::ORIGIN, bounds.size(), BG);
+        let t = start.map_or(0.0, |s| Instant::now().saturating_duration_since(s).as_secs_f32() / PULSE.as_secs_f32());
+        // 0 → 1 → 0 once per breath, eased at both ends.
+        let breath = 0.5 - 0.5 * (t * std::f32::consts::TAU).cos();
+        let level = 0.55 + 0.45 * breath;
+        let core = mix(BG, PHOSPHOR, level);
+        let halo = mix(BG, PHOSPHOR, 0.22 * level);
+        let h = bounds.height;
+        let band = |x: f32, w: f32| {
+            Path::new(|p| {
+                p.move_to(Point::new(x, 0.0));
+                p.line_to(Point::new(x + w, 0.0));
+                p.line_to(Point::new(x + w - h, h));
+                p.line_to(Point::new(x - h, h));
+                p.close();
+            })
+        };
+        let mut x = -h;
+        while x < bounds.width + h {
+            frame.fill(&band(x - 2.0, 10.0), halo);
+            frame.fill(&band(x, 6.0), core);
+            x += 12.0;
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
 // ---- overflow glyph ---------------------------------------------------------------------
 
 /// The overflow button's ⋯ (not in B612 Mono): three 2×2 phosphor squares,
