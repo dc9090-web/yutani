@@ -11,8 +11,11 @@ use crate::tunnel::status::TunnelStatus;
 pub const HANDSHAKE_STALE_S: u64 = 180;
 
 /// The panel icon: the solid mark below this many pixels, the two-piece
-/// mark (with the slice through the stem) from here up.
-pub const TWO_PIECE_MIN_PX: u16 = 22;
+/// mark (with the slice through the stem) from here up. The handoff's
+/// threshold is 22 px on the 32-unit grid; the panel marks are cropped to
+/// 25 units (`assets::PANEL_MARK`), so the same slice width arrives at
+/// 22 × 25/32 ≈ 17.2 px. On Daniel's 20 px panel the slice is ~1.3 px.
+pub const TWO_PIECE_MIN_PX: u16 = 18;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IconState {
@@ -256,13 +259,13 @@ mod tests {
     }
 
     /// The slice through the stem lands on half a pixel at 16 px, so the
-    /// panel gets the solid mark below 22 and the two-piece mark from there.
+    /// panel gets the solid mark below 18 and the two-piece mark from there.
     #[test]
-    fn the_solid_mark_is_used_below_22_px() {
-        for px in [8u16, 16, 21] {
+    fn the_solid_mark_is_used_below_18_px() {
+        for px in [8u16, 16, 17] {
             assert_eq!(IconState::Plain.bytes(px), crate::assets::PANEL_MARK_SOLID, "{px}");
         }
-        for px in [22u16, 24, 32, 64] {
+        for px in [18u16, 20, 24, 32, 64] {
             assert_eq!(IconState::Active.bytes(px), crate::assets::PANEL_MARK, "{px}");
         }
     }
