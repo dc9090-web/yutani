@@ -598,6 +598,10 @@ pub fn open_popup_message(bounds: Rectangle, offset: cosmic::iced::Vector) -> Ms
             let parent = state.core.main_window_id().unwrap_or(Id::RESERVED);
             let mut settings =
                 state.core.applet.get_popup_settings(parent, new_id, None, None, None);
+            // No grab: a grabbed popup is dismissed by the compositor on any
+            // click outside it. Daniel wants the popover to stay up until
+            // the panel icon is clicked again (2026-10-08).
+            settings.grab = false;
             settings.positioner.anchor_rect = Rectangle {
                 x: (bounds.x - offset.x) as i32,
                 y: (bounds.y - offset.y) as i32,

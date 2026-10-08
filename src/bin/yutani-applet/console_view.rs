@@ -375,23 +375,39 @@ fn action_row<'a>(c: &Console, menu_open: bool) -> Element<'a, Msg> {
     margin(row.push(overflow))
 }
 
-/// The primary button: ready, launching (step n / 4) or inert.
+/// The primary button: ready, launching (step n / 4) or inert. A console
+/// plate (`widgets::LaunchPlate`) under a drawn ▶ — B612 Mono's own sits
+/// small and low — the label, and the four step cells on the right.
 fn primary<'a>(l: LaunchButton) -> Element<'a, Msg> {
-    let (label, sub, look) = match l {
-        LaunchButton::Ready => ("▶ LAUNCH EVE".to_string(), None, PrimaryLook::Ready),
-        LaunchButton::Launching { step } => ("LAUNCHING…".to_string(), Some(format!("STEP {step} / 4")), PrimaryLook::Busy),
-        LaunchButton::Inert(why) => (why.to_string(), None, PrimaryLook::Inert),
+    let (label, sub, look, done) = match l {
+        LaunchButton::Ready => ("LAUNCH EVE".to_string(), None, PrimaryLook::Ready, 0),
+        LaunchButton::Launching { step } => ("LAUNCHING".to_string(), Some(format!("STEP {step} / 4")), PrimaryLook::Busy, step.saturating_sub(1)),
+        LaunchButton::Inert(why) => (why.to_string(), None, PrimaryLook::Inert, 0),
     };
-    let ink = match look {
-        PrimaryLook::Ready => skin::BG,
-        PrimaryLook::Busy => skin::PHOSPHOR,
-        PrimaryLook::Inert => skin::DIMMER,
+    let (ink, strength) = match look {
+        PrimaryLook::Ready => (skin::BG, 0.45),
+        PrimaryLook::Busy => (skin::PHOSPHOR, 0.35),
+        PrimaryLook::Inert => (skin::DIMMER, 0.25),
     };
-    let mut content = Row::new().width(Length::Fill).align_y(Alignment::Center).push(t(label, skin::PRIMARY, ink)).push(fill_x());
+    let mut content = Row::new().width(Length::Fill).spacing(8).align_y(Alignment::Center);
+    if look != PrimaryLook::Inert {
+        let px = (skin::PRIMARY.size * 0.75).round();
+        content = content.push(layered(widgets::Arrow { direction: Direction::Right, color: ink }, Length::Fixed(px * 0.8), Length::Fixed(px)));
+    }
+    content = content.push(t(label, skin::PRIMARY, ink)).push(fill_x());
     if let Some(sub) = sub {
         content = content.push(t(sub, skin::PRIMARY_SUB, ink));
     }
-    let button = widget::button::custom(centered(widget::container(content).padding([0.0, skin::PRIMARY_PAD_X]), Horizontal::Left))
+    if look != PrimaryLook::Inert {
+        content = content.push(layered(widgets::StepCells { done, ink }, Length::Fixed(widgets::StepCells::WIDTH), Length::Fixed(widgets::STEP_CELL.1)));
+    }
+    let face = cosmic::iced::widget::stack([
+        layered(widgets::LaunchPlate { ink, strength }, Length::Fill, Length::Fixed(skin::PRIMARY_HEIGHT)),
+        centered(widget::container(content).padding([0.0, skin::PRIMARY_PAD_X]), Horizontal::Left),
+    ])
+    .width(Length::Fill)
+    .height(Length::Fixed(skin::PRIMARY_HEIGHT));
+    let button = widget::button::custom(face)
         .width(Length::Fill)
         .height(Length::Fixed(skin::PRIMARY_HEIGHT))
         .padding(0)
