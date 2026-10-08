@@ -61,6 +61,9 @@ pub struct Applet {
     /// that stands still for `ping::STALE_AFTER` (a paused, frozen or
     /// killed probe) clears the window, so the row reads IDLE.
     pub ping_seen: Option<(u64, Instant)>,
+    /// The daemon's direct (not tunnelled) probe, kept the same way.
+    pub direct_ping: PingWindow,
+    pub direct_seen: Option<(u64, Instant)>,
     /// Session totals `(rx, tx)`: the counters while connected, frozen
     /// otherwise.
     pub totals: (u64, u64),
@@ -234,6 +237,7 @@ impl Applet {
             totals: self.totals,
             host: &self.host_reading,
             ping: &self.ping,
+            direct_ping: &self.direct_ping,
             tunnel_pending: self.pending.filter(|_| self.pending()).map(|(want, _)| want),
             service_pending: starting || self.quitting.is_some(),
             available,
@@ -267,25 +271,17 @@ impl Applet {
     /// Take the probe's newest sample if its sequence moved; if it has
     /// stood still for longer than `ping::STALE_AFTER`, clear the window.
     fn take_ping(&mut self, seq: u64, rtt_us: Option<u32>, now: Instant) {
-        if seq == 0 {
-            return; // no probe has run yet
-        }
-        match self.ping_seen {
-            Some((last, at)) if last == seq => {
-                if ping::stale(Some(at), now) {
-                    self.ping.clear();
-                }
-            }
-            _ => {
-                self.ping_seen = Some((seq, now));
-                self.ping.push_seq(seq, rtt_us.map(|us| us as f32 / 1000.0));
-            }
-        }
+        take_sample(&mut self.ping, &mut self.ping_seen, seq, rtt_us, now);
     }
 
     fn forget_ping(&mut self) {
         self.ping.clear();
         self.ping_seen = None;
+    }
+
+    fn forget_direct_ping(&mut self) {
+        self.direct_ping.clear();
+        self.direct_seen = None;
     }
 
     /// A `status` reply landed: release the guard, and issue whatever was
@@ -355,6 +351,8 @@ impl cosmic::Application for Applet {
             host_reading: HostReading::default(),
             ping: PingWindow::default(),
             ping_seen: None,
+            direct_ping: PingWindow::default(),
+            direct_seen: None,
             totals: (0, 0),
             starting: None,
         };
@@ -402,6 +400,7 @@ impl cosmic::Application for Applet {
                     }
                 }
                 let live = status.tunnel.connected;
+                take_sample(&mut self.direct_ping, &mut self.direct_seen, status.direct_ping.seq, status.direct_ping.rtt_us, Instant::now());
                 if live {
                     self.take_ping(status.tunnel.ping_seq, status.tunnel.ping_us, Instant::now());
                 } else {
@@ -434,6 +433,7 @@ impl cosmic::Application for Applet {
             Msg::Status(Err(IpcError::Offline)) => {
                 self.status = None;
                 self.forget_ping();
+                self.forget_direct_ping();
                 self.sampler.reset();
                 self.rates = Rates::default();
                 self.pending = None;
@@ -618,6 +618,25 @@ pub fn close_popup_message(id: Id) -> Msg {
     Msg::Surface(destroy_popup(id))
 }
 
+/// Take a probe's newest sample into `window` if its sequence moved; if
+/// it has stood still for longer than `ping::STALE_AFTER`, clear the window.
+fn take_sample(window: &mut PingWindow, seen: &mut Option<(u64, Instant)>, seq: u64, rtt_us: Option<u32>, now: Instant) {
+    if seq == 0 {
+        return; // no probe has run yet
+    }
+    match *seen {
+        Some((last, at)) if last == seq => {
+            if ping::stale(Some(at), now) {
+                window.clear();
+            }
+        }
+        _ => {
+            *seen = Some((seq, now));
+            window.push_seq(seq, rtt_us.map(|us| us as f32 / 1000.0));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,7 +811,7 @@ mod tests {
     fn connected() -> Status {
         use yutani::tunnel::status::{Status, TunnelStatus};
         let tunnel = TunnelStatus { installed: true, connected: true, handshake_age_s: Some(4), ..Default::default() };
-        Status { clients: vec![], hidden: false, tunnel, shortcuts: None, outputs: Vec::new(), steam: Vec::new(), launch: None }
+        Status { clients: vec![], hidden: false, tunnel, shortcuts: None, outputs: Vec::new(), steam: Vec::new(), launch: None, direct_ping: Default::default() }
     }
 
     /// Each new probe becomes one sample; a repeated sequence adds nothing;
@@ -815,7 +834,7 @@ mod tests {
         assert_eq!(applet.ping.summary(true).quality, yutani::applet::ping::Quality::Idle, "cleared: no samples");
     }
 
-    /// A sequence that stands still for more than 3 s (the probe paused for
+    /// A sequence that stands still for more than 5 s (the probe paused for
     /// want of a lease, or froze) clears the window: the row reads IDLE,
     /// and the next new probe starts it again.
     #[test]
@@ -826,9 +845,9 @@ mod tests {
         s.tunnel.ping_seq = 5;
         let _ = applet.update(Msg::Status(Ok(s.clone())));
         let _ = applet.update(Msg::Status(Ok(s.clone())));
-        assert_eq!(applet.ping.summary(true).value, "360", "a repeat within 3 s keeps the window");
+        assert_eq!(applet.ping.summary(true).value, "360", "a repeat within 5 s keeps the window");
         let (seq, at) = applet.ping_seen.unwrap();
-        applet.ping_seen = Some((seq, at - Duration::from_millis(3_100)));
+        applet.ping_seen = Some((seq, at - Duration::from_millis(5_100)));
         let _ = applet.update(Msg::Status(Ok(s.clone())));
         let idle = applet.ping.summary(true);
         assert_eq!((idle.quality, idle.dots.len()), (yutani::applet::ping::Quality::Idle, 0));

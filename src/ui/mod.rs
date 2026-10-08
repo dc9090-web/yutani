@@ -177,6 +177,11 @@ pub struct App {
     /// launch` (`yutani::steam`), from the 30 s subscription; copied into
     /// every `status` reply and into the settings window when it is open.
     pub steam_findings: Vec<yutani::steam::Finding>,
+    /// The direct (not tunnelled) TQ probe's newest sample, copied into
+    /// every `status` reply.
+    direct_ping: crate::tunnel::probe::Latest,
+    /// Keeps that probe's thread running; dropping it stops it.
+    _direct_probe: Option<crate::tunnel::probe::Probe>,
 }
 
 #[derive(Clone, Debug)]
@@ -594,6 +599,7 @@ impl App {
                     .collect();
                 let steam = self.steam_findings.clone();
                 let launch = self.launch.as_ref().map(|l| l.state().clone());
+                let direct_ping = self.direct_ping.get();
                 let reply = reply.clone();
                 let task = cosmic::iced::Task::perform(
                     async move {
@@ -601,7 +607,7 @@ impl App {
                             tokio::task::spawn_blocking(move || crate::tunnel::control::current_tunnel_status(&location))
                                 .await
                                 .map_err(|e| format!("status task failed: {e}"))?;
-                        let status = crate::tunnel::status::Status { clients, hidden, tunnel, shortcuts, outputs, steam, launch };
+                        let status = crate::tunnel::status::Status { clients, hidden, tunnel, shortcuts, outputs, steam, launch, direct_ping };
                         serde_json::to_string(&status).map(Some).map_err(|e| format!("status: {e}"))
                     },
                     move |result| cosmic::Action::App(Msg::IpcReplyLater(reply, result)),
@@ -2377,6 +2383,14 @@ impl Application for App {
     }
 
     fn init(core: cosmic::app::Core, flags: AppFlags) -> (Self, Task<cosmic::Action<Msg>>) {
+        // The direct TQ probe: idle until the ping lease is renewed (the
+        // popover open, or an EVE client running). Tests never start it:
+        // the daemon under test must do no network I/O.
+        let direct_ping = crate::tunnel::probe::Latest::default();
+        let direct_probe = match std::env::var_os("XDG_RUNTIME_DIR") {
+            Some(dir) if !cfg!(test) => crate::tunnel::probe::spawn_direct(dir.into(), direct_ping.clone()),
+            _ => None,
+        };
         let (layout, layout_poisoned) = match Layout::try_load() {
             Ok(Some(layout)) => (layout, false),
             Ok(None) => (Layout::default(), false),
@@ -2404,6 +2418,8 @@ impl Application for App {
             last_activated: None,
             tunnel_in_flight: None,
             steam_findings: Vec::new(),
+            direct_ping,
+            _direct_probe: direct_probe,
             settings: None,
             keepalive: None,
             last_config_write: None,

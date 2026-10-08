@@ -472,6 +472,7 @@ mod tests {
             outputs: vec![],
             steam: vec![],
             launch: None,
+            direct_ping: Default::default(),
         })
         .unwrap();
         v.as_object_mut().unwrap().remove("launch");

@@ -154,6 +154,12 @@ pub struct Status {
     /// otherwise and (`serde(default)`) from a daemon older than Phase 3.
     #[serde(default)]
     pub launch: Option<crate::launch_eve::LaunchState>,
+    /// The daemon's own probe of TQ over the ordinary route, not the
+    /// tunnel (`probe::spawn_direct`), for the popover's DIRECT figure.
+    /// `seq` 0 before the first probe and (`serde(default)`) from a daemon
+    /// older than this field.
+    #[serde(default)]
+    pub direct_ping: crate::tunnel::probe::Sample,
 }
 
 /// Combine the worker's file, whether `/sys/class/net/yutani0` exists,
@@ -404,6 +410,7 @@ mod tests {
                 file: "/h/localconfig.vdf".into(),
             }],
             launch: None,
+            direct_ping: Default::default(),
             tunnel: assemble(Some(&file()), true, Some((1, 2)), true, false, "London", 1021),
         };
         let json = serde_json::to_string(&st).unwrap();

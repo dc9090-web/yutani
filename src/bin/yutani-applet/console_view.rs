@@ -276,7 +276,8 @@ fn ping_row<'a>(n: &Network) -> Element<'a, Msg> {
         .width(Length::Fixed(skin::PING_LEFT_W))
         .spacing(2)
         .push(t("PING · TQ", skin::READOUT_LABEL, skin::PHOSPHOR))
-        .push(Row::new().spacing(4).align_y(Alignment::End).push(t(p.value.clone(), skin::PING_VALUE, skin::WHITE)).push(t("MS", skin::UNIT, skin::DIM)));
+        .push(Row::new().spacing(4).align_y(Alignment::End).push(t(p.value.clone(), skin::PING_VALUE, skin::WHITE)).push(t("MS", skin::UNIT, skin::DIM)))
+        .push(t(n.ping_note.clone(), skin::PING_STATS, skin::DIM));
     let spark = widgets::Sparkline { dots: p.dots.clone(), avg_y: p.avg_y, color: q, live: n.live };
     let middle = Column::new()
         .width(Length::Fill)

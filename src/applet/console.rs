@@ -21,7 +21,10 @@ pub struct Inputs<'a> {
     /// counters *are* the session's).
     pub totals: (u64, u64),
     pub host: &'a HostReading,
+    /// The tunnel's probe.
     pub ping: &'a PingWindow,
+    /// The daemon's direct probe, off the tunnel.
+    pub direct_ping: &'a PingWindow,
     /// A connect (`true`) or disconnect (`false`) is still settling.
     pub tunnel_pending: Option<bool>,
     /// A start or quit of the service is still settling.
@@ -76,7 +79,11 @@ pub struct Network {
     pub down_kbps: f32,
     /// The scope band fits (short-screen rule).
     pub scope: bool,
+    /// The tunnel's ping while it is up, the direct one while it is down.
     pub ping: PingSummary,
+    /// The line under the ping value: `DIRECT 595` beside the tunnel's
+    /// figure, or `DIRECT` when the figure itself is the direct one.
+    pub ping_note: String,
     pub endpoint: String,
     pub peer: String,
     pub uptime: String,
@@ -384,7 +391,8 @@ pub fn console(status: Option<&Status>, i: &Inputs) -> Console {
             up_kbps: (rate(i.rates.tx) / 1_000.0) as f32,
             down_kbps: (rate(i.rates.rx) / 1_000.0) as f32,
             scope: true,
-            ping: i.ping.summary(live),
+            ping: if live { i.ping.summary(true) } else { i.direct_ping.summary(running) },
+            ping_note: if live { format!("DIRECT {}", i.direct_ping.summary(true).value) } else { "DIRECT".to_string() },
             endpoint,
             peer: t.map_or_else(|| DASH.to_string(), |t| t.iface.clone()),
             uptime,
@@ -445,11 +453,12 @@ mod tests {
             outputs: Vec::new(),
             steam: Vec::new(),
             launch: None,
+            direct_ping: Default::default(),
         }
     }
 
     fn inputs<'a>(host: &'a HostReading, ping: &'a PingWindow) -> Inputs<'a> {
-        Inputs { rates: Rates { tx: 1_000.0, rx: 8_000.0 }, totals: (693_600_000, 105_800_000), host, ping, tunnel_pending: None, service_pending: false, available: None, menu_open: false }
+        Inputs { rates: Rates { tx: 1_000.0, rx: 8_000.0 }, totals: (693_600_000, 105_800_000), host, ping, direct_ping: ping, tunnel_pending: None, service_pending: false, available: None, menu_open: false }
     }
 
     fn launching(steps: [Step; 4], failed: Option<&str>) -> Status {
@@ -533,6 +542,27 @@ mod tests {
         assert!(n.live && n.scope);
         assert_eq!(c.launch, LaunchButton::Ready);
         assert!(c.footer.starts_with("YUTANI OS · BUILD "));
+    }
+
+    /// The ping row shows the tunnel's probe with the direct one under it
+    /// while connected, and the direct probe itself while disconnected —
+    /// so the improvement is on screen either way.
+    #[test]
+    fn the_ping_row_compares_the_tunnel_with_the_direct_path() {
+        let h = HostReading::default();
+        let (mut tunnel, mut direct) = (PingWindow::default(), PingWindow::default());
+        tunnel.push_seq(1, Some(360.0));
+        direct.push_seq(1, Some(595.0));
+        let i = Inputs { direct_ping: &direct, ..inputs(&h, &tunnel) };
+        let up = console(Some(&status(true, Some(3), 0)), &i).network;
+        assert_eq!((up.ping.value.as_str(), up.ping_note.as_str()), ("360", "DIRECT 595"));
+        let down = console(Some(&status(false, None, 0)), &i).network;
+        assert_eq!((down.ping.value.as_str(), down.ping_note.as_str()), ("595", "DIRECT"));
+        let empty = PingWindow::default();
+        let up_alone = console(Some(&status(true, Some(3), 0)), &Inputs { direct_ping: &empty, ..inputs(&h, &tunnel) }).network;
+        assert_eq!(up_alone.ping_note, "DIRECT —", "no direct sample yet");
+        let stopped = console(None, &i).network;
+        assert_eq!(stopped.ping.quality, crate::applet::ping::Quality::Idle, "no daemon: no live figure");
     }
 
     #[test]

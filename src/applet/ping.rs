@@ -13,7 +13,8 @@ pub const SPARK_H: f32 = 22.0;
 const DASH: &str = "—";
 /// A probe sequence that has not moved for longer than this (the probe is
 /// paused for want of a lease, frozen or gone) means the window is stale.
-pub const STALE_AFTER: Duration = Duration::from_secs(3);
+/// Probes run every 2 s and a lost one takes up to 2.5 s (`tunnel::probe`).
+pub const STALE_AFTER: Duration = Duration::from_secs(5);
 
 /// Whether a sequence that last advanced at `last_advance` is stale at
 /// `now`. One that never advanced has nothing to go stale.
@@ -270,10 +271,10 @@ mod tests {
     }
 
     #[test]
-    fn a_sequence_is_stale_only_after_three_quiet_seconds() {
+    fn a_sequence_is_stale_only_after_five_quiet_seconds() {
         let t0 = Instant::now();
         assert!(!stale(None, t0), "never advanced: nothing to clear");
-        assert!(!stale(Some(t0), t0 + STALE_AFTER), "3 s is not more than 3 s");
+        assert!(!stale(Some(t0), t0 + STALE_AFTER), "5 s is not more than 5 s");
         assert!(stale(Some(t0), t0 + STALE_AFTER + Duration::from_millis(1)));
         assert!(!stale(Some(t0 + Duration::from_secs(1)), t0), "a clock read before the advance is not stale");
     }

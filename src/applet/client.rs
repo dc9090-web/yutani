@@ -195,6 +195,7 @@ mod tests {
             outputs: Vec::new(),
             steam: Vec::new(),
             launch: None,
+            direct_ping: Default::default(),
             tunnel: TunnelStatus {
                 installed: true,
                 connected: true,
