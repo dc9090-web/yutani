@@ -10,6 +10,12 @@ pub const YUTANI_SYMBOLIC: &[u8] = include_bytes!("../assets/icons/yutani-symbol
 /// The same mark with the slice omitted — at 16 px it would land on half
 /// a pixel.
 pub const YUTANI_SYMBOLIC_16: &[u8] = include_bytes!("../assets/icons/yutani-symbolic-16.svg");
+/// The panel button's copies of the two marks above: the same paths on a
+/// 23-unit viewBox cropped to the glyph. On the 32-unit grid the glyph is
+/// 21 units wide, so at the panel's suggested size it drew ~13 px against
+/// its neighbours' ~17 (2026-10-08); cropped, it fills the box as they do.
+pub const PANEL_MARK: &[u8] = include_bytes!("../assets/icons/yutani-panel.svg");
+pub const PANEL_MARK_SOLID: &[u8] = include_bytes!("../assets/icons/yutani-panel-16.svg");
 /// The launcher icon: plate, sheen, rim, the extruded mark, drop shadow.
 pub const YUTANI_APP: &[u8] = include_bytes!("../assets/icons/yutani.svg");
 /// The launcher icon below 64 px: no slice, no top-contour stroke.
@@ -77,6 +83,18 @@ mod tests {
         // solid piece at 16, where the slice would land on half a pixel.
         assert_eq!(text(YUTANI_SYMBOLIC).matches("<path").count(), 2);
         assert_eq!(text(YUTANI_SYMBOLIC_16).matches("<path").count(), 1);
+    }
+
+    /// The panel copies differ from the theme marks only in their viewBox,
+    /// which still holds the whole glyph (x 5.5–26.5, y 7–26.9).
+    #[test]
+    fn the_panel_marks_are_the_theme_marks_cropped() {
+        let paths = |t: &str| t[t.find("<path").unwrap()..].to_string();
+        for (panel, theme) in [(PANEL_MARK, YUTANI_SYMBOLIC), (PANEL_MARK_SOLID, YUTANI_SYMBOLIC_16)] {
+            let t = text(panel);
+            assert!(t.contains(r#"viewBox="4.5 5.45 23 23""#));
+            assert_eq!(paths(t), paths(text(theme)));
+        }
     }
 
     /// The launcher icon is the one place with depth: a 116 plate in a 128

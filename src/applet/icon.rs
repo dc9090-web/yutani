@@ -69,7 +69,7 @@ impl IconState {
     /// below [`TWO_PIECE_MIN_PX`], where the slice would land on half a
     /// pixel, the two-piece mark otherwise.
     pub fn bytes(self, icon_px: u16) -> &'static [u8] {
-        if icon_px < TWO_PIECE_MIN_PX { crate::assets::YUTANI_SYMBOLIC_16 } else { crate::assets::YUTANI_SYMBOLIC }
+        if icon_px < TWO_PIECE_MIN_PX { crate::assets::PANEL_MARK_SOLID } else { crate::assets::PANEL_MARK }
     }
 }
 
@@ -260,10 +260,10 @@ mod tests {
     #[test]
     fn the_solid_mark_is_used_below_22_px() {
         for px in [8u16, 16, 21] {
-            assert_eq!(IconState::Plain.bytes(px), crate::assets::YUTANI_SYMBOLIC_16, "{px}");
+            assert_eq!(IconState::Plain.bytes(px), crate::assets::PANEL_MARK_SOLID, "{px}");
         }
         for px in [22u16, 24, 32, 64] {
-            assert_eq!(IconState::Active.bytes(px), crate::assets::YUTANI_SYMBOLIC, "{px}");
+            assert_eq!(IconState::Active.bytes(px), crate::assets::PANEL_MARK, "{px}");
         }
     }
 
