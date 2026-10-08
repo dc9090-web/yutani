@@ -83,7 +83,9 @@ pub enum Request {
     SettingsPage(String),
     Quit,
     Status,
-    /// The applet's popover is open, so the ping is wanted: renew the lease.
+    /// The applet's popover is open. Older applets sent it to wake the
+    /// ping; the ping now follows EVE running, so the daemon answers `ok`
+    /// and does nothing.
     Watch,
     TunnelConnect,
     TunnelDisconnect,

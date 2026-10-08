@@ -258,16 +258,6 @@ impl Applet {
         cosmic::task::future(async { Msg::Status(client::status().await) })
     }
 
-    /// `watch`: the popover is open, so the daemon renews the ping lease.
-    /// Fire-and-forget — outside the `Poll` guard, never a note, and an
-    /// `err` from a daemon that predates it is as good as `ok`.
-    fn watch_task() -> Task<Msg> {
-        cosmic::iced::Task::future(async {
-            let _ = client::send(yutani::ipc::Request::Watch).await;
-        })
-        .discard()
-    }
-
     /// Take the probe's newest sample if its sequence moved; if it has
     /// stood still for longer than `ping::STALE_AFTER`, clear the window.
     fn take_ping(&mut self, seq: u64, rtt_us: Option<u32>, now: Instant) {
@@ -380,14 +370,10 @@ impl cosmic::Application for Applet {
                 if self.note.is_some() && self.visible_note().is_none() {
                     self.note = None;
                 }
-                let watch = if self.popover_open() {
+                if self.popover_open() {
                     self.host_reading = self.host.sample();
-                    Self::watch_task()
-                } else {
-                    Task::none()
-                };
-                let poll = if self.poll.tick() { Self::status_task() } else { Task::none() };
-                Task::batch([poll, watch])
+                }
+                if self.poll.tick() { Self::status_task() } else { Task::none() }
             }
             Msg::Status(Ok(mut status)) => {
                 // The daemon is still answering while it winds down after
@@ -540,8 +526,8 @@ impl cosmic::Application for Applet {
                 if self.popup.is_none() {
                     // The HOST card would otherwise show the last reading from before it closed.
                     self.host_reading = self.host.sample();
-                    // And the probe starts now, not at the next tick.
-                    Task::batch([surface, self.poll(), Self::watch_task()])
+                    // And the readouts fill now, not at the next tick.
+                    Task::batch([surface, self.poll()])
                 } else {
                     surface
                 }

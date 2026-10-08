@@ -580,11 +580,7 @@ impl App {
                     .filter_map(|h| self.clients.get(h))
                     .map(|c| crate::tunnel::status::ClientStatus { name: c.info.login.label().to_string(), active: c.info.activated })
                     .collect();
-                // An EVE client is running, so the ping is wanted: the applet
-                // polls at least every 5 s, inside the lease's 10 s term.
-                if !clients.is_empty() {
-                    crate::tunnel::touch_ping_lease();
-                }
+                let eve_client = !clients.is_empty();
                 let hidden = self.hidden;
                 let location = self.config.tunnel.location.clone();
                 let shortcuts = Some(crate::tunnel::status::ShortcutHint {
@@ -603,9 +599,18 @@ impl App {
                 let reply = reply.clone();
                 let task = cosmic::iced::Task::perform(
                     async move {
-                        let tunnel =
-                            tokio::task::spawn_blocking(move || crate::tunnel::control::current_tunnel_status(&location))
-                                .await
+                        let tunnel = tokio::task::spawn_blocking(move || {
+                            // The ping runs only while EVE does — a game
+                            // client or the EVE Launcher (Daniel, 2026-10-08).
+                            // The applet polls at least every 5 s, inside the
+                            // lease's 10 s term. The launcher check is a /proc
+                            // walk, so it stays off the update thread.
+                            if eve_client || crate::adopt::process_running(&["evelauncher.exe".to_string()], crate::ipc::uid()) {
+                                crate::tunnel::touch_ping_lease();
+                            }
+                            crate::tunnel::control::current_tunnel_status(&location)
+                        })
+                        .await
                                 .map_err(|e| format!("status task failed: {e}"))?;
                         let status = crate::tunnel::status::Status { clients, hidden, tunnel, shortcuts, outputs, steam, launch, direct_ping };
                         serde_json::to_string(&status).map(Some).map_err(|e| format!("status: {e}"))
@@ -615,12 +620,10 @@ impl App {
                 (Reply::Later, task)
             }
             Request::Launch => (Reply::Now(self.start_launch()), Task::none()),
-            // The popover is open: keep the ping probe running (an open and
-            // a `set_modified`, cheap enough to do inline).
-            Request::Watch => {
-                crate::tunnel::touch_ping_lease();
-                (Reply::Now(Ok(None)), cosmic::iced::Task::none())
-            }
+            // The popover is open. It no longer wakes the ping on its own:
+            // that follows EVE running (`Request::Status`). Still answered,
+            // for applets that send it.
+            Request::Watch => (Reply::Now(Ok(None)), cosmic::iced::Task::none()),
             // `systemctl start|stop` is a synchronous subprocess that can
             // take up to the unit's TimeoutStopSec (10 s). Running it here
             // would freeze every thumbnail for that long, so it goes to the

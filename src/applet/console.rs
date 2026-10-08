@@ -79,10 +79,9 @@ pub struct Network {
     pub down_kbps: f32,
     /// The scope band fits (short-screen rule).
     pub scope: bool,
-    /// The tunnel's ping while it is up, the direct one while it is down.
+    /// The tunnel's ping: the large figure, IDLE while the tunnel is down.
     pub ping: PingSummary,
-    /// The line under the ping value: `DIRECT 595` beside the tunnel's
-    /// figure, or `DIRECT` when the figure itself is the direct one.
+    /// The line under it: the direct path's figure, `DIRECT 595`.
     pub ping_note: String,
     pub endpoint: String,
     pub peer: String,
@@ -391,8 +390,8 @@ pub fn console(status: Option<&Status>, i: &Inputs) -> Console {
             up_kbps: (rate(i.rates.tx) / 1_000.0) as f32,
             down_kbps: (rate(i.rates.rx) / 1_000.0) as f32,
             scope: true,
-            ping: if live { i.ping.summary(true) } else { i.direct_ping.summary(running) },
-            ping_note: if live { format!("DIRECT {}", i.direct_ping.summary(true).value) } else { "DIRECT".to_string() },
+            ping: i.ping.summary(live),
+            ping_note: format!("DIRECT {}", i.direct_ping.summary(running).value),
             endpoint,
             peer: t.map_or_else(|| DASH.to_string(), |t| t.iface.clone()),
             uptime,
@@ -544,9 +543,8 @@ mod tests {
         assert!(c.footer.starts_with("YUTANI OS · BUILD "));
     }
 
-    /// The ping row shows the tunnel's probe with the direct one under it
-    /// while connected, and the direct probe itself while disconnected —
-    /// so the improvement is on screen either way.
+    /// The tunnel's figure is always the large one, the direct path's the
+    /// line under it — so the improvement is on screen whenever both run.
     #[test]
     fn the_ping_row_compares_the_tunnel_with_the_direct_path() {
         let h = HostReading::default();
@@ -557,12 +555,13 @@ mod tests {
         let up = console(Some(&status(true, Some(3), 0)), &i).network;
         assert_eq!((up.ping.value.as_str(), up.ping_note.as_str()), ("360", "DIRECT 595"));
         let down = console(Some(&status(false, None, 0)), &i).network;
-        assert_eq!((down.ping.value.as_str(), down.ping_note.as_str()), ("595", "DIRECT"));
+        assert_eq!((down.ping.value.as_str(), down.ping.quality, down.ping_note.as_str()), ("—", crate::applet::ping::Quality::Idle, "DIRECT 595"));
         let empty = PingWindow::default();
         let up_alone = console(Some(&status(true, Some(3), 0)), &Inputs { direct_ping: &empty, ..inputs(&h, &tunnel) }).network;
         assert_eq!(up_alone.ping_note, "DIRECT —", "no direct sample yet");
         let stopped = console(None, &i).network;
         assert_eq!(stopped.ping.quality, crate::applet::ping::Quality::Idle, "no daemon: no live figure");
+        assert_eq!(stopped.ping_note, "DIRECT —");
     }
 
     #[test]
