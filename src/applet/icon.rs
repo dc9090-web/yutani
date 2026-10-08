@@ -19,13 +19,14 @@ pub const TWO_PIECE_MIN_PX: u16 = 18;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IconState {
-    /// The plain mark: connected and healthy with nothing behind it, or
-    /// deliberately disconnected.
+    /// The plain mark: deliberately disconnected, nothing running.
     Plain,
-    /// The mark with the success dot: the tunnel is connected *and* there
-    /// is an EVE client behind it — the one state where Yutani is doing its
-    /// whole job.
-    Active,
+    /// The mark with the green dot: the tunnel is up and healthy.
+    Connected,
+    /// The mark with the blue dot: an EVE client is running. Daniel asked
+    /// for green = tunnel, blue = EVE (2026-10-08); EVE outranks the tunnel
+    /// because it is the more specific news.
+    Eve,
     /// The mark with the hollow ring: an action is in flight, or the tunnel
     /// has just come up and is still handshaking.
     Sync,
@@ -42,6 +43,8 @@ pub enum IconState {
 pub enum Badge {
     /// Filled, the theme's success colour.
     Connected,
+    /// Filled, blue (`theme::EVE_BADGE_ON_DARK`).
+    Eve,
     /// Filled, the theme's warning colour.
     Attention,
     /// Hollow: panel-background fill, ink ring.
@@ -61,7 +64,8 @@ impl IconState {
 
     pub fn badge(self) -> Option<Badge> {
         match self {
-            IconState::Active => Some(Badge::Connected),
+            IconState::Connected => Some(Badge::Connected),
+            IconState::Eve => Some(Badge::Eve),
             IconState::Attention => Some(Badge::Attention),
             IconState::Sync => Some(Badge::Sync),
             IconState::Plain | IconState::Dim => None,
@@ -77,8 +81,8 @@ impl IconState {
 }
 
 /// `tunnel` is `None` when the daemon did not answer. `clients` is how many
-/// EVE clients the daemon is tracking — it is what separates the dotted
-/// [`IconState::Active`] mark from the plain one. `pending` is true for
+/// EVE clients the daemon is tracking — any at all is the blue
+/// [`IconState::Eve`] dot. `pending` is true for
 /// [`super::PENDING_S`] after a `tunnel connect|disconnect` was sent.
 /// `steam_problem` is true when the daemon found a Steam account whose EVE
 /// launch line is broken (`Status::steam`): the warning dot, unless the
@@ -103,7 +107,6 @@ pub fn icon_state(tunnel: Option<&TunnelStatus>, clients: usize, pending: bool, 
         return IconState::Attention;
     }
     match (t.connected, t.handshake_age_s) {
-        (false, _) => IconState::Plain,
         // Up and never handshaked. That is *settling* only for as long as
         // the link has just come up; a tunnel still silent after
         // HANDSHAKE_STALE_S is not handshaking, it is broken, and the sync
@@ -118,11 +121,11 @@ pub fn icon_state(tunnel: Option<&TunnelStatus>, clients: usize, pending: bool, 
             }
         }
         (true, Some(age)) if age >= HANDSHAKE_STALE_S => IconState::Attention,
-        // A healthy tunnel with EVE behind it: the one state worth the
-        // dot. With nothing running the tunnel is merely ready, which is
-        // the plain mark — the panel must not claim more than is true.
-        (true, Some(_)) if clients > 0 => IconState::Active,
-        (true, Some(_)) => IconState::Plain,
+        // Nothing wrong with the tunnel: EVE running is blue whether the
+        // tunnel is up or not, a healthy tunnel alone is green.
+        _ if clients > 0 => IconState::Eve,
+        (true, Some(_)) => IconState::Connected,
+        (false, _) => IconState::Plain,
     }
 }
 
@@ -173,10 +176,10 @@ mod tests {
     }
 
     #[test]
-    fn a_deliberate_disconnect_and_a_fresh_handshake_are_both_plain() {
+    fn a_deliberate_disconnect_is_plain_and_a_healthy_tunnel_is_green() {
         assert_eq!(icon_state(Some(&tunnel(true, false, None)), 0, false, false), IconState::Plain);
-        assert_eq!(icon_state(Some(&tunnel(true, true, Some(0))), 0, false, false), IconState::Plain);
-        assert_eq!(icon_state(Some(&tunnel(true, true, Some(179))), 0, false, false), IconState::Plain);
+        assert_eq!(icon_state(Some(&tunnel(true, true, Some(0))), 0, false, false), IconState::Connected);
+        assert_eq!(icon_state(Some(&tunnel(true, true, Some(179))), 0, false, false), IconState::Connected);
     }
 
     #[test]
@@ -217,17 +220,17 @@ mod tests {
         assert_eq!(icon_state(Some(&failed(tunnel(true, false, None))), 0, true, false), IconState::Sync);
     }
 
-    /// The whole point of the blue mark: the tunnel is up, healthy, *and*
-    /// carrying an EVE client. Anything short of all three is not it.
+    /// The blue dot: any EVE client running, tunnel up or not. Trouble
+    /// with the tunnel, a press in flight, or a missing daemon outrank it.
     #[test]
-    fn the_blue_mark_needs_a_healthy_tunnel_and_a_client_behind_it() {
+    fn the_blue_dot_is_any_eve_client_unless_something_outranks_it() {
         let healthy = tunnel(true, true, Some(21));
-        assert_eq!(icon_state(Some(&healthy), 1, false, false), IconState::Active);
-        assert_eq!(icon_state(Some(&healthy), 9, false, false), IconState::Active);
-        // Connected but nothing is running: ready, not active.
-        assert_eq!(icon_state(Some(&healthy), 0, false, false), IconState::Plain);
-        // Clients but no tunnel: the icon is about the tunnel first.
-        assert_eq!(icon_state(Some(&tunnel(true, false, None)), 3, false, false), IconState::Plain);
+        assert_eq!(icon_state(Some(&healthy), 1, false, false), IconState::Eve);
+        assert_eq!(icon_state(Some(&healthy), 9, false, false), IconState::Eve);
+        // Connected but nothing is running: green.
+        assert_eq!(icon_state(Some(&healthy), 0, false, false), IconState::Connected);
+        // Clients with the tunnel deliberately down: still blue.
+        assert_eq!(icon_state(Some(&tunnel(true, false, None)), 3, false, false), IconState::Eve);
         // A stale handshake is trouble however many clients are running.
         assert_eq!(icon_state(Some(&tunnel(true, true, Some(180))), 3, false, false), IconState::Attention);
         assert_eq!(icon_state(Some(&never_handshaked(Some(9_000))), 3, false, false), IconState::Attention);
@@ -241,16 +244,17 @@ mod tests {
     }
 
     /// Redesign spec §1: the glyph is never recoloured. Status is a corner
-    /// badge — filled success, filled warning, or a hollow ring — and the
+    /// badge — filled success, blue, filled warning, or a hollow ring — and the
     /// stopped state is the same shape at 40 %.
     #[test]
     fn status_is_a_corner_badge_and_never_a_recoloured_glyph() {
-        assert_eq!(IconState::Active.badge(), Some(Badge::Connected));
+        assert_eq!(IconState::Connected.badge(), Some(Badge::Connected));
+        assert_eq!(IconState::Eve.badge(), Some(Badge::Eve));
         assert_eq!(IconState::Attention.badge(), Some(Badge::Attention));
         assert_eq!(IconState::Sync.badge(), Some(Badge::Sync));
         assert_eq!(IconState::Plain.badge(), None);
         assert_eq!(IconState::Dim.badge(), None);
-        for state in [IconState::Plain, IconState::Sync, IconState::Attention, IconState::Dim, IconState::Active] {
+        for state in [IconState::Plain, IconState::Sync, IconState::Attention, IconState::Dim, IconState::Connected, IconState::Eve] {
             assert_eq!(state.icon_name(), "yutani-symbolic", "{state:?}: one shape, one name");
             let file = format!("{}.svg", state.icon_name());
             assert!(crate::assets::ICONS.iter().any(|(_, n, _)| *n == file), "{file}");
@@ -266,7 +270,7 @@ mod tests {
             assert_eq!(IconState::Plain.bytes(px), crate::assets::PANEL_MARK_SOLID, "{px}");
         }
         for px in [18u16, 20, 24, 32, 64] {
-            assert_eq!(IconState::Active.bytes(px), crate::assets::PANEL_MARK, "{px}");
+            assert_eq!(IconState::Eve.bytes(px), crate::assets::PANEL_MARK, "{px}");
         }
     }
 

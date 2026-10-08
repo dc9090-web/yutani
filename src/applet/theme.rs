@@ -101,18 +101,25 @@ pub fn mark_class() -> cosmic::theme::Svg {
     cosmic::theme::Svg::custom(|theme| cosmic::iced::widget::svg::Style { color: Some(mark_ink(theme.cosmic())) })
 }
 
+/// The EVE badge's blue on a dark panel. COSMIC's theme has no blue role
+/// (its accent is the user's choice), so it is fixed.
+pub const EVE_BADGE_ON_DARK: Color = Color::from_rgb8(0x4d, 0xa6, 0xff);
+/// The same blue darkened for a light panel.
+pub const EVE_BADGE_ON_LIGHT: Color = Color::from_rgb8(0x1f, 0x6f, 0xd8);
+
 /// The status badge's fill on a dark panel. No glow: Daniel asked for a
 /// plain dot in the tray (2026-10-07).
 pub fn badge_fill(badge: super::icon::Badge) -> Color {
     use super::icon::Badge;
     match badge {
         Badge::Connected => crate::applet::skin::PHOSPHOR,
+        Badge::Eve => EVE_BADGE_ON_DARK,
         Badge::Attention | Badge::Sync => crate::applet::skin::AMBER,
     }
 }
 
-/// The status badge: phosphor or amber on a dark panel, the
-/// theme's success/warning on a light one (phosphor on a light grey is
+/// The status badge: phosphor, blue or amber on a dark panel, the
+/// theme's success/warning (and the darker blue) on a light one (phosphor on a light grey is
 /// under 2:1); a 1.5 px ring in the panel's own colour; Sync is a hollow
 /// outline.
 pub fn badge_class(badge: super::icon::Badge) -> cosmic::theme::Container<'static> {
@@ -122,10 +129,12 @@ pub fn badge_class(badge: super::icon::Badge) -> cosmic::theme::Container<'stati
         let panel = panel_bg(c);
         let fill = if c.is_dark {
             badge_fill(badge)
-        } else if badge == Badge::Connected {
-            success(c)
         } else {
-            warning(c)
+            match badge {
+                Badge::Connected => success(c),
+                Badge::Eve => EVE_BADGE_ON_LIGHT,
+                Badge::Attention | Badge::Sync => warning(c),
+            }
         };
         let (bg, ring) = if badge == Badge::Sync { (panel, fill) } else { (fill, panel) };
         container::Style {
@@ -150,6 +159,7 @@ mod tests {
         assert_eq!(DIM_OPACITY, 0.40);
         assert_eq!(badge_fill(crate::applet::icon::Badge::Connected), crate::applet::skin::PHOSPHOR);
         assert_eq!(badge_fill(crate::applet::icon::Badge::Attention), crate::applet::skin::AMBER);
+        assert_eq!(badge_fill(crate::applet::icon::Badge::Eve), EVE_BADGE_ON_DARK);
     }
 
     #[test]
