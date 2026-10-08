@@ -266,75 +266,6 @@ impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Hazard {
     }
 }
 
-// ---- launch plate -----------------------------------------------------------------------
-
-/// The primary button's engraved rule, 3 px inside the edge, as on the
-/// Nostromo's console plates. Solid, not translucent: `ink` mixed into
-/// `ground` by `strength`. On the panel's popup surface this canvas lands
-/// *over* the label (the preview window draws it under) and its alpha came
-/// out far darker, so CRT scanlines struck through the text (2026-10-08) —
-/// nothing here may cross the label, and nothing relies on blending.
-pub struct LaunchPlate {
-    pub ink: Color,
-    /// What the rule sits on: the slab's fill, or the popover ground.
-    pub ground: Color,
-    pub strength: f32,
-}
-
-impl<M> canvas::Program<M, cosmic::Theme, Renderer> for LaunchPlate {
-    type State = ();
-
-    fn draw(&self, _: &(), renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
-        let (w, h) = (bounds.width.floor(), bounds.height.floor());
-        let mix = |a: f32, b: f32| b + (a - b) * self.strength;
-        let rule = Color::from_rgb(mix(self.ink.r, self.ground.r), mix(self.ink.g, self.ground.g), mix(self.ink.b, self.ground.b));
-        let i = 3.0;
-        frame.fill_rectangle(Point::new(i, i), Size::new(w - 2.0 * i, 1.0), rule);
-        frame.fill_rectangle(Point::new(i, h - i - 1.0), Size::new(w - 2.0 * i, 1.0), rule);
-        frame.fill_rectangle(Point::new(i, i + 1.0), Size::new(1.0, h - 2.0 * i - 2.0), rule);
-        frame.fill_rectangle(Point::new(w - i - 1.0, i + 1.0), Size::new(1.0, h - 2.0 * i - 2.0), rule);
-        vec![frame.into_geometry()]
-    }
-}
-
-/// The launch's four steps as cells, right of the label: outlined when
-/// pending, filled when done.
-pub struct StepCells {
-    pub done: u8,
-    pub ink: Color,
-}
-
-/// One cell's size and the gap between cells.
-pub const STEP_CELL: (f32, f32, f32) = (5.0, 10.0, 3.0);
-
-impl StepCells {
-    pub const WIDTH: f32 = 4.0 * STEP_CELL.0 + 3.0 * STEP_CELL.2;
-}
-
-impl<M> canvas::Program<M, cosmic::Theme, Renderer> for StepCells {
-    type State = ();
-
-    fn draw(&self, _: &(), renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
-        let (cw, ch, gap) = STEP_CELL;
-        let y = ((bounds.height - ch) / 2.0).floor();
-        for n in 0..4u8 {
-            let x = f32::from(n) * (cw + gap);
-            if n < self.done {
-                frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), self.ink);
-            } else {
-                let edge = self.ink;
-                frame.fill_rectangle(Point::new(x, y), Size::new(cw, 1.0), edge);
-                frame.fill_rectangle(Point::new(x, y + ch - 1.0), Size::new(cw, 1.0), edge);
-                frame.fill_rectangle(Point::new(x, y + 1.0), Size::new(1.0, ch - 2.0), edge);
-                frame.fill_rectangle(Point::new(x + cw - 1.0, y + 1.0), Size::new(1.0, ch - 2.0), edge);
-            }
-        }
-        vec![frame.into_geometry()]
-    }
-}
-
 // ---- overflow glyph ---------------------------------------------------------------------
 
 /// The overflow button's ⋯ (not in B612 Mono): three 2×2 phosphor squares,
@@ -364,7 +295,6 @@ pub enum Direction {
     Up,
     Down,
     Left,
-    Right,
 }
 
 /// A filled triangle standing in for ▲ ▼ ◄, which B612 Mono lacks (▲ ◄)
@@ -385,7 +315,6 @@ impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Arrow {
             Direction::Up => [Point::new(w / 2.0, 0.0), Point::new(w, h), Point::new(0.0, h)],
             Direction::Down => [Point::new(0.0, 0.0), Point::new(w, 0.0), Point::new(w / 2.0, h)],
             Direction::Left => [Point::new(0.0, h / 2.0), Point::new(w, 0.0), Point::new(w, h)],
-            Direction::Right => [Point::new(0.0, 0.0), Point::new(w, h / 2.0), Point::new(0.0, h)],
         };
         let path = Path::new(|p| {
             p.move_to(a);

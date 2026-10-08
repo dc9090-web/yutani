@@ -375,42 +375,32 @@ fn action_row<'a>(c: &Console, menu_open: bool) -> Element<'a, Msg> {
     margin(row.push(overflow))
 }
 
-/// The primary button: ready, launching (step n / 4) or inert. An
-/// engraved rule (`widgets::LaunchPlate`) round a drawn ▶ — B612 Mono's own sits
-/// small and low — the label, and the four step cells on the right.
+/// The primary button: ready, launching (step n / 4) or inert. A dark
+/// plate with a phosphor edge, the label centred between two short
+/// amber/black hazard caps (the Steam notice's stripe) — Daniel's pick of
+/// four directions, 2026-10-08. Inert drops the caps: nothing to warn of.
 fn primary<'a>(l: LaunchButton) -> Element<'a, Msg> {
-    let (label, sub, look, done) = match l {
-        LaunchButton::Ready => ("LAUNCH EVE".to_string(), None, PrimaryLook::Ready, 0),
-        LaunchButton::Launching { step } => ("LAUNCHING".to_string(), Some(format!("STEP {step} / 4")), PrimaryLook::Busy, step.saturating_sub(1)),
-        LaunchButton::Inert(why) => (why.to_string(), None, PrimaryLook::Inert, 0),
+    let (label, look) = match l {
+        LaunchButton::Ready => ("LAUNCH EVE".to_string(), PrimaryLook::Ready),
+        LaunchButton::Launching { step } => (format!("LAUNCHING · {step}/4"), PrimaryLook::Busy),
+        LaunchButton::Inert(why) => (why.to_string(), PrimaryLook::Inert),
     };
-    let (ink, ground, strength) = match look {
-        PrimaryLook::Ready => (skin::BG, skin::PHOSPHOR, 0.45),
-        PrimaryLook::Busy => (skin::PHOSPHOR, skin::BG, 0.35),
-        PrimaryLook::Inert => (skin::DIMMER, skin::BG, 0.25),
-    };
-    let mut content = Row::new().width(Length::Fill).spacing(8).align_y(Alignment::Center);
+    let ink = if look == PrimaryLook::Inert { skin::DIMMER } else { skin::PHOSPHOR };
+    let inner = skin::PRIMARY_HEIGHT - 2.0;
+    let cap = || layered(widgets::Hazard, Length::Fixed(skin::PRIMARY_CAP_W), Length::Fixed(inner));
+    let mut row = Row::new().width(Length::Fill).height(Length::Fixed(inner)).align_y(Alignment::Center);
     if look != PrimaryLook::Inert {
-        let px = (skin::PRIMARY.size * 0.75).round();
-        content = content.push(layered(widgets::Arrow { direction: Direction::Right, color: ink }, Length::Fixed(px * 0.8), Length::Fixed(px)));
+        row = row.push(cap());
     }
-    content = content.push(t(label, skin::PRIMARY, ink)).push(fill_x());
-    if let Some(sub) = sub {
-        content = content.push(t(sub, skin::PRIMARY_SUB, ink));
-    }
+    row = row.push(centered(t(label, skin::PRIMARY, ink), Horizontal::Center));
     if look != PrimaryLook::Inert {
-        content = content.push(layered(widgets::StepCells { done, ink }, Length::Fixed(widgets::StepCells::WIDTH), Length::Fixed(widgets::STEP_CELL.1)));
+        row = row.push(cap());
     }
-    let face = cosmic::iced::widget::stack([
-        layered(widgets::LaunchPlate { ink, ground, strength }, Length::Fill, Length::Fixed(skin::PRIMARY_HEIGHT)),
-        centered(widget::container(content).padding([0.0, skin::PRIMARY_PAD_X]), Horizontal::Left),
-    ])
-    .width(Length::Fill)
-    .height(Length::Fixed(skin::PRIMARY_HEIGHT));
-    let button = widget::button::custom(face)
+    let button = widget::button::custom(row)
         .width(Length::Fill)
         .height(Length::Fixed(skin::PRIMARY_HEIGHT))
-        .padding(0)
+        // Inside the 1 px edge, so the caps do not paint over it.
+        .padding(1)
         .class(skin::primary_class(look))
         .on_press_maybe((look == PrimaryLook::Ready).then_some(Msg::Launch));
     if look == PrimaryLook::Ready {

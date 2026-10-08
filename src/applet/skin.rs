@@ -129,6 +129,8 @@ pub const NOTICE_PAD: Padding = pad(7.0, 11.0, 8.0, 11.0);
 pub const ACTION_GAP: f32 = 8.0;
 pub const PRIMARY_HEIGHT: f32 = 36.0;
 pub const PRIMARY_PAD_X: f32 = 14.0;
+/// Each hazard cap on the primary button: four stripes wide.
+pub const PRIMARY_CAP_W: f32 = 24.0;
 pub const OVERFLOW_PX: f32 = 36.0;
 
 pub const MENU_PAD: f32 = 5.0;
@@ -308,18 +310,22 @@ pub fn menu_row_class(danger: bool) -> cosmic::theme::Button {
 /// The primary button's three looks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrimaryLook {
-    /// Phosphor fill, `BG` text.
+    /// Dark plate, phosphor edge and text, hazard caps; a phosphor wash
+    /// on hover.
     Ready,
-    /// Phosphor outline and text.
+    /// The same plate, no hover: a launch is under way.
     Busy,
-    /// `LINE` outline, dimmer text, no press.
+    /// `LINE` edge, dimmer text, no caps, no press.
     Inert,
 }
 
 pub fn primary_class(look: PrimaryLook) -> cosmic::theme::Button {
     let s = match look {
-        PrimaryLook::Ready => button_style(BG, Some(PHOSPHOR), Some(PHOSPHOR), CARD_RADIUS),
-        PrimaryLook::Busy => button_style(PHOSPHOR, None, Some(PHOSPHOR), CARD_RADIUS),
+        PrimaryLook::Ready => {
+            let rest = button_style(PHOSPHOR, Some(BG), Some(PHOSPHOR), CARD_RADIUS);
+            return states(rest, button_style(PHOSPHOR, Some(OVERFLOW_OPEN), Some(PHOSPHOR), CARD_RADIUS), rest);
+        }
+        PrimaryLook::Busy => button_style(PHOSPHOR, Some(BG), Some(PHOSPHOR), CARD_RADIUS),
         PrimaryLook::Inert => button_style(DIMMER, None, Some(LINE), CARD_RADIUS),
     };
     states(s, s, s)
