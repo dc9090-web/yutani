@@ -1,0 +1,65 @@
+[package]
+name = "iced_wgpu"
+description = "A renderer for iced on top of wgpu"
+version = "0.14.0"
+edition = "2024"
+authors = ["Héctor Ramón Jiménez <hector@hecrj.dev>"]
+license = "MIT"
+repository = "https://github.com/iced-rs/iced"
+homepage = "https://iced.rs"
+categories = ["gui"]
+keywords = ["gui", "ui", "graphics", "interface", "widgets"]
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+all-features = true
+
+[features]
+default = ["wgpu/default"]
+geometry = ["iced_graphics/geometry", "lyon"]
+image = ["iced_graphics/image"]
+svg = ["iced_graphics/svg", "resvg/text"]
+web-colors = ["iced_graphics/web-colors"]
+webgl = ["wgpu/webgl"]
+strict-assertions = []
+wayland = ["cctk"]
+
+[dependencies]
+iced_debug = { git = "https://github.com/pop-os/libcosmic", rev = "a401af8b1c54a8abd393b8c5b7c8809402f83850" }
+iced_graphics = { git = "https://github.com/pop-os/libcosmic", rev = "a401af8b1c54a8abd393b8c5b7c8809402f83850" }
+
+bitflags = "2.5"
+bytemuck = { version = "1.0", features = ["derive"] }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+glam = "0.25"
+cryoglyph = { git = "https://github.com/iced-rs/cryoglyph.git", rev = "e429a025df36ab8145708acb309080ae3deec17a" }
+guillotiere = "0.6"
+log = "0.4"
+rustc-hash = "2.0"
+thiserror = "2"
+wgpu = { version = "28.0", default-features = false, features = ["std", "wgsl"] }
+
+lyon = { version = "1.0", optional = true }
+
+resvg = { version = "0.45", optional = true }
+
+[target.'cfg(all(unix, not(target_os = "macos"), not(target_os = "redox")))'.dependencies]
+
+rustix = { version = "0.38", features = ["fs"] }
+raw-window-handle = "0.6"
+cctk = { git = "https://github.com/pop-os/cosmic-protocols", package = "cosmic-client-toolkit", rev = "32283d7", optional = true }
+wayland-protocols = { version = "0.32.1", features = ["staging"] }
+wayland-backend = { version = "0.3.3", features = ["client_system"] }
+wayland-client = { version = "0.31.2" }
+wayland-sys = { version = "0.31.1", features = ["dlopen"] }
+as-raw-xcb-connection = "1.0.1"
+tiny-xlib = "0.2.3"
+x11rb = { version = "0.13.1", features = [
+    "allow-unsafe-code",
+    "dl-libxcb",
+    "dri3",
+    "randr",
+] }
+
+[build-dependencies]
+build_helpers = { git = "https://github.com/pop-os/libcosmic", rev = "a401af8b1c54a8abd393b8c5b7c8809402f83850" }

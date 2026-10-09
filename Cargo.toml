@@ -59,3 +59,9 @@ opt-level = 3
 # once upstream wayland-rs ships the same change.
 [patch.crates-io]
 wayland-backend = { path = "vendor/wayland-backend" }
+
+# iced_wgpu from libcosmic's tree with MSAA switched off (see
+# vendor/iced_wgpu/README.yutani.md): with it on, the popover kept frozen
+# copies of its canvas shapes where they sat before it last shrank.
+[patch."https://github.com/pop-os/libcosmic"]
+iced_wgpu = { path = "vendor/iced_wgpu" }
