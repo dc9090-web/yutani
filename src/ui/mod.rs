@@ -23,7 +23,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::adopt;
 use crate::backend::{self, CaptureImage, ClientInfo, Cmd, Event, Handle};
 use crate::model::client::Login;
 use crate::model::config::{Config, Mode};
@@ -38,7 +37,6 @@ pub mod rules;
 pub mod settings;
 pub mod settings_ui;
 pub mod thumbnail;
-pub mod tunnel_page;
 
 /// The daemon's flags. `Config` itself lives in the library now, and the
 /// orphan rule forbids implementing libcosmic's `CosmicFlags` for a foreign
@@ -166,22 +164,10 @@ pub struct App {
     /// `ConfigChanged` carrying exactly what we wrote, this soon after, is
     /// that echo and is ignored (see `OWN_WRITE_ECHO`).
     pub last_config_write: Option<(Instant, Config)>,
-    /// The `.conf` a tunnel install/uninstall/connect/disconnect started
-    /// from, while that action runs on the blocking pool. It lives here and
-    /// not in the window's state because the window can be closed and
-    /// reopened while pkexec is still asking for the password: the new
-    /// window must start out busy, must not start a second pkexec, and the
-    /// note at the end must name the file the action *started* with.
-    pub tunnel_in_flight: Option<PathBuf>,
     /// Steam accounts whose EVE launch line is broken or lacks `yutani
     /// launch` (`yutani::steam`), from the 30 s subscription; copied into
     /// every `status` reply and into the settings window when it is open.
     pub steam_findings: Vec<yutani::steam::Finding>,
-    /// The direct (not tunnelled) TQ probe's newest sample, copied into
-    /// every `status` reply.
-    direct_ping: crate::tunnel::probe::Latest,
-    /// Keeps that probe's thread running; dropping it stops it.
-    _direct_probe: Option<crate::tunnel::probe::Probe>,
 }
 
 #[derive(Clone, Debug)]
@@ -194,33 +180,18 @@ pub enum Msg {
     /// config stays, and the settings window (if open) shows the reason.
     ConfigBroken(String),
     Ipc(ipc::IpcEvent),
-    /// The answer to an IPC request that could not be produced on the update
-    /// thread (see [`Reply::Later`]). Carries the request's one-shot reply
-    /// handle, so the answer still reaches exactly the client that asked.
-    IpcReplyLater(ipc::Responder, Result<Option<String>, String>),
-    /// A `quit` that had a live tunnel to wind down first: the
-    /// `systemctl stop` has finished (or failed), and the daemon may now
-    /// drop its socket and exit. The client that asked was answered `ok`
-    /// the moment the request arrived — it is not waiting on this.
-    QuitAfterTunnel(Result<(), String>),
     /// [`rules::FOCUS_GRACE`] has passed since focus left EVE: hide the
     /// thumbnails if it has not come back.
     FocusGraceOver,
     /// 500 ms while a Launch EVE run is active: look for the EVE Launcher,
     /// let the state machine time out, notice the new client placed.
     LaunchTick,
-    Adopt(adopt::AdoptEvent),
     /// The Steam launch-line scan finished (the periodic subscription, or a
     /// re-check when the settings window opens or shows its Steam page).
     SteamChecked(Vec<yutani::steam::Finding>),
     /// The Characters page's files, read on the blocking pool by
     /// `refresh_characters`; `on_characters_listed` takes them from here.
     CharactersListed(CharactersListed),
-    /// Files were dropped on one of our windows. Only the settings window
-    /// cares (the Tunnel page takes a `.conf` this way); `FileHovered` is
-    /// deliberately *not* a message — it repeats for every pointer motion
-    /// while the drag is over the window.
-    FileDropped(SurfaceId, Vec<PathBuf>),
     Settings(settings::Msg),
 }
 
@@ -234,11 +205,9 @@ pub struct CharactersListed {
 }
 
 /// How an IPC request is answered. Every request produces exactly one
-/// `Response`: either here on the update thread, or — for requests that
-/// would otherwise block it — from the `Msg::IpcReplyLater` the returned
-/// `Task` resolves to. If the app quits before that task resolves, the task
-/// (and with it the `Responder`) is dropped, the one-shot sender closes and
-/// the waiting client is told "no reply from app"; nothing panics.
+/// `Response`: either here on the update thread, or — for `quit`, which
+/// must write its reply before the exit — from the `Task` returned
+/// alongside, which owns the reply handle.
 enum Reply {
     /// Answer now, from this call.
     Now(Result<Option<String>, String>),
@@ -552,102 +521,32 @@ impl App {
                 Some(page) => (Reply::Now(Ok(None)), self.open_settings_at(Some(page))),
                 None => (Reply::Now(Err(format!("unknown settings page {page:?}"))), Task::none()),
             },
-            // Quitting takes the tunnel with it (applet spec §4.5). The
-            // client is answered `ok` before anything slow happens: a
-            // `systemctl stop` can take the unit's whole TimeoutStopSec
-            // (10 s), and neither the caller nor the thumbnails may hang on
-            // it, so the stop runs on the blocking pool and the exit itself
-            // waits for `Msg::QuitAfterTunnel` (see `quit`).
-            Request::Quit => {
-                // Two `stat`s decide the plan, not the full status: that
-                // one can spawn `systemctl`, which has no place here.
-                let plan = crate::tunnel::control::quit_plan(
-                    crate::tunnel::control::installed(),
-                    crate::tunnel::control::iface_present(),
-                );
-                self.quit(plan, reply)
-            }
-            // The applet polls this every 5 s (1 s with its popup open),
-            // and the tunnel half can spawn `systemctl is-failed` (unit
-            // installed, link down — the ordinary state): a fork/exec and a
-            // D-Bus round trip, up to a second when systemd is slow. The
-            // client list is taken here; the rest runs on the blocking pool
-            // and the answer comes back as `IpcReplyLater`.
+            Request::Quit => self.quit(reply),
             Request::Status => {
                 let order = self.focus_order();
-                let clients: Vec<crate::tunnel::status::ClientStatus> = order
+                let clients: Vec<crate::status::ClientStatus> = order
                     .iter()
                     .filter_map(|h| self.clients.get(h))
-                    .map(|c| crate::tunnel::status::ClientStatus { name: c.info.login.label().to_string(), active: c.info.activated })
+                    .map(|c| crate::status::ClientStatus { name: c.info.login.label().to_string(), active: c.info.activated })
                     .collect();
-                let eve_client = !clients.is_empty();
-                let hidden = self.hidden;
-                let location = self.config.tunnel.location.clone();
-                let shortcuts = Some(crate::tunnel::status::ShortcutHint {
+                let shortcuts = Some(crate::status::ShortcutHint {
                     prefix: self.config.shortcuts.prefix_label(),
                     next: crate::model::config::key_symbol(&self.config.shortcuts.next),
                     prev: crate::model::config::key_symbol(&self.config.shortcuts.prev),
                 });
-                let outputs: Vec<crate::tunnel::status::OutputStatus> = self
-                    .outputs
-                    .iter()
-                    .map(|o| crate::tunnel::status::OutputStatus { name: o.name.clone(), height: o.logical_size.1 })
-                    .collect();
-                let steam = self.steam_findings.clone();
-                let launch = self.launch.as_ref().map(|l| l.state().clone());
-                let direct_ping = self.direct_ping.get();
-                let reply = reply.clone();
-                let task = cosmic::iced::Task::perform(
-                    async move {
-                        let tunnel = tokio::task::spawn_blocking(move || {
-                            // The ping runs only while EVE does — a game
-                            // client or the EVE Launcher (Daniel, 2026-10-08).
-                            // The applet polls at least every 5 s, inside the
-                            // lease's 10 s term. The launcher check is a /proc
-                            // walk, so it stays off the update thread.
-                            if eve_client || crate::adopt::process_running(&["evelauncher.exe".to_string()], crate::ipc::uid()) {
-                                crate::tunnel::touch_ping_lease();
-                            }
-                            crate::tunnel::control::current_tunnel_status(&location)
-                        })
-                        .await
-                                .map_err(|e| format!("status task failed: {e}"))?;
-                        let status = crate::tunnel::status::Status { clients, hidden, tunnel, shortcuts, outputs, steam, launch, direct_ping };
-                        serde_json::to_string(&status).map(Some).map_err(|e| format!("status: {e}"))
-                    },
-                    move |result| cosmic::Action::App(Msg::IpcReplyLater(reply, result)),
-                );
-                (Reply::Later, task)
+                let status = crate::status::Status {
+                    clients,
+                    hidden: self.hidden,
+                    shortcuts,
+                    steam: self.steam_findings.clone(),
+                    launch: self.launch.as_ref().map(|l| l.state().clone()),
+                };
+                (Reply::Now(serde_json::to_string(&status).map(Some).map_err(|e| format!("status: {e}"))), Task::none())
             }
             Request::Launch => (Reply::Now(self.start_launch()), Task::none()),
-            // The popover is open. It no longer wakes the ping on its own:
-            // that follows EVE running (`Request::Status`). Still answered,
-            // for applets that send it.
+            // Older applets send this when their popover opens, to wake a
+            // ping that no longer exists. Still answered.
             Request::Watch => (Reply::Now(Ok(None)), cosmic::iced::Task::none()),
-            // `systemctl start|stop` is a synchronous subprocess that can
-            // take up to the unit's TimeoutStopSec (10 s). Running it here
-            // would freeze every thumbnail for that long, so it goes to the
-            // blocking pool and the answer comes back as `IpcReplyLater`.
-            Request::TunnelConnect | Request::TunnelDisconnect => {
-                let connect = matches!(request, Request::TunnelConnect);
-                let reply = reply.clone();
-                let task = cosmic::iced::Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            if connect {
-                                crate::tunnel::control::connect()
-                            } else {
-                                crate::tunnel::control::disconnect()
-                            }
-                        })
-                        .await
-                        .map_err(|e| format!("tunnel task failed: {e}"))
-                        .and_then(|r| r.map(|()| None).map_err(|e| format!("{e:#}")))
-                    },
-                    move |result| cosmic::Action::App(Msg::IpcReplyLater(reply, result)),
-                );
-                (Reply::Later, task)
-            }
         }
     }
 
@@ -724,7 +623,7 @@ impl App {
         // A /proc walk of a few ms, at 2 Hz and only while step 1 or 3
         // needs it; move it to spawn_blocking if it ever shows in a profile.
         let launcher_alive = self.launch.as_ref().is_some_and(|l| l.wants_launcher())
-            && crate::adopt::process_running(&["evelauncher.exe".to_string()], crate::ipc::uid());
+            && crate::eve_process::process_running(&[crate::eve_process::LAUNCHER], crate::ipc::uid());
         self.observe_launch(Obs::Tick { now_ms, launcher_alive });
         // Dock mode never sets `placed` (its slot does not depend on a
         // placement): there the target is ready once it has a surface.
@@ -751,41 +650,24 @@ impl App {
         if self.send(Cmd::Activate(handle)) { Ok(None) } else { Err("backend not ready".into()) }
     }
 
-    /// IPC `quit`, once the plan is known.
-    fn quit(&self, plan: crate::tunnel::control::QuitPlan, reply: &ipc::Responder) -> (Reply, Task<cosmic::Action<Msg>>) {
-        match plan {
-            // Answered from the task that exits, not from this update: the
-            // connection task still has to write the reply, and an exit
-            // returned alongside it raced that write — `yutani quit` could
-            // see EOF ("no reply") and exit 1 after a successful quit. A
-            // short sleep lets the write happen; then the socket goes and
-            // the exit follows.
-            crate::tunnel::control::QuitPlan::ExitNow => {
-                let reply = reply.clone();
-                let task = cosmic::iced::Task::perform(
-                    async move {
-                        reply.respond(crate::ipc::Response::Ok);
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                        ipc::remove_socket();
-                    },
-                    |()| cosmic::Action::None,
-                )
-                .chain(cosmic::iced::exit());
-                (Reply::Later, task)
-            }
-            crate::tunnel::control::QuitPlan::DisconnectThenExit => {
-                let task = cosmic::iced::Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(crate::tunnel::control::disconnect)
-                            .await
-                            .map_err(|e| format!("tunnel task failed: {e}"))
-                            .and_then(|r| r.map_err(|e| format!("{e:#}")))
-                    },
-                    |result| cosmic::Action::App(Msg::QuitAfterTunnel(result)),
-                );
-                (Reply::Now(Ok(None)), task)
-            }
-        }
+    /// IPC `quit`. Answered from the task that exits, not from this
+    /// update: the connection task still has to write the reply, and an
+    /// exit returned alongside it raced that write — `yutani quit` could
+    /// see EOF ("no reply") and exit 1 after a successful quit. A short
+    /// sleep lets the write happen; then the socket goes and the exit
+    /// follows.
+    fn quit(&self, reply: &ipc::Responder) -> (Reply, Task<cosmic::Action<Msg>>) {
+        let reply = reply.clone();
+        let task = cosmic::iced::Task::perform(
+            async move {
+                reply.respond(crate::ipc::Response::Ok);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                ipc::remove_socket();
+            },
+            |()| cosmic::Action::None,
+        )
+        .chain(cosmic::iced::exit());
+        (Reply::Later, task)
     }
 
     /// The one place `hidden` changes (every IPC request comes through here).
@@ -1499,8 +1381,6 @@ impl App {
         if let Some(i) = position {
             state.pages.activate_position(i as u16);
         }
-        // A tunnel action outlives the window it was started from.
-        state.tunnel.busy = self.tunnel_in_flight.is_some();
         state.steam_findings = self.steam_findings.clone();
         self.settings = Some(state);
         let title = self.set_window_title("Yutani Settings".to_string(), id);
@@ -1530,9 +1410,6 @@ impl App {
                 // …and EVE's files with it: the Characters page is as stale
                 // as the rest after the window has been sitting open.
                 let characters = self.refresh_characters();
-                // …and so is the tunnel: it can have been installed,
-                // connected or torn down from the CLI meanwhile.
-                let tunnel = self.refresh_tunnel();
                 // …and Steam's launch line, possibly onto the Steam page.
                 let steam = self.recheck_steam();
                 // Un-minimize first, then activate: a window the compositor
@@ -1540,7 +1417,6 @@ impl App {
                 // same chain libcosmic's own `Action::Activate` does.
                 return Task::batch([
                     characters,
-                    tunnel,
                     steam,
                     cosmic::iced::window::minimize(window, false)
                         .chain(activation::activate(window, token.clone())),
@@ -1558,9 +1434,8 @@ impl App {
                     }
                     state.refresh();
                     // EVE's files are outside `State::refresh` (they are not
-                    // ours, and the names lookup is a task) — and so is the
-                    // tunnel, which is systemd's state, not a file of ours.
-                    return Task::batch([self.refresh_characters(), self.refresh_tunnel(), self.recheck_steam()]);
+                    // ours, and the names lookup is a task).
+                    return Task::batch([self.refresh_characters(), self.recheck_steam()]);
                 }
                 S::ActiveBorder(text) => state.active_border_field = text.clone(),
                 S::InactiveBorder(text) => state.inactive_border_field = text.clone(),
@@ -1609,38 +1484,12 @@ impl App {
                     state.copy_phase = settings::CopyPhase::Idle;
                     return Task::none();
                 }
-                S::AskUninstall => {
-                    state.uninstall_confirm = true;
-                    return Task::none();
-                }
-                S::CancelUninstall => {
-                    state.uninstall_confirm = false;
-                    return Task::none();
-                }
                 S::CopyReset => {
                     state.copied = false;
                     return Task::none();
                 }
                 S::SteamFullPath(on) => {
                     state.steam_full_path = *on;
-                    return Task::none();
-                }
-                S::TunnelConfPath(text) => {
-                    state.tunnel.conf_path = text.clone();
-                    return Task::none();
-                }
-                S::TunnelStatus(status) => {
-                    state.tunnel.status = Some((**status).clone());
-                    return Task::none();
-                }
-                // The chooser answers with a path or with nothing
-                // (cancelled); either way the note is the only feedback.
-                S::TunnelConfChosen(path) => {
-                    if let Some(path) = path {
-                        state.tunnel.conf_path = path.display().to_string();
-                        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        state.note = Some(format!("chose {name}"));
-                    }
                     return Task::none();
                 }
                 // Clamped to the listing the window is showing: libcosmic
@@ -1713,45 +1562,6 @@ impl App {
                 let (note, task) = self.centre_vertically();
                 self.settings_note(note);
                 return task;
-            }
-            // The window's own drop target answered: the Wayland route
-            // into the same handler the X11 window event uses.
-            S::FilesDropped(paths) => {
-                self.on_files_dropped(paths);
-                return Task::none();
-            }
-            S::RefreshTunnel => return self.refresh_tunnel(),
-            S::BrowseTunnelConf => return self.browse_tunnel_conf(),
-            // Re-checked here and not only on the button: the file behind
-            // the enabled state can have been moved since the last redraw.
-            // The redraw's answer is cached per text (`conf_check`), so it
-            // is dropped first or this would be the same look, not a new one.
-            S::InstallTunnel => {
-                if let Some(s) = self.settings.as_mut() {
-                    *s.tunnel.conf_check.borrow_mut() = None;
-                }
-                let blocked =
-                    self.settings.as_ref().and_then(|s| tunnel_page::install_blocker(&s.tunnel));
-                if let Some(reason) = blocked {
-                    self.settings_note(reason.to_string());
-                    return Task::none();
-                }
-                return self.run_tunnel_action(settings::TunnelAction::Install);
-            }
-            S::UninstallTunnel => {
-                if let Some(state) = self.settings.as_mut() {
-                    state.uninstall_confirm = false;
-                }
-                return self.run_tunnel_action(settings::TunnelAction::Uninstall);
-            }
-            S::TunnelConnect => return self.run_tunnel_action(settings::TunnelAction::Connect),
-            S::TunnelDisconnect => return self.run_tunnel_action(settings::TunnelAction::Disconnect),
-            // Whatever happened, the action is over: the buttons come back
-            // and the state on screen is re-read from systemd.
-            S::TunnelDone(action, result) => {
-                let note = self.tunnel_done(*action, result.clone());
-                self.settings_note(note);
-                return self.refresh_tunnel();
             }
             // Both set the note themselves, then the listing (and the
             // newest backup) are re-read: the files on disk just changed.
@@ -2090,7 +1900,7 @@ impl App {
         // The toplevel list empties when the window closes; the process
         // outlives it and writes these files while it exits.
         if let Some(reason) =
-            characters::write_blocker_now(listing, &self.config.tunnel.adopt_processes, state.characters.last_write)
+            characters::write_blocker_now(listing, &crate::eve_process::EVE_PROCESSES, state.characters.last_write)
         {
             self.settings_note(reason);
             return None;
@@ -2147,7 +1957,7 @@ impl App {
             return self.settings_note("nothing to restore".to_string());
         };
         if let Some(reason) =
-            characters::write_blocker_now(listing, &self.config.tunnel.adopt_processes, state.characters.last_write)
+            characters::write_blocker_now(listing, &crate::eve_process::EVE_PROCESSES, state.characters.last_write)
         {
             return self.settings_note(reason);
         }
@@ -2184,81 +1994,6 @@ impl App {
         self.settings_note(note);
     }
 
-    /// Files dropped on the settings window — from its own drag-and-drop
-    /// destination widget (`settings::Msg::FilesDropped`, the Wayland
-    /// route) or from the X11/XWayland `FileDropped` window event. Only a
-    /// `.conf` is taken: the Tunnel page's third way of naming the
-    /// WireGuard file. The file itself is never opened here — the page
-    /// shows its name, and `install` (as root) is the only thing that reads
-    /// what is inside it.
-    fn on_files_dropped(&mut self, paths: &[PathBuf]) {
-        let Some(conf) = tunnel_page::conf_candidate(paths) else {
-            // The drop was accepted (the cursor said so); say why nothing
-            // happened rather than leaving the user to wonder.
-            self.settings_note(tunnel_page::NOT_A_CONF_DROP.to_string());
-            return;
-        };
-        let name = conf.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let tab = settings::page_index(settings::Page::Tunnel);
-        if let Some(state) = self.settings.as_mut() {
-            state.tunnel.conf_path = conf.display().to_string();
-            // The file landed on a page that does not mention it otherwise;
-            // show the one that does.
-            if let Some(tab) = tab {
-                state.pages.activate_position(tab as u16);
-            }
-            state.note = Some(format!("dropped {name}; press Install tunnel"));
-        }
-    }
-
-    /// One finished tunnel action: the buttons come back — whatever
-    /// happened, and on every path through here — and the note says what
-    /// happened. It never names anything from inside the `.conf`, only its
-    /// file name.
-    fn tunnel_done(&mut self, action: settings::TunnelAction, result: Result<(), String>) -> String {
-        // The file the action *started* with, not whatever the field holds
-        // now: the path can have been re-typed or dropped on while pkexec
-        // was asking for a password, and the note would then name a file
-        // that was never installed. Taken whether or not the window is
-        // still there — the action is over either way.
-        let conf = self.tunnel_in_flight.take().unwrap_or_default();
-        let Some(state) = self.settings.as_mut() else {
-            tracing::info!(?action, ok = result.is_ok(), "tunnel action finished after its window closed");
-            return String::new();
-        };
-        state.tunnel.busy = false;
-        match (action, result) {
-            (settings::TunnelAction::Install, result) => tunnel_page::install_note(&conf, result),
-            (_, Err(e)) => e,
-            (settings::TunnelAction::Uninstall, Ok(())) => "tunnel uninstalled".to_string(),
-            // `systemctl start` returns once the unit is up, but the
-            // handshake behind it is not: the status line says when it is.
-            (settings::TunnelAction::Connect, Ok(())) => "tunnel connecting…".to_string(),
-            (settings::TunnelAction::Disconnect, Ok(())) => "tunnel disconnected".to_string(),
-        }
-    }
-
-    /// Read the tunnel state off the UI thread (`is-failed` may spawn
-    /// systemctl). Runs when the window opens or is raised, when Re-check is
-    /// pressed, and after every action.
-    fn refresh_tunnel(&self) -> Task<cosmic::Action<Msg>> {
-        if self.settings.is_none() {
-            return Task::none();
-        }
-        let location = self.config.tunnel.location.clone();
-        cosmic::iced::Task::perform(
-            async move {
-                tokio::task::spawn_blocking(move || crate::tunnel::control::current_tunnel_status(&location))
-                    .await
-                    .ok()
-            },
-            |status| match status {
-                Some(t) => cosmic::Action::App(Msg::Settings(settings::Msg::TunnelStatus(Box::new(t)))),
-                None => cosmic::Action::None,
-            },
-        )
-    }
-
     /// Re-scan Steam's launch lines off the UI thread; the answer comes
     /// back as `Msg::SteamChecked`. Run when the settings window opens and
     /// when its Steam page is shown, so a fix made in Steam a moment ago
@@ -2268,70 +2003,6 @@ impl App {
             Ok(findings) => cosmic::Action::App(Msg::SteamChecked(findings)),
             Err(_) => cosmic::Action::None,
         })
-    }
-
-    /// One tunnel action on the blocking pool; the page is `busy` until the
-    /// `TunnelDone` it resolves to. `install` shells out to `pkexec` (the
-    /// polkit agent's password prompt) and connect/disconnect to
-    /// `systemctl`, either of which can take seconds — none of it may
-    /// happen on the thread that draws the thumbnails.
-    ///
-    /// The IPC `tunnel connect|disconnect` requests run the same functions
-    /// and are not covered by this flag: systemd serialises the two, and
-    /// the status refresh at the end reports whatever actually happened.
-    fn run_tunnel_action(&mut self, action: settings::TunnelAction) -> Task<cosmic::Action<Msg>> {
-        // One at a time: a message that slips in while pkexec is up (from a
-        // window reopened mid-prompt, say) must not start a second prompt.
-        if self.tunnel_in_flight.is_some() {
-            self.settings_note(tunnel_page::BUSY.to_string());
-            return Task::none();
-        }
-        let Some(state) = self.settings.as_mut() else { return Task::none() };
-        state.tunnel.busy = true;
-        let conf = PathBuf::from(state.tunnel.conf_path.trim());
-        // What the note at the end has to name; cleared by `tunnel_done`.
-        self.tunnel_in_flight = Some(conf.clone());
-        let (servers, domains) = (self.config.tunnel.dns_servers.clone(), self.config.tunnel.dns_domains.clone());
-        cosmic::iced::Task::perform(
-            async move {
-                tokio::task::spawn_blocking(move || match action {
-                    settings::TunnelAction::Install => crate::tunnel::install::install(&conf, &servers, &domains),
-                    settings::TunnelAction::Uninstall => crate::tunnel::install::uninstall(),
-                    settings::TunnelAction::Connect => crate::tunnel::control::connect(),
-                    settings::TunnelAction::Disconnect => crate::tunnel::control::disconnect(),
-                })
-                .await
-                .map_err(|e| format!("tunnel task failed: {e}"))
-                .and_then(|r| r.map_err(|e| format!("{e:#}")))
-            },
-            move |result| cosmic::Action::App(Msg::Settings(settings::Msg::TunnelDone(action, result))),
-        )
-    }
-
-    /// The XDG file-chooser portal, filtered to `*.conf`. A cancelled or
-    /// unavailable dialog answers `None` and changes nothing.
-    fn browse_tunnel_conf(&self) -> Task<cosmic::Action<Msg>> {
-        use cosmic::dialog::file_chooser::{self, FileFilter};
-        cosmic::iced::Task::perform(
-            async {
-                let dialog = file_chooser::open::Dialog::new()
-                    .title("WireGuard configuration")
-                    .filter(FileFilter::new("WireGuard config").glob("*.conf"));
-                match dialog.open_file().await {
-                    // `FileResponse::url()` panics when nothing was
-                    // selected; the URI list behind it is empty instead.
-                    Ok(response) => response.0.uris().first().and_then(|url| url.to_file_path().ok()),
-                    // Cancelling is an answer, not a fault: only a portal
-                    // that failed is worth a line in the log.
-                    Err(file_chooser::Error::Cancelled) => None,
-                    Err(why) => {
-                        tracing::warn!("file chooser: {why}");
-                        None
-                    }
-                }
-            },
-            |path| cosmic::Action::App(Msg::Settings(settings::Msg::TunnelConfChosen(path))),
-        )
     }
 
     fn settings_note(&mut self, note: String) {
@@ -2386,14 +2057,6 @@ impl Application for App {
     }
 
     fn init(core: cosmic::app::Core, flags: AppFlags) -> (Self, Task<cosmic::Action<Msg>>) {
-        // The direct TQ probe: idle until the ping lease is renewed (the
-        // popover open, or an EVE client running). Tests never start it:
-        // the daemon under test must do no network I/O.
-        let direct_ping = crate::tunnel::probe::Latest::default();
-        let direct_probe = match std::env::var_os("XDG_RUNTIME_DIR") {
-            Some(dir) if !cfg!(test) => crate::tunnel::probe::spawn_direct(dir.into(), direct_ping.clone()),
-            _ => None,
-        };
         let (layout, layout_poisoned) = match Layout::try_load() {
             Ok(Some(layout)) => (layout, false),
             Ok(None) => (Layout::default(), false),
@@ -2419,10 +2082,7 @@ impl Application for App {
             hidden: false,
             last_eve_focus: None,
             last_activated: None,
-            tunnel_in_flight: None,
             steam_findings: Vec::new(),
-            direct_ping,
-            _direct_probe: direct_probe,
             settings: None,
             keepalive: None,
             last_config_write: None,
@@ -2496,15 +2156,6 @@ impl Application for App {
                 }
                 Task::none()
             }
-            // The X11/XWayland route only (see `subscription`); the drop
-            // the settings window itself receives comes through
-            // `settings::Msg::FilesDropped`. Both end in the same handler.
-            Msg::FileDropped(id, paths) => {
-                if self.settings.as_ref().map(|s| s.window) == Some(id) {
-                    self.on_files_dropped(&paths);
-                }
-                Task::none()
-            }
             Msg::Settings(msg) => self.on_settings(msg),
             Msg::Ipc(ev) => {
                 let (reply, task) = self.handle_request(&ev.request, &ev.reply);
@@ -2513,35 +2164,12 @@ impl Application for App {
                 }
                 task
             }
-            Msg::IpcReplyLater(reply, result) => {
-                reply.respond(response_of(result));
-                Task::none()
-            }
-            // A failed stop is logged, not fatal: the user asked to quit,
-            // and refusing to would leave them with a daemon they cannot
-            // close. `yutani tunnel disconnect` still works afterwards.
             Msg::FocusGraceOver => self.reconcile_surfaces(),
             Msg::LaunchTick => {
                 self.launch_tick();
                 Task::none()
             }
-            Msg::QuitAfterTunnel(result) => {
-                if let Err(err) = result {
-                    tracing::warn!("stopping the tunnel before quitting failed: {err}");
-                } else {
-                    tracing::info!("tunnel stopped; quitting");
-                }
-                ipc::remove_socket();
-                cosmic::iced::exit()
-            }
             Msg::CharactersListed(listed) => self.on_characters_listed(listed),
-            Msg::Adopt(ev) => {
-                match ev.result {
-                    Ok(()) => tracing::info!(pid = ev.pid, name = %ev.name, "adopted into yutani-eve.slice"),
-                    Err(e) => tracing::warn!(pid = ev.pid, name = %ev.name, "adoption failed: {e}"),
-                }
-                Task::none()
-            }
             Msg::SteamChecked(findings) => {
                 // The subscription emits on change, but the settings
                 // window's re-check on open runs regardless of change; the
@@ -2569,11 +2197,6 @@ impl Application for App {
                 event @ (WaylandEvent::Output(..) | WaylandEvent::Layer(..)),
             )) => Some(Msg::Wayland(event)),
             iced::Event::Mouse(m) => Some(Msg::Pointer(id, m)),
-            // winit emits this on X11, macOS and Windows only — never on
-            // Wayland, where a drop reaches the client through the data
-            // device and so through the settings window's own drag-and-drop
-            // destination widget. Kept for XWayland/X11 sessions.
-            iced::Event::Window(iced::window::Event::FileDropped(paths)) => Some(Msg::FileDropped(id, paths)),
             // Every other event (RequestResize, Frame, keyboard, …) must not become
             // a message: update → redraw → same event again is a hot loop.
             _ => None,
@@ -2595,9 +2218,6 @@ impl Application for App {
         }
         if self.launch.is_some() {
             subs.push(cosmic::iced::time::every(Duration::from_millis(500)).map(|_| Msg::LaunchTick));
-        }
-        if self.config.tunnel.auto_adopt {
-            subs.push(adopt::subscription(self.config.tunnel.adopt_processes.clone()).map(Msg::Adopt));
         }
         Subscription::batch(subs)
     }
@@ -2749,10 +2369,7 @@ mod tests {
             last_eve_focus: None,
             last_activated: None,
             settings: None,
-            tunnel_in_flight: None,
             steam_findings: Vec::new(),
-            direct_ping: Default::default(),
-            _direct_probe: None,
             keepalive: None,
             last_config_write: None,
         }
@@ -2778,22 +2395,19 @@ mod tests {
         app.clients[h].surface
     }
 
-    /// [I2] `status` is what the applet polls every 5 s (1 s with its popup
-    /// open), and the tunnel half of it can spawn `systemctl is-failed`
-    /// (installed unit, link down — the ordinary state). That must never
-    /// run on the thread that drives every thumbnail frame, so the request
-    /// is answered later, from a task, and nothing reaches the client from
-    /// this call.
+    /// `status` is what the applet polls every 5 s (1 s with its popup
+    /// open): answered at once, from the update, with the clients in it.
     #[test]
-    fn status_is_answered_off_the_update_thread() {
+    fn status_is_answered_at_once() {
         let mut app = app(Config::default());
-        let (reply, mut rx) = ipc::Responder::detached();
+        let (reply, _rx) = ipc::Responder::detached();
         let (how, _task) = app.handle_request(&crate::ipc::Request::Status, &reply);
-        assert!(matches!(how, Reply::Later), "answered on the update thread");
-        assert!(rx.try_recv().is_err(), "the reply must come from the task, not from this call");
+        let Reply::Now(Ok(Some(json))) = how else { panic!("status must be answered now") };
+        let status: crate::status::Status = serde_json::from_str(&json).unwrap();
+        assert!(status.clients.is_empty() && !status.hidden);
     }
 
-    /// `watch` (the applet's popover is open) renews the ping lease and is
+    /// `watch` (sent by older applets when their popover opens) is
     /// answered at once with a plain `ok`.
     #[test]
     fn watch_is_answered_at_once() {
@@ -3130,30 +2744,6 @@ mod tests {
         assert!(characters.last_backup.is_none());
     }
 
-    /// [M1] The Install press re-checks the `.conf` path because the file
-    /// can have been moved since the last redraw — but the redraw's answer
-    /// is cached per text, so the press has to drop it or it looks at
-    /// nothing and raises the polkit prompt for a file root cannot read.
-    #[test]
-    fn the_install_press_re_stats_the_conf_file_instead_of_trusting_the_redraw() {
-        let dir = std::env::temp_dir().join(format!("yutani-install-press-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let conf = dir.join("wg0.conf");
-        std::fs::write(&conf, "[Interface]\n").unwrap();
-        let mut app = app(Config::default());
-        app.settings = Some(settings::State::new(SurfaceId::unique(), &app.config));
-        app.settings.as_mut().unwrap().tunnel.conf_path = conf.display().to_string();
-        // The redraw: enabled, and the answer cached for that text.
-        assert_eq!(tunnel_page::install_blocker(&app.settings.as_ref().unwrap().tunnel), None);
-        std::fs::remove_file(&conf).unwrap();
-        let _ = app.update(Msg::Settings(settings::Msg::InstallTunnel));
-        let state = app.settings.as_ref().unwrap();
-        assert_eq!(state.note.as_deref(), Some(tunnel_page::NOT_A_FILE), "the press must see the file is gone");
-        assert!(!state.tunnel.busy && app.tunnel_in_flight.is_none(), "no action started");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
     /// [I3] The watcher's answer to a `config.ron` that does not parse:
     /// nothing changes live, and an open settings window shows why (the
     /// same field `save_config` uses, so the Display/Behavior pages give
@@ -3168,7 +2758,7 @@ mod tests {
         assert_eq!(app.settings.as_ref().unwrap().config_error.as_deref(), Some("cannot parse config.ron: 3:1"));
     }
 
-    /// [M5] `quit` with nothing to wind down used to answer `ok` and return
+    /// [M5] `quit` used to answer `ok` and return
     /// `exit()` from the same update: the connection task's write of that
     /// reply raced process teardown, and `yutani quit` could see EOF ("no
     /// reply") and exit 1 after a successful quit. The answer now comes
@@ -3177,7 +2767,7 @@ mod tests {
     fn quit_answers_from_the_task_that_exits_so_the_reply_is_written_first() {
         let app = app(Config::default());
         let (reply, mut rx) = ipc::Responder::detached();
-        let (how, _task) = app.quit(crate::tunnel::control::QuitPlan::ExitNow, &reply);
+        let (how, _task) = app.quit(&reply);
         assert!(matches!(how, Reply::Later), "answered in the same update as the exit");
         assert!(rx.try_recv().is_err(), "the reply must come from the task, not from this call");
     }

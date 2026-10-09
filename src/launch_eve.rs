@@ -464,19 +464,16 @@ mod tests {
         let l = started();
         let json = serde_json::to_string(l.state()).unwrap();
         assert_eq!(serde_json::from_str::<LaunchState>(&json).unwrap(), *l.state());
-        let mut v = serde_json::to_value(crate::tunnel::status::Status {
+        let mut v = serde_json::to_value(crate::status::Status {
             clients: vec![],
             hidden: false,
-            tunnel: Default::default(),
             shortcuts: None,
-            outputs: vec![],
             steam: vec![],
             launch: None,
-            direct_ping: Default::default(),
         })
         .unwrap();
         v.as_object_mut().unwrap().remove("launch");
-        let s: crate::tunnel::status::Status = serde_json::from_value(v).unwrap();
+        let s: crate::status::Status = serde_json::from_value(v).unwrap();
         assert_eq!(s.launch, None);
     }
 }

@@ -8,15 +8,13 @@ use cosmic::widget::{self, Column, Row};
 use cosmic::Element;
 
 use yutani::applet::Action;
-use yutani::applet::console::{AccountRow, Accounts, Console, ControlRow, Gauge, LaunchButton, Level, LogLine, Network, Step};
+use yutani::applet::console::{AccountRow, Accounts, Console, ControlRow, Gauge, LaunchButton, Level, LogLine, Step};
 use yutani::applet::fonts::{self, advance_em};
 use yutani::applet::menu::MenuRow;
-use yutani::applet::ping::{Quality, SPARK_H};
-use yutani::applet::sand::Drive;
 use yutani::applet::skin::{self, Ink, PrimaryLook, Type};
 
 use crate::app::{Applet, Msg, Note};
-use crate::widgets::{self, Direction};
+use crate::widgets;
 
 // ---- text ----------------------------------------------------------------------
 
@@ -37,14 +35,13 @@ fn t<'a>(text: impl AsRef<str>, ty: Type, color: Color) -> Element<'a, Msg> {
     Row::with_children(cells.collect::<Vec<Element<'a, Msg>>>()).align_y(Alignment::Center).into()
 }
 
-/// An arrow and its word, tracked: B612 Mono has no ▲ or ◄, so every
-/// arrow in the popover is drawn (a filled triangle, 0.6 × the text size
-/// square) rather than set as text.
-fn arrowed<'a>(dir: Direction, word: &'static str, ty: Type, color: Color) -> Element<'a, Msg> {
+/// A left arrow and its word, tracked: B612 Mono has no ◄, so the arrow
+/// is drawn (a filled triangle, 0.6 × the text size square) rather than
+/// set as text.
+fn arrowed<'a>(word: &'static str, ty: Type, color: Color) -> Element<'a, Msg> {
     let px = (ty.size * 0.6).ceil();
-    let arrow = layered(widgets::Arrow { direction: dir, color }, Length::Fixed(px), Length::Fixed(px));
-    let row = Row::new().spacing(4).align_y(Alignment::Center);
-    if dir == Direction::Down { row.push(t(word, ty, color)).push(arrow) } else { row.push(arrow).push(t(word, ty, color)) }.into()
+    let arrow = layered(widgets::Arrow { color }, Length::Fixed(px), Length::Fixed(px));
+    Row::new().spacing(4).align_y(Alignment::Center).push(arrow).push(t(word, ty, color)).into()
 }
 
 /// A canvas in a renderer layer of its own. On the panel's popup surface
@@ -176,7 +173,7 @@ fn control_row<'a>(r: &ControlRow) -> Element<'a, Msg> {
 }
 
 fn control<'a>(c: &Console) -> Element<'a, Msg> {
-    card(Column::new().width(Length::Fill).push(control_row(&c.control[0])).push(hairline(skin::HAIRLINE_INSET)).push(control_row(&c.control[1])), true)
+    card(control_row(&c.service), true)
 }
 
 // ---- 02 accounts ----------------------------------------------------------------------
@@ -197,7 +194,7 @@ fn account_row<'a>(r: &AccountRow) -> Element<'a, Msg> {
         .push(chip)
         .push(widget::container(t(r.name.clone(), skin::ACCOUNT_NAME, name_ink)).width(Length::Fill).clip(true));
     if r.focused {
-        row = row.push(arrowed(Direction::Left, "FOCUSED", skin::FOCUSED_TAG, skin::AMBER));
+        row = row.push(arrowed("FOCUSED", skin::FOCUSED_TAG, skin::AMBER));
     }
     widget::button::custom(centered(widget::container(row).padding(skin::ACCOUNT_ROW_PAD), Horizontal::Left))
         .width(Length::Fill)
@@ -219,107 +216,14 @@ fn accounts<'a>(c: &Console) -> Element<'a, Msg> {
             .into()
     };
     let body: Element<'a, Msg> = match &c.accounts {
-        Accounts::Stopped => empty("SERVICE STOPPED", skin::DIM, "THUMBNAILS, HOTKEYS AND TUNNEL ROUTING ARE INACTIVE.", skin::DIMMER),
+        Accounts::Stopped => empty("SERVICE STOPPED", skin::DIM, "THUMBNAILS AND HOTKEYS ARE INACTIVE.", skin::DIMMER),
         Accounts::Empty => empty("NO EVE CLIENTS RUNNING", skin::PHOSPHOR, "LAUNCH EVE BELOW — IT APPEARS HERE WITH THE NEXT FREE HOTKEY.", skin::DIM),
         Accounts::Rows(rows) => Column::with_children(rows.iter().map(account_row).collect::<Vec<_>>()).width(Length::Fill).spacing(1).padding(skin::ACCOUNT_LIST_PAD).into(),
     };
     card(body, true)
 }
 
-// ---- 03 network -------------------------------------------------------------------------
-
-fn readout<'a>(dir: Direction, word: &'static str, value: String, label_ink: Color, label_first: bool) -> Element<'a, Msg> {
-    let label = arrowed(dir, word, skin::READOUT_LABEL, label_ink);
-    let value = t(value, skin::READOUT, skin::WHITE);
-    let unit = t("KB/S", skin::UNIT, skin::DIM);
-    let row = Row::new().spacing(6).align_y(Alignment::Center);
-    if label_first { row.push(label).push(value).push(unit) } else { row.push(value).push(unit).push(label) }.into()
-}
-
-fn scope<'a>(n: &Network) -> Element<'a, Msg> {
-    let drive = Drive { live: n.live, up_kbps: n.up_kbps, down_kbps: n.down_kbps };
-    let top = Row::new()
-        .width(Length::Fill)
-        .push(readout(Direction::Up, "UPLINK", n.up.clone(), skin::AMBER, true))
-        .push(fill_x())
-        .push(readout(Direction::Down, "DOWNLINK", n.down.clone(), skin::PHOSPHOR, false));
-    let bottom = Row::new()
-        .width(Length::Fill)
-        .push(t(n.tx_total.clone(), skin::SCOPE_FOOT, skin::DIM))
-        .push(fill_x())
-        .push(t("SESSION", skin::SCOPE_FOOT, skin::DIM))
-        .push(fill_x())
-        .push(t(n.rx_total.clone(), skin::SCOPE_FOOT, skin::DIM));
-    let overlay = Column::new().width(Length::Fill).height(Length::Fill).padding([10.0, skin::SCOPE_INSET]).push(top).push(widget::space().height(Length::Fill)).push(bottom);
-    cosmic::iced::widget::stack([
-        layered(widgets::Scope { drive }, Length::Fill, Length::Fixed(skin::SCOPE_HEIGHT)),
-        overlay.into(),
-    ])
-    .width(Length::Fill)
-    .height(Length::Fixed(skin::SCOPE_HEIGHT))
-    .into()
-}
-
-fn quality_ink(q: Quality) -> Color {
-    match q {
-        Quality::Nominal => skin::PHOSPHOR,
-        Quality::Degraded => skin::AMBER,
-        Quality::Poor => skin::RED,
-        Quality::Idle => skin::DIMMER,
-    }
-}
-
-fn ping_row<'a>(n: &Network) -> Element<'a, Msg> {
-    let p = &n.ping;
-    let q = quality_ink(p.quality);
-    let left = Column::new()
-        .width(Length::Fixed(skin::PING_LEFT_W))
-        .spacing(2)
-        .push(t("PING · TQ", skin::READOUT_LABEL, skin::PHOSPHOR))
-        .push(Row::new().spacing(4).align_y(Alignment::End).push(t(p.value.clone(), skin::PING_VALUE, skin::WHITE)).push(t("MS", skin::UNIT, skin::DIM)))
-        .push(t(n.ping_note.clone(), skin::PING_STATS, skin::DIM));
-    let spark = widgets::Sparkline { dots: p.dots.clone(), avg_y: p.avg_y, color: q, live: n.live };
-    let middle = Column::new()
-        .width(Length::Fill)
-        .spacing(4)
-        .push(layered(spark, Length::Fill, Length::Fixed(SPARK_H)))
-        .push(t(p.stats.clone(), skin::PING_STATS, skin::DIM))
-        .push(t(p.jitter_loss.clone(), skin::PING_STATS, skin::DIM));
-    // The quality word alone on the right; JIT · LOSS sits under the
-    // MIN/AVG/MAX line instead. The handoff's three columns (64 · 240 · 74)
-    // do not fit a 360 px popover with three-digit pings: the sparkline was
-    // clipped and both stat lines wrapped. A fixed width, right-aligned,
-    // so NOMINAL → DEGRADED → IDLE does not reflow the sparkline.
-    let word = Row::new().spacing(6).align_y(Alignment::Center).push(t(p.quality.word(), skin::QUALITY_WORD, q)).push(led(q, false, 6.0));
-    let right = widget::container(word).width(Length::Fixed(skin::QUALITY_W)).align_x(Horizontal::Right);
-    Row::new().width(Length::Fill).padding(skin::ROW_PAD).spacing(skin::ROW_GAP).align_y(Alignment::Center).push(left).push(middle).push(right).into()
-}
-
-fn facts<'a>(n: &Network) -> Element<'a, Msg> {
-    Row::new()
-        .width(Length::Fill)
-        .padding(skin::FACTS_PAD)
-        .spacing(6)
-        .align_y(Alignment::Center)
-        .push(t("ENDPOINT", skin::FACTS_KEY, skin::PHOSPHOR))
-        .push(t(n.endpoint.clone(), skin::FACTS, skin::WHITE))
-        .push(t("·", skin::FACTS, skin::LINE_2))
-        .push(t("PEER", skin::FACTS_KEY, skin::PHOSPHOR))
-        .push(t(n.peer.clone(), skin::FACTS, skin::WHITE))
-        .push(fill_x())
-        .push(t(n.uptime.clone(), skin::FACTS, ink(n.uptime_ink)))
-        .into()
-}
-
-fn network<'a>(n: &Network) -> Element<'a, Msg> {
-    let mut col = Column::new().width(Length::Fill);
-    if n.scope {
-        col = col.push(scope(n)).push(hairline(0.0));
-    }
-    card(col.push(ping_row(n)).push(hairline(skin::HAIRLINE_INSET)).push(facts(n)), false)
-}
-
-// ---- 04 host --------------------------------------------------------------------------------
+// ---- 03 host --------------------------------------------------------------------------------
 
 fn gauge_row<'a>(g: &Gauge) -> Element<'a, Msg> {
     let lit_color = match g.level {
@@ -456,8 +360,7 @@ fn menu<'a>(running: bool) -> Element<'a, Msg> {
 }
 
 fn note_line<'a>(note: &Note) -> Element<'a, Msg> {
-    let color = if note.progress { skin::DIM } else { skin::RED };
-    widget::container(widget::text(note.text.to_uppercase()).size(skin::NOTICE.size).font(fonts::font(skin::NOTICE.face)).class(cosmic::theme::Text::Color(color)))
+    widget::container(widget::text(note.text.to_uppercase()).size(skin::NOTICE.size).font(fonts::font(skin::NOTICE.face)).class(cosmic::theme::Text::Color(skin::RED)))
         .width(Length::Fill)
         .padding(skin::pad(0.0, 14.0, 10.0, 14.0))
         .into()
@@ -488,9 +391,7 @@ pub fn popup(state: &Applet) -> Element<'_, Msg> {
         .push(control(&c))
         .push(section("02", c.accounts_label, count))
         .push(accounts(&c))
-        .push(section("03", "NETWORK", Some(t("EVE TRAFFIC ONLY", skin::SECTION_META, skin::DIM))))
-        .push(network(&c.network))
-        .push(section("04", "HOST", Some(t(c.host_meta.clone(), skin::SECTION_META, skin::DIM))))
+        .push(section("03", "HOST", Some(t(c.host_meta.clone(), skin::SECTION_META, skin::DIM))))
         .push(host(&c));
     if let Some(n) = &c.notice {
         col = col.push(notice(n));

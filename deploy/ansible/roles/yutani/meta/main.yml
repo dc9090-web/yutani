@@ -4,8 +4,8 @@ galaxy_info:
   namespace: yutani
   author: Yutani
   description: >-
-    Build, install and integrate Yutani (live EVE Online thumbnails, hotkeys,
-    panel applet and the EVE-only WireGuard tunnel) on a COSMIC desktop.
+    Build, install and integrate Yutani (live EVE Online thumbnails, hotkeys
+    and the panel applet) on a COSMIC desktop.
   license: MIT
   min_ansible_version: "2.15"
   platforms:
@@ -16,6 +16,5 @@ galaxy_info:
     - cosmic
     - desktop
     - eveonline
-    - wireguard
 
 dependencies: []

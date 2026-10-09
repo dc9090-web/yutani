@@ -1,5 +1,5 @@
 [Unit]
-Description=Yutani - EVE Online thumbnails, hotkeys and tunnel
+Description=Yutani - EVE Online thumbnails and hotkeys
 PartOf=graphical-session.target
 After=graphical-session.target
 # A crash loop (ten failures in a minute) stops rather than spinning.

@@ -139,10 +139,11 @@ pub enum Verdict {
     /// that does not exist, or a bare `yutani` not on PATH. Play fails in
     /// `/bin/sh` before Proton runs, with nothing on screen.
     Broken { path: String },
-    /// No `yutani launch --` at all: EVE starts outside the tunnel.
+    /// No `yutani launch --` at all: EVE starts without the present mode
+    /// that keeps a covered client drawing, so its thumbnail can freeze.
     NoWrapper,
     /// The line has an unbalanced double quote: `/bin/sh` fails on the
-    /// syntax error before EVE starts at all, not "outside the tunnel".
+    /// syntax error before EVE starts at all.
     Malformed,
 }
 
@@ -153,7 +154,7 @@ impl Verdict {
         match self {
             Verdict::Ok => None,
             Verdict::Broken { path } => Some(format!("Steam launches EVE through {path}, which is missing.")),
-            Verdict::NoWrapper => Some("Steam launches EVE without yutani, so it runs outside the tunnel.".to_string()),
+            Verdict::NoWrapper => Some("Steam launches EVE without yutani, so a covered client's thumbnail can freeze.".to_string()),
             Verdict::Malformed => {
                 Some("Steam's launch options for EVE have an unbalanced quote, so Play fails before EVE starts.".to_string())
             }
@@ -440,7 +441,7 @@ mod tests {
         );
         assert_eq!(
             Verdict::NoWrapper.message().as_deref(),
-            Some("Steam launches EVE without yutani, so it runs outside the tunnel.")
+            Some("Steam launches EVE without yutani, so a covered client's thumbnail can freeze.")
         );
         assert_eq!(
             Verdict::Malformed.message().as_deref(),

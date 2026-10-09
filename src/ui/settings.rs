@@ -18,7 +18,6 @@ use cosmic::widget::segmented_button;
 use cosmic::widget::{self, Column, Row};
 
 use yutani::eve_settings::names::Names;
-use yutani::tunnel::status::TunnelStatus;
 
 use crate::model::config::{Config, Edge, Mode, Modifier, Visibility, config_path, parse_color};
 use crate::model::layout;
@@ -31,7 +30,6 @@ pub enum Page {
     Behavior,
     Layouts,
     Characters,
-    Tunnel,
     Steam,
 }
 
@@ -44,7 +42,6 @@ impl Page {
             "behavior" | "behaviour" => Some(Page::Behavior),
             "layouts" => Some(Page::Layouts),
             "characters" => Some(Page::Characters),
-            "tunnel" => Some(Page::Tunnel),
             "steam" => Some(Page::Steam),
             _ => None,
         }
@@ -53,26 +50,20 @@ impl Page {
 
 /// The tab strip, in order. `State::new` builds the segmented control from
 /// this, so the list *is* the window: a page missing here has no tab.
-pub const PAGES: [(&str, Page); 6] = [
+pub const PAGES: [(&str, Page); 5] = [
     ("Display", Page::Display),
     ("Behavior", Page::Behavior),
     ("Layouts", Page::Layouts),
     ("Characters", Page::Characters),
-    ("Tunnel", Page::Tunnel),
     ("Steam", Page::Steam),
 ];
 
 /// Where a page sits in [`PAGES`], for the code that has to *select* a tab
-/// rather than render one (dropping a `.conf` on the window jumps to the
-/// Tunnel page). `None` for a page with no tab, which the page-order test
-/// forbids.
+/// rather than render one (`settings <page>` over IPC). `None` for a page
+/// with no tab, which the page-order test forbids.
 pub fn page_index(page: Page) -> Option<usize> {
     index_of(&PAGES, &page)
 }
-
-/// The settings window's drag-and-drop destination id (see `view`). Far
-/// above anything iced's widget-id counter reaches in a session.
-pub const SETTINGS_DROP_ID: u64 = 0x5955_5441_4E49_0001; // "YUTANI" + 1
 
 pub const MODES: [(&str, Mode); 2] = [("Floating", Mode::Floating), ("Dock", Mode::Dock)];
 pub const EDGES: [(&str, Edge); 4] =
@@ -192,15 +183,6 @@ pub fn copy_done_text(source: &str, characters: usize) -> String {
     format!("{source}’s settings copied to {n}. Restart any running client to see them.")
 }
 
-/// The sidebar's live sublabel for the Tunnel pane.
-pub fn tunnel_sublabel(status: Option<&TunnelStatus>) -> String {
-    match status {
-        Some(t) if t.installed && t.connected => format!("Connected · {}", t.location),
-        Some(t) if t.installed => "Installed · idle".to_string(),
-        _ => "Not installed".to_string(),
-    }
-}
-
 /// Everything the settings window owns. `None` on `App` while it is closed.
 pub struct State {
     pub window: SurfaceId,
@@ -238,12 +220,6 @@ pub struct State {
     pub characters: super::characters::State,
     /// The Characters pane's copy flow.
     pub copy_phase: CopyPhase,
-    /// The Tunnel page's own state (`super::tunnel_page`): the systemd unit
-    /// and `/etc/yutani`, not `config.ron`, so it is refreshed by
-    /// `App::refresh_tunnel`.
-    pub tunnel: super::tunnel_page::State,
-    /// The Tunnel pane's Uninstall… awaits its confirmation.
-    pub uninstall_confirm: bool,
     /// Steam: the Copy button reads "Copied" for 1.6 s.
     pub copied: bool,
     /// Steam: "Steam can't find yutani" — the command with the full path.
@@ -284,11 +260,6 @@ impl State {
             layout_error: None,
             characters: Default::default(),
             copy_phase: CopyPhase::Idle,
-            tunnel: super::tunnel_page::State {
-                can_browse: super::tunnel_page::CAN_BROWSE,
-                ..Default::default()
-            },
-            uninstall_confirm: false,
             copied: false,
             steam_full_path: false,
             exe_path,
@@ -326,7 +297,6 @@ impl State {
         self.renaming = None;
         self.confirm_delete = None;
         self.copy_phase = CopyPhase::Idle;
-        self.uninstall_confirm = false;
     }
 
     pub fn page(&self) -> Page {
@@ -397,36 +367,6 @@ pub enum Msg {
     ProfileDirChosen(Option<PathBuf>),
     /// A names lookup finished: what is known, and the error if any id is still unnamed.
     Names(Names, Option<String>),
-    /// Files dragged onto this window and dropped on it, decoded from the
-    /// drop's `text/uri-list`. The window's whole page is a drag-and-drop
-    /// destination ([`view`]): on Wayland a drop arrives through the
-    /// compositor's data device and nowhere else.
-    FilesDropped(Vec<PathBuf>),
-    /// Tunnel page: the `.conf` path field, as typed/browsed/dropped.
-    TunnelConfPath(String),
-    /// Tunnel page: open the XDG file chooser.
-    BrowseTunnelConf,
-    /// The file chooser answered (`None`: cancelled or unavailable).
-    TunnelConfChosen(Option<PathBuf>),
-    /// Tunnel page: install (or replace) the tunnel from the chosen file.
-    InstallTunnel,
-    /// Tunnel page: Uninstall… → the inline confirm.
-    AskUninstall,
-    CancelUninstall,
-    /// Tunnel page: remove the unit, the rules and `/etc/yutani`.
-    UninstallTunnel,
-    /// Tunnel page: `systemctl start`.
-    TunnelConnect,
-    /// Tunnel page: `systemctl stop`.
-    TunnelDisconnect,
-    /// Tunnel page: re-read the state now.
-    RefreshTunnel,
-    /// The tunnel's current state, re-read after every action and on open.
-    /// Boxed: `TunnelStatus` is much the largest thing a `Msg` could carry,
-    /// and every other variant would pay for it.
-    TunnelStatus(Box<TunnelStatus>),
-    /// An action finished: which one, and how it went.
-    TunnelDone(TunnelAction, Result<(), String>),
     /// The "Save current arrangement" field.
     Name(String),
     SaveAs,
@@ -455,16 +395,6 @@ pub fn centre_blocker(mode: Mode, thumbs_shown: bool) -> Option<&'static str> {
     } else {
         None
     }
-}
-
-/// The four things the Tunnel page can ask the daemon to do. Each runs the
-/// same function the CLI and the IPC requests run, on the blocking pool.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TunnelAction {
-    Install,
-    Uninstall,
-    Connect,
-    Disconnect,
 }
 
 /// The settings window: an ordinary xdg-toplevel. Undecorated because
@@ -588,11 +518,6 @@ pub fn view<'a>(
         // Nor is EVE's profile directory `config.ron`: this page copies
         // CCP's files and is just as usable while ours does not parse.
         (Page::Characters, _) => super::characters::view(state, clients_running),
-        // Nor is the tunnel `config.ron`: the page drives systemd units and
-        // `/etc/yutani`. It only *reads* `config.tunnel` for the DNS lines,
-        // and that is the in-memory (validated) config, so it works while
-        // the file on disk does not parse.
-        (Page::Tunnel, _) => super::tunnel_page::view(state, config),
         (_, Some(error)) => broken_config(error),
         (Page::Display, None) => display_page(state, config),
         (Page::Behavior, None) => behavior_page(config),
@@ -610,23 +535,6 @@ pub fn view<'a>(
         (None, None, Some(_)) => ui::mono("config.ron not written while unreadable", ui::SAVED, Weight::Normal, ui::Role::Warning),
         (None, None, None) => ui::mono("saved", ui::SAVED, Weight::Normal, ui::Role::Tertiary),
     };
-    // The whole window — header bar included, so a file let go anywhere
-    // on it lands — is the drop target for the Tunnel page's `.conf`
-    // (`tunnel_page::DroppedFiles` names the MIME types it takes). The
-    // destination widget hands every ordinary event to its child first,
-    // so the header bar's drag and close still work inside it. This —
-    // libcosmic's drag-and-drop destination widget, fed by the compositor's
-    // data device — is the only route a drop takes on Wayland;
-    // `iced::window::Event::FileDropped` is winit's X11/macOS/Windows
-    // event and never fires here. A drop the widget cannot decode arrives
-    // as `None`, i.e. no files, and changes nothing.
-    // The destination's id is pinned: the widget mints a fresh one on every
-    // `view`, and the compositor resolves a drop against the id it saw at
-    // the last pointer motion — with thumbnails redrawing at 30 fps the two
-    // would rarely match and the drop would be lost. And the drag is a
-    // COPY: this window records a path, it never takes the file, so a file
-    // manager that honours MOVE must not delete the user's only copy of the
-    // private key before Install has run.
     let window = widget::column::with_children(vec![
         widget::header_bar()
             .title("Yutani Settings")
@@ -637,16 +545,7 @@ pub fn view<'a>(
             .into(),
         split.into(),
     ]);
-    let dropzone: Element<'a, Msg> =
-        widget::dnd_destination::dnd_destination_for_data::<super::tunnel_page::DroppedFiles, _>(
-            window,
-            |data, _action| Msg::FilesDropped(data.map(|files| files.0).unwrap_or_default()),
-        )
-        .drag_id(SETTINGS_DROP_ID)
-        .action(cosmic::iced::clipboard::dnd::DndAction::Copy)
-        .preferred_action(cosmic::iced::clipboard::dnd::DndAction::Copy)
-        .into();
-    let content: Element<'a, Msg> = widget::container(dropzone)
+    let content: Element<'a, Msg> = widget::container(window)
         .class(cosmic::theme::Container::WindowBackground)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -666,7 +565,6 @@ fn sidebar<'a>(state: &'a State, config: &'a Config) -> Element<'a, Msg> {
             Page::Behavior => ("Behaviour", "Placement, keys".to_string()),
             Page::Layouts => ("Layouts", format!("{} saved", state.layouts.len())),
             Page::Characters => ("Characters", "Copy EVE settings".to_string()),
-            Page::Tunnel => ("Tunnel", tunnel_sublabel(state.tunnel.status.as_ref())),
             Page::Steam => ("Steam", "Launch options".to_string()),
         };
         items = items.push(ui::sidebar_item(name, sub, p == page, Msg::Page(entity)));
@@ -1151,8 +1049,6 @@ mod tests {
             layout_error: None,
             characters: Default::default(),
             copy_phase: CopyPhase::Idle,
-            tunnel: Default::default(),
-            uninstall_confirm: false,
             copied: false,
             steam_full_path: false,
             exe_path: "/usr/bin/yutani".to_string(),
@@ -1262,18 +1158,15 @@ mod tests {
 
     #[test]
     fn every_page_has_a_tab_in_the_documented_order() {
-        assert_eq!(labels(&PAGES), vec!["Display", "Behavior", "Layouts", "Characters", "Tunnel", "Steam"]);
+        assert_eq!(labels(&PAGES), vec!["Display", "Behavior", "Layouts", "Characters", "Steam"]);
         // The handoff's three frame rates and three prefixes are offered,
         // and each maps back into the full tables.
         assert_eq!(FPS_CHOICES.map(|i| FPS[i]), [15, 30, 60]);
         assert_eq!(PREFIX_CHOICES.map(|i| PREFIXES[i].0), ["Ctrl + Alt", "Super", "Ctrl + Shift"]);
-        for page in [Page::Display, Page::Behavior, Page::Layouts, Page::Characters, Page::Tunnel, Page::Steam] {
+        for page in [Page::Display, Page::Behavior, Page::Layouts, Page::Characters, Page::Steam] {
             assert!(page_index(page).is_some(), "{page:?}");
         }
         assert_eq!(page_index(Page::Characters), Some(page_index(Page::Layouts).unwrap() + 1));
-        // A `.conf` dropped on the window selects this tab by index, so the
-        // index has to be the one the tab strip actually has.
-        assert_eq!(page_index(Page::Tunnel), Some(page_index(Page::Characters).unwrap() + 1));
         assert_eq!(page_index(Page::Steam), Some(PAGES.len() - 1), "Steam stays last");
     }
 
@@ -1291,27 +1184,6 @@ mod tests {
         assert_eq!(apply_config_field(&mut c, &Msg::CopyCharacters), Ok(false));
         assert_eq!(apply_config_field(&mut c, &Msg::RestoreBackup), Ok(false));
         assert_eq!(apply_config_field(&mut c, &Msg::Names(Names::new(), None)), Ok(false));
-        // The Tunnel page drives systemd and `/etc/yutani`; not one of its
-        // messages is a `config.ron` field either, so none of them may
-        // report a config change (or be written back to the file).
-        assert_eq!(apply_config_field(&mut c, &Msg::FilesDropped(vec![PathBuf::from("/tmp/x.conf")])), Ok(false));
-        assert_eq!(apply_config_field(&mut c, &Msg::TunnelConfPath("/tmp/x.conf".into())), Ok(false));
-        assert_eq!(apply_config_field(&mut c, &Msg::BrowseTunnelConf), Ok(false));
-        assert_eq!(apply_config_field(&mut c, &Msg::TunnelConfChosen(None)), Ok(false));
-        assert_eq!(
-            apply_config_field(&mut c, &Msg::TunnelConfChosen(Some(PathBuf::from("/tmp/x.conf")))),
-            Ok(false)
-        );
-        assert_eq!(apply_config_field(&mut c, &Msg::InstallTunnel), Ok(false));
-        assert_eq!(apply_config_field(&mut c, &Msg::UninstallTunnel), Ok(false));
-        assert_eq!(apply_config_field(&mut c, &Msg::TunnelConnect), Ok(false));
-        assert_eq!(apply_config_field(&mut c, &Msg::TunnelDisconnect), Ok(false));
-        assert_eq!(apply_config_field(&mut c, &Msg::RefreshTunnel), Ok(false));
-        assert_eq!(apply_config_field(&mut c, &Msg::TunnelStatus(Box::default())), Ok(false));
-        for action in [TunnelAction::Install, TunnelAction::Uninstall, TunnelAction::Connect, TunnelAction::Disconnect] {
-            assert_eq!(apply_config_field(&mut c, &Msg::TunnelDone(action, Ok(()))), Ok(false));
-            assert_eq!(apply_config_field(&mut c, &Msg::TunnelDone(action, Err("no".into()))), Ok(false));
-        }
         assert_eq!(c, Config::default());
         assert!(!clears_note(&Msg::CopySteamArgs));
         assert!(!is_live_only(&Msg::CopySteamArgs));
@@ -1458,7 +1330,7 @@ mod tests {
 
     /// The handoff's copy, derived from real state: the frame-rate help,
     /// the shortcut chips from the prefix, the launch line, the confirm and
-    /// done sentences, the Tunnel sublabel.
+    /// done sentences.
     #[test]
     fn the_derived_copy_follows_the_handoff() {
         assert!(fps_help(60).starts_with("Smoothest"));
@@ -1477,14 +1349,6 @@ mod tests {
         );
         assert!(copy_confirm_text("A", 1, true).starts_with("This replaces the interface and account settings of 1 character with A’s."));
         assert_eq!(copy_done_text("Ishukone", 3), "Ishukone’s settings copied to 3 characters. Restart any running client to see them.");
-        let mut t = TunnelStatus::default();
-        assert_eq!(tunnel_sublabel(None), "Not installed");
-        assert_eq!(tunnel_sublabel(Some(&t)), "Not installed");
-        t.installed = true;
-        assert_eq!(tunnel_sublabel(Some(&t)), "Installed · idle");
-        t.connected = true;
-        t.location = "London".into();
-        assert_eq!(tunnel_sublabel(Some(&t)), "Connected · London");
     }
 
     /// Reset frame: the handoff's defaults, and the accent for the focused
@@ -1499,7 +1363,7 @@ mod tests {
         assert_eq!(c.eve_settings_dir.as_deref(), Some("/mnt/eve/settings_Default"));
         assert_eq!(apply_config_field(&mut c, &Msg::ProfileDirChosen(None)), Ok(false));
         // Transient UI messages are not config fields.
-        for m in [Msg::AskCopy, Msg::CancelCopy, Msg::AskUninstall, Msg::CancelUninstall, Msg::CopyReset, Msg::SteamFullPath(true), Msg::LayoutMenu("x".into()), Msg::LayoutCancel, Msg::CentreVertically] {
+        for m in [Msg::AskCopy, Msg::CancelCopy, Msg::CopyReset, Msg::SteamFullPath(true), Msg::LayoutMenu("x".into()), Msg::LayoutCancel, Msg::CentreVertically] {
             assert_eq!(apply_config_field(&mut c, &m), Ok(false));
         }
     }

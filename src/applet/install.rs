@@ -136,12 +136,12 @@ pub fn desktop_entry(exec: &str) -> String {
     format!(
         "[Desktop Entry]\n\
          Name=Yutani\n\
-         Comment=EVE Online clients and the WireGuard tunnel\n\
+         Comment=EVE Online clients\n\
          Type=Application\n\
          Exec={exec}\n\
          Terminal=false\n\
          Categories=COSMIC;\n\
-         Keywords=COSMIC;Applet;EVE;WireGuard;VPN;Yutani;\n\
+         Keywords=COSMIC;Applet;EVE;Yutani;\n\
          Icon={SYMBOLIC_NAME}\n\
          StartupNotify=true\n\
          NoDisplay=true\n\

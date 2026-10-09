@@ -15,15 +15,9 @@ use cosmic::surface::action::{app_popup, destroy_popup};
 
 use yutani::applet::client::{self, IpcError};
 use yutani::applet::console::{Console, Inputs, console};
-use yutani::applet::console::degrade;
 use yutani::applet::host::{HostReading, HostSampler, Sources};
-use yutani::applet::ping::{self, PingWindow};
-use yutani::applet::rate::{Rates, Sampler};
-use yutani::applet::{
-    Action, PENDING_S, Poll, clip_note, note_visible, pending_done, poll_interval, start_command,
-    still_pending, waiting_note,
-};
-use yutani::tunnel::status::Status;
+use yutani::applet::{Action, PENDING_S, Poll, clip_note, note_visible, poll_interval, start_command, still_pending};
+use yutani::status::Status;
 
 use crate::view;
 
@@ -33,56 +27,31 @@ pub struct Applet {
     pub popup: Option<Id>,
     /// The daemon's last `status` reply; `None` is the offline state.
     pub status: Option<Status>,
-    pub rates: Rates,
-    pub sampler: Sampler,
-    /// Monotonic base for the rate sampler and the note timer.
+    /// Monotonic base for the note timer.
     pub started: Instant,
-    /// A `tunnel connect|disconnect` is in flight (icon shows sync):
-    /// `(the state it asked for, the deadline it gives up at)`.
-    pub pending: Option<(bool, Instant)>,
     /// At most one `status` request outstanding, with at most one deferred
     /// behind it. See [`Poll`].
     pub poll: Poll,
-    /// A `quit` was acknowledged: every `status` until the daemon is gone
-    /// (or this deadline passes) describes a tunnel on its way down, so it
-    /// is degraded rather than believed. See `Msg::Done(Action::Quit, ..)`.
+    /// A `quit` was acknowledged: the service rocker shows pending until
+    /// the daemon is gone or this deadline passes.
     pub quitting: Option<Instant>,
     /// The `⋯` overflow menu is showing; closes with the popup.
     pub menu_open: bool,
-    /// The last `err …` reply, shown for 3 s — or what a tunnel action is
-    /// still doing, shown until the daemon answers it.
+    /// The last `err …` reply, shown for 3 s.
     pub note: Option<Note>,
     /// The HOST card's sampler, read at 1 Hz while the popover is open.
     pub host: HostSampler,
     pub host_reading: HostReading,
-    /// Ping samples, fed by the worker's probe.
-    pub ping: PingWindow,
-    /// The probe sequence last seen and when it last moved: a sequence
-    /// that stands still for `ping::STALE_AFTER` (a paused, frozen or
-    /// killed probe) clears the window, so the row reads IDLE.
-    pub ping_seen: Option<(u64, Instant)>,
-    /// The daemon's direct (not tunnelled) probe, kept the same way.
-    pub direct_ping: PingWindow,
-    pub direct_seen: Option<(u64, Instant)>,
-    /// Session totals `(rx, tx)`: the counters while connected, frozen
-    /// otherwise.
-    pub totals: (u64, u64),
     /// "Start" was pressed: the service rocker shows pending until a
     /// status reply arrives or this deadline passes.
     pub starting: Option<Instant>,
 }
 
-/// A one-line note under the action row (spec §7): what went wrong, when it
-/// was said, and which action it belongs to. `action` is `None` for a failed
-/// poll, which belongs to no row and sits at the foot of the menu instead.
-/// A `progress` note is not an error but what a slow action is doing while
-/// it is awaited (`waiting_note`); it is muted rather than red and lives
-/// until the action's reply replaces or clears it, not for `NOTE_MS`.
+/// A one-line note under the action row (spec §7): what went wrong and
+/// when it was said.
 pub struct Note {
     pub text: String,
     pub at_ms: u64,
-    pub action: Option<Action>,
-    pub progress: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -206,43 +175,9 @@ impl Applet {
         self.started.elapsed().as_millis() as u64
     }
 
-    /// True while a connect/disconnect is still settling (spec §3): until
-    /// the daemon reports the state that was asked for, or the deadline
-    /// runs out, whichever comes first.
-    pub fn pending(&self) -> bool {
-        let observed = self.status.as_ref().is_some_and(|s| s.tunnel.connected);
-        self.pending
-            .is_some_and(|(want, until)| still_pending(until, Instant::now(), pending_done(want, observed)))
-    }
-
-    /// The panel's own output (the daemon lists them all); the height
-    /// left for the popover is that output's minus the panel strip.
-    pub fn available(&self) -> Option<i32> {
-        self.status.as_ref().and_then(|s| {
-            let mine = &self.core.applet.output_name;
-            s.outputs
-                .iter()
-                .find(|o| &o.name == mine)
-                .map(|o| o.height)
-                .or_else(|| s.outputs.iter().map(|o| o.height).filter(|h| *h > 0).min())
-                .map(|h| h - PANEL_RESERVE)
-        })
-    }
-
     pub fn console(&self) -> Console {
-        let available = self.available();
         let starting = self.starting.is_some_and(|until| Instant::now() < until);
-        let inputs = Inputs {
-            rates: self.rates,
-            totals: self.totals,
-            host: &self.host_reading,
-            ping: &self.ping,
-            direct_ping: &self.direct_ping,
-            tunnel_pending: self.pending.filter(|_| self.pending()).map(|(want, _)| want),
-            service_pending: starting || self.quitting.is_some(),
-            available,
-            menu_open: self.menu_open,
-        };
+        let inputs = Inputs { host: &self.host_reading, service_pending: starting || self.quitting.is_some() };
         console(self.status.as_ref(), &inputs)
     }
 
@@ -258,53 +193,20 @@ impl Applet {
         cosmic::task::future(async { Msg::Status(client::status().await) })
     }
 
-    /// Take the probe's newest sample if its sequence moved; if it has
-    /// stood still for longer than `ping::STALE_AFTER`, clear the window.
-    fn take_ping(&mut self, seq: u64, rtt_us: Option<u32>, now: Instant) {
-        take_sample(&mut self.ping, &mut self.ping_seen, seq, rtt_us, now);
-    }
-
-    fn forget_ping(&mut self) {
-        self.ping.clear();
-        self.ping_seen = None;
-    }
-
-    fn forget_direct_ping(&mut self) {
-        self.direct_ping.clear();
-        self.direct_seen = None;
-    }
-
     /// A `status` reply landed: release the guard, and issue whatever was
     /// deferred behind it.
     fn replied(&mut self) -> Task<Msg> {
         if self.poll.replied() { Self::status_task() } else { Task::none() }
     }
 
-    fn note(&mut self, text: String, action: Option<Action>) {
+    fn note(&mut self, text: String) {
         let at_ms = self.now_ms();
-        self.note = Some(Note { text: clip_note(&text), at_ms, action, progress: false });
+        self.note = Some(Note { text: clip_note(&text), at_ms });
     }
 
-    /// Say what `action` is doing while its reply is awaited, if it is one
-    /// of the slow ones.
-    fn waiting(&mut self, action: Action) {
-        if let Some(text) = waiting_note(action) {
-            let at_ms = self.now_ms();
-            self.note = Some(Note { text, at_ms, action: Some(action), progress: true });
-        }
-    }
-
-    /// The reply to `action` is in: whatever it said, the wait is over.
-    fn done_waiting(&mut self, action: Action) {
-        if self.note.as_ref().is_some_and(|n| n.progress && n.action == Some(action)) {
-            self.note = None;
-        }
-    }
-
-    /// The note the menu shows right now: an error for `NOTE_MS` after it
-    /// was set, a progress note for as long as it is there.
+    /// The note the menu shows right now: for `NOTE_MS` after it was set.
     pub fn visible_note(&self) -> Option<&Note> {
-        self.note.as_ref().filter(|n| n.progress || note_visible(n.at_ms, self.now_ms()))
+        self.note.as_ref().filter(|n| note_visible(n.at_ms, self.now_ms()))
     }
 }
 
@@ -329,21 +231,13 @@ impl cosmic::Application for Applet {
             core,
             popup: None,
             status: None,
-            rates: Rates::default(),
-            sampler: Sampler::default(),
             started: Instant::now(),
-            pending: None,
             poll: Poll::default(),
             quitting: None,
             menu_open: false,
             note: None,
             host: HostSampler::new(Sources::discover()),
             host_reading: HostReading::default(),
-            ping: PingWindow::default(),
-            ping_seen: None,
-            direct_ping: PingWindow::default(),
-            direct_seen: None,
-            totals: (0, 0),
             starting: None,
         };
         // Through the guard like every other poll, so the very first reply
@@ -375,76 +269,24 @@ impl cosmic::Application for Applet {
                 }
                 if self.poll.tick() { Self::status_task() } else { Task::none() }
             }
-            Msg::Status(Ok(mut status)) => {
-                // The daemon is still answering while it winds down after
-                // a quit, and says "Connected" until the iface is gone.
-                if let Some(until) = self.quitting {
-                    if still_pending(until, Instant::now(), false) {
-                        degrade(&mut status);
-                    } else {
-                        self.quitting = None;
-                    }
-                }
-                let live = status.tunnel.connected;
-                take_sample(&mut self.direct_ping, &mut self.direct_seen, status.direct_ping.seq, status.direct_ping.rtt_us, Instant::now());
-                if live {
-                    self.take_ping(status.tunnel.ping_seq, status.tunnel.ping_us, Instant::now());
-                } else {
-                    self.forget_ping();
-                }
-                if live {
-                    self.totals = (status.tunnel.rx_bytes, status.tunnel.tx_bytes);
+            Msg::Status(Ok(status)) => {
+                // The daemon still answers while it winds down after a
+                // quit; the rocker stays pending until it is gone, or
+                // until the deadline says it is not going.
+                if self.quitting.is_some_and(|until| !still_pending(until, Instant::now(), false)) {
+                    self.quitting = None;
                 }
                 self.starting = None;
-                if live {
-                    let now = self.now_ms();
-                    self.rates =
-                        self.sampler.push(status.tunnel.rx_bytes, status.tunnel.tx_bytes, now);
-                } else {
-                    // Counters freeze and rates read zero while down; the
-                    // next connect must not show one huge catch-up spike.
-                    self.sampler.reset();
-                    self.rates = Rates::default();
-                }
-                // The deadline is the upper bound; the daemon agreeing ends
-                // it sooner, which is the common case.
-                if let Some((want, until)) = self.pending
-                    && !still_pending(until, Instant::now(), pending_done(want, live))
-                {
-                    self.pending = None;
-                }
                 self.status = Some(status);
                 after_reply
             }
             Msg::Status(Err(IpcError::Offline)) => {
                 self.status = None;
-                self.forget_ping();
-                self.forget_direct_ping();
-                self.sampler.reset();
-                self.rates = Rates::default();
-                self.pending = None;
                 self.quitting = None;
-                // The rows a wait sits under are gone with the daemon; its
-                // reply still comes, and finds nothing to clear.
-                if self.note.as_ref().is_some_and(|n| n.progress) {
-                    self.note = None;
-                }
                 after_reply
             }
             Msg::Status(Err(IpcError::Failed(msg))) => {
-                // A failed poll after a success keeps the last totals
-                // (spec §7) — they are counters — but the reply is stale,
-                // so it must stop claiming a live tunnel and live rates.
-                if let Some(status) = self.status.as_mut() {
-                    degrade(status);
-                }
-                self.sampler.reset();
-                self.rates = Rates::default();
-                // A wait that is still on outranks a poll error: its reply
-                // is what ends it, and it must find its own note to clear.
-                if !self.note.as_ref().is_some_and(|n| n.progress) {
-                    self.note(msg, None);
-                }
+                self.note(msg);
                 after_reply
             }
             Msg::ToggleMenu => {
@@ -466,7 +308,7 @@ impl cosmic::Application for Applet {
                     ])
                 }
                 Err(err) => {
-                    self.note(format!("cannot start yutani: {err}"), Some(Action::StartDaemon));
+                    self.note(format!("cannot start yutani: {err}"));
                     Task::none()
                 }
             },
@@ -474,46 +316,24 @@ impl cosmic::Application for Applet {
                 let Some(request) = action.request() else {
                     return Task::none();
                 };
-                if matches!(action, Action::Connect | Action::Disconnect) {
-                    let want = matches!(action, Action::Connect);
-                    self.pending = Some((want, Instant::now() + Duration::from_secs(PENDING_S)));
-                }
-                self.waiting(action);
                 cosmic::task::future(async move {
                     let result =
                         client::send(request).await.map(|_| ()).map_err(|err| err.to_string());
                     Msg::Done(action, result)
                 })
             }
-            // The daemon acknowledges `quit` immediately but may spend up
-            // to ~10 s stopping the tunnel before it goes away, so `status`
-            // keeps answering — and keeps saying "Connected" — the whole
-            // time. The tunnel is on its way down, so say so now rather
-            // than showing a live link that no longer has an owner, and
-            // keep saying so through the polls that follow (`quitting`)
-            // until the socket is gone — or, should the daemon never go,
-            // for as long as it is given to stop.
+            // The daemon acknowledges `quit` at once but keeps answering
+            // while it winds down; the rocker shows that (`quitting`).
             Msg::Done(Action::Quit, Ok(())) => {
-                if let Some(status) = self.status.as_mut() {
-                    degrade(status);
-                }
                 self.quitting = Some(Instant::now() + Duration::from_secs(PENDING_S));
-                self.sampler.reset();
-                self.rates = Rates::default();
                 self.poll()
             }
-            Msg::Done(action, Ok(())) => {
-                self.done_waiting(action);
-                self.poll()
-            }
+            Msg::Done(_, Ok(())) => self.poll(),
             Msg::Done(action, Err(msg)) => {
                 if action == Action::StartDaemon {
                     self.starting = None;
                 }
-                if matches!(action, Action::Connect | Action::Disconnect) {
-                    self.pending = None;
-                }
-                self.note(msg, Some(action));
+                self.note(msg);
                 self.poll()
             }
             // Opening the popup polls at once: the timer's first tick after
@@ -562,11 +382,6 @@ impl cosmic::Application for Applet {
     }
 }
 
-/// What the panel strip and the popup's own offset take from the output's
-/// height before the popover gets any of it: the largest panel size plus
-/// its paddings and the 4 px popup offset, rounded up.
-pub const PANEL_RESERVE: i32 = 80;
-
 /// Open the popup under the panel button. `bounds` and `offset` come from
 /// the button's own `on_press_with_rectangle`, which is the only way to
 /// learn where the button sits on the panel surface.
@@ -608,31 +423,12 @@ pub fn close_popup_message(id: Id) -> Msg {
     Msg::Surface(destroy_popup(id))
 }
 
-/// Take a probe's newest sample into `window` if its sequence moved; if
-/// it has stood still for longer than `ping::STALE_AFTER`, clear the window.
-fn take_sample(window: &mut PingWindow, seen: &mut Option<(u64, Instant)>, seq: u64, rtt_us: Option<u32>, now: Instant) {
-    if seq == 0 {
-        return; // no probe has run yet
-    }
-    match *seen {
-        Some((last, at)) if last == seq => {
-            if ping::stale(Some(at), now) {
-                window.clear();
-            }
-        }
-        _ => {
-            *seen = Some((seq, now));
-            window.push_seq(seq, rtt_us.map(|us| us as f32 / 1000.0));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use cosmic::Application as _;
     use yutani::applet::{NOTE_MAX_CHARS, NOTE_MS};
-    use yutani::tunnel::status::Status;
+    use yutani::status::Status;
 
     /// How many of this process's children `/proc` currently lists as
     /// zombies (state `Z`) — i.e. exited but not yet `wait`ed on.
@@ -784,104 +580,46 @@ mod tests {
     #[test]
     fn opening_the_popup_polls_at_once_and_closing_it_does_not() {
         let mut applet = applet();
-        let _ = applet.update(Msg::Status(Ok(connected())));
+        let _ = applet.update(Msg::Status(Ok(running())));
         assert!(!applet.poll.in_flight(), "init's poll has been answered");
 
         let bounds = Rectangle { x: 0.0, y: 0.0, width: 10.0, height: 10.0 };
         let _ = applet.update(open_popup_message(bounds, cosmic::iced::Vector::default()));
         assert!(applet.poll.in_flight(), "a poll goes out with the open");
 
-        let _ = applet.update(Msg::Status(Ok(connected())));
+        let _ = applet.update(Msg::Status(Ok(running())));
         let id = Id::unique();
         applet.popup = Some(id);
         let _ = applet.update(close_popup_message(id));
         assert!(!applet.poll.in_flight(), "closing polls nothing");
     }
 
-    fn connected() -> Status {
-        use yutani::tunnel::status::{Status, TunnelStatus};
-        let tunnel = TunnelStatus { installed: true, connected: true, handshake_age_s: Some(4), ..Default::default() };
-        Status { clients: vec![], hidden: false, tunnel, shortcuts: None, outputs: Vec::new(), steam: Vec::new(), launch: None, direct_ping: Default::default() }
+    fn running() -> Status {
+        Status { clients: vec![], hidden: false, shortcuts: None, steam: Vec::new(), launch: None }
     }
 
-    /// Each new probe becomes one sample; a repeated sequence adds nothing;
-    /// a dropped tunnel clears the window.
+    /// `quit` is acknowledged at once but the daemon keeps answering while
+    /// it winds down: the rocker stays pending through those polls, until
+    /// the daemon is gone.
     #[test]
-    fn ping_samples_follow_the_probe_sequence() {
+    fn a_quit_stays_pending_until_the_daemon_is_gone() {
         let mut applet = applet();
-        let mut s = connected();
-        s.tunnel.ping_us = Some(360_000);
-        s.tunnel.ping_seq = 1;
-        let _ = applet.update(Msg::Status(Ok(s.clone())));
-        let _ = applet.update(Msg::Status(Ok(s.clone())));
-        assert_eq!(applet.ping.summary(true).value, "360");
-        s.tunnel.ping_us = None;
-        s.tunnel.ping_seq = 2;
-        let _ = applet.update(Msg::Status(Ok(s.clone())));
-        assert!(applet.ping.summary(true).jitter_loss.ends_with("LOSS 50.0%"), "{}", applet.ping.summary(true).jitter_loss);
-        s.tunnel.connected = false;
-        let _ = applet.update(Msg::Status(Ok(s)));
-        assert_eq!(applet.ping.summary(true).quality, yutani::applet::ping::Quality::Idle, "cleared: no samples");
-    }
-
-    /// A sequence that stands still for more than 5 s (the probe paused for
-    /// want of a lease, or froze) clears the window: the row reads IDLE,
-    /// and the next new probe starts it again.
-    #[test]
-    fn a_stalled_probe_sequence_clears_the_window() {
-        let mut applet = applet();
-        let mut s = connected();
-        s.tunnel.ping_us = Some(360_000);
-        s.tunnel.ping_seq = 5;
-        let _ = applet.update(Msg::Status(Ok(s.clone())));
-        let _ = applet.update(Msg::Status(Ok(s.clone())));
-        assert_eq!(applet.ping.summary(true).value, "360", "a repeat within 5 s keeps the window");
-        let (seq, at) = applet.ping_seen.unwrap();
-        applet.ping_seen = Some((seq, at - Duration::from_millis(5_100)));
-        let _ = applet.update(Msg::Status(Ok(s.clone())));
-        let idle = applet.ping.summary(true);
-        assert_eq!((idle.quality, idle.dots.len()), (yutani::applet::ping::Quality::Idle, 0));
-        // Still the same seq: stays cleared rather than re-taking the old sample.
-        let _ = applet.update(Msg::Status(Ok(s.clone())));
-        assert!(applet.ping.summary(true).dots.is_empty());
-        s.tunnel.ping_seq = 6;
-        let _ = applet.update(Msg::Status(Ok(s)));
-        assert_eq!(applet.ping.summary(true).value, "360", "a new probe starts a fresh window");
-    }
-
-    /// M1: `quit` is acknowledged at once but the daemon spends up to 10 s
-    /// stopping the tunnel and answers `status` with "Connected" the whole
-    /// time — so the degrade on Quit must hold across those polls, not be
-    /// undone by the very poll it issues, until the daemon is gone.
-    #[test]
-    fn the_quit_degrade_holds_until_the_daemon_is_gone() {
-        let mut applet = applet();
-        let _ = applet.update(Msg::Status(Ok(connected())));
-        assert!(applet.status.as_ref().unwrap().tunnel.connected);
-
+        let _ = applet.update(Msg::Status(Ok(running())));
         let _ = applet.update(Msg::Done(Action::Quit, Ok(())));
-        assert!(!applet.status.as_ref().unwrap().tunnel.connected, "said to be going down at once");
-        let _ = applet.update(Msg::Status(Ok(connected())));
-        assert!(!applet.status.as_ref().unwrap().tunnel.connected, "and still, while the daemon winds down");
-        assert!(applet.status.as_ref().unwrap().tunnel.handshake_age_s.is_none());
-
+        let _ = applet.update(Msg::Status(Ok(running())));
+        assert_eq!(applet.console().service.rocker, yutani::applet::console::RockerState::Pending);
         let _ = applet.update(Msg::Status(Err(IpcError::Offline)));
-        assert!(applet.status.is_none());
-        // A daemon started afresh is believed again.
-        let _ = applet.update(Msg::Status(Ok(connected())));
-        assert!(applet.status.as_ref().unwrap().tunnel.connected, "the quit is over once the daemon was gone");
+        assert!(applet.status.is_none() && applet.quitting.is_none());
     }
 
-    /// M1: a daemon that never goes away (a quit it did not act on) is
-    /// believed again after the same 10 s bound the sync icon uses.
+    /// A daemon that never goes away (a quit it did not act on) is believed
+    /// again after `PENDING_S`.
     #[test]
-    fn the_quit_degrade_gives_up_after_the_daemon_stop_timeout() {
+    fn a_quit_gives_up_after_the_deadline() {
         let mut applet = applet();
-        let _ = applet.update(Msg::Status(Ok(connected())));
         let _ = applet.update(Msg::Done(Action::Quit, Ok(())));
         applet.quitting = Some(Instant::now() - Duration::from_secs(1));
-        let _ = applet.update(Msg::Status(Ok(connected())));
-        assert!(applet.status.as_ref().unwrap().tunnel.connected);
+        let _ = applet.update(Msg::Status(Ok(running())));
         assert!(applet.quitting.is_none());
     }
 
@@ -893,91 +631,8 @@ mod tests {
         let long = "malformed reply ".to_string() + &"x".repeat(2_000);
         let _ = applet.update(Msg::Status(Err(IpcError::Failed(long.clone()))));
         assert_eq!(applet.note.as_ref().unwrap().text.chars().count(), NOTE_MAX_CHARS + 1);
-        let _ = applet.update(Msg::Done(Action::Connect, Err(long)));
+        let _ = applet.update(Msg::Done(Action::Launch, Err(long)));
         assert_eq!(applet.note.as_ref().unwrap().text.chars().count(), NOTE_MAX_CHARS + 1);
-    }
-
-    /// I2: a connect/disconnect can take up to 15 s to be answered, so the
-    /// menu says what is happening under the row the whole time — a note
-    /// that, unlike an error, does not expire after `NOTE_MS` — and the
-    /// daemon's answer replaces it: nothing on success, the error on failure.
-    #[test]
-    fn a_tunnel_press_says_what_is_happening_until_the_daemon_answers() {
-        let mut applet = applet();
-        let _ = applet.update(Msg::Press(Action::Connect));
-        let note = applet.note.as_ref().expect("a waiting note");
-        assert_eq!(note.action, Some(Action::Connect));
-        assert!(note.progress, "waiting, not an error");
-        assert!(note.text.contains("onnecting"), "{}", note.text);
-        assert!(applet.visible_note().is_some(), "shown at once");
-        // Well past NOTE_MS, still waiting: still shown, and a tick keeps it.
-        applet.started = Instant::now() - Duration::from_millis(NOTE_MS * 3);
-        let _ = applet.update(Msg::Tick);
-        assert!(applet.visible_note().is_some(), "a waiting note does not expire");
-
-        let _ = applet.update(Msg::Done(Action::Connect, Ok(())));
-        assert!(applet.note.is_none(), "the answer ends the wait");
-
-        let _ = applet.update(Msg::Press(Action::Disconnect));
-        assert!(applet.note.as_ref().is_some_and(|n| n.progress && n.text.contains("isconnecting")));
-        let _ = applet.update(Msg::Done(Action::Disconnect, Err("timeout after 15000ms".into())));
-        let note = applet.note.as_ref().expect("the error replaces the wait");
-        assert!(!note.progress);
-        assert_eq!(note.action, Some(Action::Disconnect));
-        assert!(note.text.contains("timeout"), "{}", note.text);
-    }
-
-    /// A poll that fails while a connect is in flight (a 3 s status
-    /// timeout, a `socket_path` error) must not replace "connecting…" with
-    /// its own error: the wait is still on, and the daemon's answer would
-    /// then find no progress note to clear and leave the red poll error
-    /// standing. With no wait on, the poll error is shown as before.
-    #[test]
-    fn a_failed_poll_does_not_overwrite_a_progress_note() {
-        let mut applet = applet();
-        let _ = applet.update(Msg::Press(Action::Connect));
-        let _ = applet.update(Msg::Status(Err(IpcError::Failed("timeout after 3000ms".into()))));
-        let note = applet.note.as_ref().expect("still waiting");
-        assert!(note.progress, "the poll error must not replace the wait: {}", note.text);
-        assert_eq!(note.action, Some(Action::Connect));
-        let _ = applet.update(Msg::Done(Action::Connect, Ok(())));
-        assert!(applet.note.is_none(), "the answer ends the wait");
-
-        let _ = applet.update(Msg::Status(Err(IpcError::Failed("timeout after 3000ms".into()))));
-        let note = applet.note.as_ref().expect("a poll error with nothing in flight is shown");
-        assert!(!note.progress && note.action.is_none(), "{}", note.text);
-    }
-
-    /// Quit pressed while a connect is still running: the daemon goes, the
-    /// polls go Offline and the menu collapses to "Start Yutani" — which
-    /// must not keep "connecting…" at its foot with no row to belong to.
-    #[test]
-    fn going_offline_clears_a_progress_note() {
-        let mut applet = applet();
-        let _ = applet.update(Msg::Status(Ok(connected())));
-        let _ = applet.update(Msg::Press(Action::Connect));
-        assert!(applet.note.as_ref().is_some_and(|n| n.progress));
-        let _ = applet.update(Msg::Status(Err(IpcError::Offline)));
-        assert!(applet.note.is_none(), "no row owns the wait once the daemon is gone");
-    }
-
-    /// Totals are the counters while connected and freeze — not reset —
-    /// when the tunnel or the service goes away.
-    #[test]
-    fn session_totals_freeze_when_the_tunnel_goes_down() {
-        let mut applet = applet();
-        let mut s = connected();
-        s.tunnel.rx_bytes = 5_000_000;
-        s.tunnel.tx_bytes = 1_000_000;
-        let _ = applet.update(Msg::Status(Ok(s.clone())));
-        assert_eq!(applet.totals, (5_000_000, 1_000_000));
-        s.tunnel.connected = false;
-        s.tunnel.rx_bytes = 0;
-        s.tunnel.tx_bytes = 0;
-        let _ = applet.update(Msg::Status(Ok(s)));
-        assert_eq!(applet.totals, (5_000_000, 1_000_000));
-        let _ = applet.update(Msg::Status(Err(IpcError::Offline)));
-        assert_eq!(applet.totals, (5_000_000, 1_000_000));
     }
 
     /// Starting the service shows the pending rocker until a status reply
@@ -987,8 +642,8 @@ mod tests {
         let mut applet = applet();
         let _ = applet.update(Msg::Status(Err(IpcError::Offline)));
         applet.starting = Some(Instant::now() + Duration::from_secs(PENDING_S));
-        assert!(applet.console().control[0].rocker == yutani::applet::console::RockerState::Pending);
-        let _ = applet.update(Msg::Status(Ok(connected())));
+        assert!(applet.console().service.rocker == yutani::applet::console::RockerState::Pending);
+        let _ = applet.update(Msg::Status(Ok(running())));
         assert!(applet.starting.is_none());
     }
 

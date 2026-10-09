@@ -9,28 +9,12 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::ipc::{MAX_REPLY, Request, Response, socket_path};
-use crate::tunnel::status::Status;
+use crate::status::Status;
 
 /// Budget for one full round trip (connect + write + reply). A daemon that
 /// accepts the connection but never answers would otherwise hang the
 /// applet's poll task forever.
 pub const IPC_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Budget for `tunnel connect|disconnect`. The daemon answers those only
-/// once its `systemctl start|stop yutani-tunnel` has returned, and the
-/// unit's own `TimeoutStopSec` is 10 s (a wedged worker is SIGKILLed then),
-/// so the `status` budget would give up — and show a timeout under the row
-/// — on an action that is in fact succeeding.
-pub const TUNNEL_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// The round-trip budget for `request`: [`TUNNEL_TIMEOUT`] for the two
-/// tunnel actions, [`IPC_TIMEOUT`] for everything else.
-pub fn budget(request: &Request) -> Duration {
-    match request {
-        Request::TunnelConnect | Request::TunnelDisconnect => TUNNEL_TIMEOUT,
-        _ => IPC_TIMEOUT,
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IpcError {
@@ -108,7 +92,7 @@ async fn send_to_inner(path: &Path, request: &Request) -> Result<Option<String>,
 /// `send_to` against `$XDG_RUNTIME_DIR/yutani.sock`, with the request's
 /// own [`budget`].
 pub async fn send(request: Request) -> Result<Option<String>, IpcError> {
-    send_to_with(&socket_path().map_err(|err| IpcError::Failed(err.to_string()))?, &request, budget(&request)).await
+    send_to_with(&socket_path().map_err(|err| IpcError::Failed(err.to_string()))?, &request, IPC_TIMEOUT).await
 }
 
 /// The `status` request, parsed. Takes an owned path so the future is
@@ -127,7 +111,7 @@ pub async fn status() -> Result<Status, IpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tunnel::status::{ClientStatus, Status, TunnelStatus};
+    use crate::status::{ClientStatus, Status};
 
     /// A current-thread runtime; `#[tokio::test]` would need the `macros`
     /// feature (and a new lock entry), which this crate does not have.
@@ -192,26 +176,8 @@ mod tests {
             clients: vec![ClientStatus { name: "KestrelVance".into(), active: true }],
             hidden: false,
             shortcuts: None,
-            outputs: Vec::new(),
             steam: Vec::new(),
             launch: None,
-            direct_ping: Default::default(),
-            tunnel: TunnelStatus {
-                installed: true,
-                connected: true,
-                iface: "yutani0".into(),
-                location: "London".into(),
-                address: Some("10.2.0.2".into()),
-                endpoint: Some("198.51.100.10:51820".into()),
-                handshake_age_s: Some(21),
-                up_for_s: None,
-                failed: false,
-                exit_address: None,
-                ping_us: None,
-                ping_seq: 0,
-                rx_bytes: 413_100_000,
-                tx_bytes: 2_790_000_000,
-            },
         }
     }
 
@@ -237,8 +203,6 @@ mod tests {
         let status = got.1.unwrap();
         assert_eq!(status.clients[0].name, "KestrelVance");
         assert!(status.clients[0].active);
-        assert_eq!(status.tunnel.handshake_age_s, Some(21));
-        assert_eq!(status.tunnel.tx_bytes, 2_790_000_000);
     }
 
     #[test]
@@ -399,18 +363,5 @@ mod tests {
         });
         assert_eq!(got.0, "status\n");
         assert!(matches!(got.1.unwrap_err(), IpcError::Failed(m) if m.contains("too long")));
-    }
-
-    /// I2: the daemon answers `tunnel connect|disconnect` only after its
-    /// `systemctl start|stop` has completed, and the unit's own
-    /// `TimeoutStopSec` is 10 s — so the 3 s `status` budget would give up
-    /// on an action that is in fact succeeding. `status` keeps its 3 s.
-    #[test]
-    fn tunnel_requests_get_a_longer_budget_than_status() {
-        assert_eq!(budget(&Request::TunnelConnect), TUNNEL_TIMEOUT);
-        assert_eq!(budget(&Request::TunnelDisconnect), TUNNEL_TIMEOUT);
-        assert_eq!(budget(&Request::Status), IPC_TIMEOUT);
-        assert_eq!(budget(&Request::Quit), IPC_TIMEOUT);
-        assert!(TUNNEL_TIMEOUT >= Duration::from_secs(12), "TimeoutStopSec=10 plus a margin");
     }
 }

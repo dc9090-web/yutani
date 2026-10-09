@@ -1,7 +1,6 @@
 //! User configuration: `~/.config/yutani/config.ron`.
 
 use serde::{Deserialize, Serialize};
-use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,42 +95,6 @@ impl ShortcutsConfig {
     }
 }
 
-/// EVE-only WireGuard tunnel (spec 2026-09-12-yutani-tunnel-design.md).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct TunnelConfig {
-    /// Label shown for the exit ("London").
-    pub location: String,
-    /// Move running EVE processes into the tunnel cgroup automatically.
-    pub auto_adopt: bool,
-    /// Executable names (case-insensitive) that count as EVE.
-    pub adopt_processes: Vec<String>,
-    /// Resolvers for EVE's domains while the tunnel is up, reached *inside*
-    /// the tunnel: `resolvectl dns yutani0 <these>`.
-    pub dns_servers: Vec<Ipv4Addr>,
-    /// Domains routed to those resolvers (`resolvectl domain yutani0
-    /// ~<each>`). Plain host names; a leading `~` or `.` is stripped by
-    /// [`Config::validate`].
-    ///
-    /// Both lists reach the root worker only through `yutani tunnel
-    /// install`, which copies them into `/etc/yutani/tunnel.conf` — root
-    /// never reads this file (spec §9). Changing them therefore requires
-    /// re-running `yutani tunnel install`.
-    pub dns_domains: Vec<String>,
-}
-
-impl Default for TunnelConfig {
-    fn default() -> Self {
-        Self {
-            location: "London".into(),
-            auto_adopt: true,
-            adopt_processes: vec!["exefile.exe".into(), "eve-online.exe".into(), "evelauncher.exe".into()],
-            dns_servers: crate::tunnel::DEFAULT_DNS_SERVERS.to_vec(),
-            dns_domains: crate::tunnel::DEFAULT_DNS_DOMAINS.iter().map(|d| (*d).to_string()).collect(),
-        }
-    }
-}
-
 /// How `yutani launch` starts the game: the environment it adds so a client
 /// hidden under another keeps rendering (its thumbnail stays live) without
 /// running the GPU flat out.
@@ -208,8 +171,6 @@ pub struct Config {
     pub dock_edge: Edge,
     /// Keyboard shortcuts written by `yutani shortcuts install`.
     pub shortcuts: ShortcutsConfig,
-    /// EVE-only WireGuard tunnel.
-    pub tunnel: TunnelConfig,
     /// What `yutani launch` adds to the game's environment.
     pub launch: LaunchConfig,
     /// EVE's profile directory (the one holding `core_char_*.dat`), when
@@ -237,7 +198,6 @@ impl Default for Config {
             corner_radius: 8,
             dock_edge: Edge::Top,
             shortcuts: ShortcutsConfig::default(),
-            tunnel: TunnelConfig::default(),
             launch: LaunchConfig::default(),
             eve_settings_dir: None,
         }
@@ -333,60 +293,6 @@ impl Config {
             self.app_ids = d.app_ids.clone();
         }
         {
-            // An empty/whitespace-only entry is almost always a stray blank
-            // line from hand-editing the RON file; drop it rather than let
-            // it sit there matching nothing.
-            let before = self.tunnel.adopt_processes.len();
-            self.tunnel.adopt_processes.retain(|p| !p.trim().is_empty());
-            if self.tunnel.adopt_processes.len() != before {
-                tracing::warn!("config: tunnel.adopt_processes had empty/whitespace-only entries; dropping them");
-            }
-            if self.tunnel.adopt_processes.is_empty() {
-                tracing::warn!("config: tunnel.adopt_processes is empty; using defaults");
-                self.tunnel.adopt_processes = d.tunnel.adopt_processes.clone();
-            }
-        }
-        {
-            // These two end up in a root-owned file and in `resolvectl`
-            // argv, so what survives here must be a plain host name and
-            // nothing else: a value with a newline in it would otherwise
-            // forge a second `# yutani: …` line in /etc/yutani/tunnel.conf.
-            // `~eveonline.com` / `.eveonline.com` are what a user copying
-            // from `resolvectl status` writes, and the `~` is ours to add,
-            // so those two prefixes are stripped rather than refused.
-            let before = self.tunnel.dns_domains.len();
-            self.tunnel.dns_domains = self
-                .tunnel
-                .dns_domains
-                .iter()
-                .map(|d| d.trim().trim_start_matches(['~', '.']).trim().to_string())
-                .filter(|d| valid_dns_domain(d))
-                .collect();
-            if self.tunnel.dns_domains.len() != before {
-                tracing::warn!(
-                    "config: tunnel.dns_domains had empty entries or entries that are not plain host names; dropping them"
-                );
-            }
-            if self.tunnel.dns_domains.is_empty() {
-                tracing::warn!("config: tunnel.dns_domains is empty; using defaults");
-                self.tunnel.dns_domains = d.tunnel.dns_domains.clone();
-            }
-            // A resolver the exit node cannot reach (the LAN router, a
-            // Pi-hole, loopback) would take the whole machine's DNS down
-            // while the tunnel is up: see `tunnel::usable_dns_server`.
-            self.tunnel.dns_servers.retain(|s| {
-                let usable = crate::tunnel::usable_dns_server(s);
-                if !usable {
-                    tracing::warn!("config: tunnel.dns_servers entry {s} {}; dropping it", crate::tunnel::UNUSABLE_DNS_SERVER);
-                }
-                usable
-            });
-            if self.tunnel.dns_servers.is_empty() {
-                tracing::warn!("config: tunnel.dns_servers is empty; using defaults");
-                self.tunnel.dns_servers = d.tunnel.dns_servers.clone();
-            }
-        }
-        {
             // Trimmed, because what is left here is what gets written to the
             // shortcuts file verbatim, and " Right " is no keysym name.
             let (next, prev) = (self.shortcuts.next.trim().to_string(), self.shortcuts.prev.trim().to_string());
@@ -422,15 +328,6 @@ impl Config {
         check!(eve_settings_dir, |v: &Option<String>| v.as_deref().is_none_or(|p| Path::new(p).is_absolute()), "absolute path or unset");
         self
     }
-}
-
-/// A plain DNS host name: ASCII letters, digits, `-` and `.`, non-empty.
-/// Deliberately strict — the value is written into root's
-/// `/etc/yutani/tunnel.conf` and passed to `resolvectl`, so anything that
-/// could forge a conf line (a newline) or confuse resolved (a space, `~`,
-/// a quote, non-ASCII) is refused rather than escaped.
-pub fn valid_dns_domain(name: &str) -> bool {
-    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
 }
 
 /// Resolve an xkb keysym name the way cosmic-comp does: the exact name
@@ -711,41 +608,13 @@ mod tests {
         assert_eq!(c.clone().validate(), c);
     }
 
+    /// The tunnel is gone (2026-10-09), but a config.ron written while it
+    /// existed still has a `tunnel: (…)` section: it parses, and the rest
+    /// of the file is kept.
     #[test]
-    fn tunnel_defaults_and_parse() {
-        let c = Config::default();
-        assert_eq!(c.tunnel.location, "London");
-        assert!(c.tunnel.auto_adopt);
-        assert_eq!(c.tunnel.adopt_processes, vec!["exefile.exe", "eve-online.exe", "evelauncher.exe"]);
-        let c: Config = ron::from_str("(tunnel: (location: \"Amsterdam\", auto_adopt: false))").unwrap();
-        assert_eq!(c.tunnel.location, "Amsterdam");
-        assert!(!c.tunnel.auto_adopt);
-        assert_eq!(c.tunnel.adopt_processes.len(), 3);
-    }
-
-    #[test]
-    fn validate_drops_blank_adopt_process_entries_and_falls_back_when_all_blank() {
-        let mut c = Config::default();
-        c.tunnel.adopt_processes = vec!["  ".into(), "real.exe".into(), "".into()];
-        assert_eq!(c.validate().tunnel.adopt_processes, vec!["real.exe"]);
-
-        let mut c = Config::default();
-        c.tunnel.adopt_processes = vec!["".into(), "   ".into()];
-        assert_eq!(c.validate().tunnel.adopt_processes, Config::default().tunnel.adopt_processes);
-    }
-
-    #[test]
-    fn tunnel_dns_defaults_and_parse() {
-        let c = Config::default();
-        assert_eq!(c.tunnel.dns_servers, vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(9, 9, 9, 9)]);
-        assert_eq!(c.tunnel.dns_domains, vec!["eveonline.com", "ccpgames.com", "evetech.net"]);
-        // An older config.ron without the keys still parses (serde(default)).
-        let c: Config = ron::from_str("(tunnel: (location: \"Amsterdam\"))").unwrap();
-        assert_eq!(c.tunnel.dns_servers, Config::default().tunnel.dns_servers);
-        let c: Config =
-            ron::from_str("(tunnel: (dns_servers: [\"8.8.8.8\"], dns_domains: [\"example.net\"]))").unwrap();
-        assert_eq!(c.tunnel.dns_servers, vec![Ipv4Addr::new(8, 8, 8, 8)]);
-        assert_eq!(c.tunnel.dns_domains, vec!["example.net"]);
+    fn an_old_tunnel_section_is_ignored() {
+        let c: Config = ron::from_str("(fps: 60, tunnel: (location: \"Amsterdam\", auto_adopt: false, dns_servers: [\"8.8.8.8\"]))").unwrap();
+        assert_eq!(c.fps, 60);
     }
 
     /// Daniel, 2026-09-16: the covered fullscreen client stopped drawing,
@@ -758,7 +627,7 @@ mod tests {
         let d = LaunchConfig::default();
         assert!(d.unlocked_present);
         assert_eq!(d.frame_rate, None);
-        let c: Config = ron::from_str("(tunnel: (location: \"Amsterdam\"))").unwrap();
+        let c: Config = ron::from_str("(fps: 60)").unwrap();
         assert_eq!(c.launch, LaunchConfig::default());
         let c: Config = ron::from_str("(launch: (unlocked_present: false, frame_rate: Some(120)))").unwrap();
         assert!(!c.launch.unlocked_present);
@@ -773,65 +642,6 @@ mod tests {
         let mut c = Config::default();
         c.launch.frame_rate = Some(10);
         assert_eq!(c.validate().launch.frame_rate, Some(10));
-    }
-
-    #[test]
-    fn validate_cleans_dns_domains_and_falls_back_when_a_list_is_empty() {
-        // resolved's own syntax (`~eveonline.com`) and a leading dot are what
-        // a user copying from `resolvectl status` would write; the `~` is
-        // ours to add, so strip it rather than send `~~eveonline.com`.
-        let mut c = Config::default();
-        c.tunnel.dns_domains = vec!["~eveonline.com".into(), " .ccpgames.com ".into(), "  ".into()];
-        assert_eq!(c.validate().tunnel.dns_domains, vec!["eveonline.com", "ccpgames.com"]);
-
-        // Not a plain hostname: dropped, never pasted into a resolvectl argv
-        // or into the root-owned conf.
-        let mut c = Config::default();
-        c.tunnel.dns_domains = vec!["eve online.com".into(), "eveonline.com".into(), "a\nb".into()];
-        assert_eq!(c.validate().tunnel.dns_domains, vec!["eveonline.com"]);
-
-        // Nothing usable left → the defaults, not an empty list (an empty
-        // list would mean "no EVE domains resolve inside the tunnel").
-        let mut c = Config::default();
-        c.tunnel.dns_domains = vec!["~".into(), "".into()];
-        assert_eq!(c.validate().tunnel.dns_domains, Config::default().tunnel.dns_domains);
-
-        let mut c = Config::default();
-        c.tunnel.dns_servers = vec![];
-        assert_eq!(c.validate().tunnel.dns_servers, Config::default().tunnel.dns_servers);
-
-        // Good values survive untouched.
-        let c = Config::default();
-        assert_eq!(c.clone().validate(), c);
-    }
-
-    /// `dns_servers: ["192.168.1.1"]` — the router, a Pi-hole, the obvious
-    /// thing to type — would have every query on the machine to that
-    /// address marked for the tunnel and sent to the exit node, which
-    /// cannot reach the LAN: machine-wide DNS dies while connected. Such
-    /// addresses are dropped here, on the way in, and refused again by
-    /// `install-root`.
-    #[test]
-    fn validate_drops_dns_servers_the_exit_node_cannot_reach() {
-        let mut c = Config::default();
-        c.tunnel.dns_servers = vec![Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(127, 0, 0, 53)];
-        assert_eq!(c.validate().tunnel.dns_servers, vec![Ipv4Addr::new(8, 8, 8, 8)]);
-
-        // Nothing usable left → the defaults, as for an empty list.
-        let mut c = Config::default();
-        c.tunnel.dns_servers = vec![Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(169, 254, 1, 1)];
-        assert_eq!(c.validate().tunnel.dns_servers, Config::default().tunnel.dns_servers);
-    }
-
-    #[test]
-    fn valid_dns_domain_accepts_plain_hostnames_only() {
-        assert!(valid_dns_domain("eveonline.com"));
-        assert!(valid_dns_domain("a-b.evetech.net"));
-        assert!(!valid_dns_domain(""));
-        assert!(!valid_dns_domain("eve online.com"));
-        assert!(!valid_dns_domain("eveonline.com\n# yutani: uid = 0"));
-        assert!(!valid_dns_domain("~eveonline.com"));
-        assert!(!valid_dns_domain("eve\"online.com"));
     }
 
     #[test]

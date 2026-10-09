@@ -1,6 +1,6 @@
-//! The popover's drawn pieces (Nostromo handoff): the sand-field scope,
-//! the ping sparkline, the rockers, dotted section rules, corner brackets,
-//! and the footer's blinking cursor. Anything that moves
+//! The popover's drawn pieces (Nostromo handoff): the rockers, dotted
+//! section rules, corner brackets, hazard stripes and the footer's
+//! blinking cursor. Anything that moves
 //! animates inside its own canvas — `RedrawRequested` steps it and asks for
 //! the next frame — so the popover's `view()` is not rebuilt per frame.
 
@@ -12,109 +12,11 @@ use cosmic::iced::widget::canvas::{self, Action, Event, Frame, Geometry, Path, S
 use cosmic::iced::{Color, Point, Rectangle, Size, window};
 
 use yutani::applet::console::RockerState;
-use yutani::applet::ping::{Dot, SPARK_H, SPARK_W};
 use yutani::applet::rocker::knob_left;
-use yutani::applet::sand::{Drive, Sand, Tint};
-use yutani::applet::skin::{self, AMBER, BG, CORNER_MARK_PX, DIM, DIMMER, LINE, LINE_2, PHOSPHOR, WHITE};
+use yutani::applet::skin::{self, AMBER, BG, DIM, DIMMER, LINE, LINE_2, PHOSPHOR};
 
 fn alpha(c: Color, a: f32) -> Color {
     Color { a, ..c }
-}
-
-// ---- scope ---------------------------------------------------------------------
-
-/// The sand field behind the network readouts.
-pub struct Scope {
-    pub drive: Drive,
-}
-
-#[derive(Default)]
-pub struct ScopeState {
-    sand: Option<Sand>,
-    last: Option<Instant>,
-}
-
-impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Scope {
-    type State = ScopeState;
-
-    fn update(&self, state: &mut ScopeState, event: &Event, bounds: Rectangle, _: mouse::Cursor) -> Option<Action<M>> {
-        let Event::Window(window::Event::RedrawRequested(now)) = event else { return None };
-        let dt = state.last.map_or(0.0, |l| now.saturating_duration_since(l).as_secs_f32());
-        state.last = Some(*now);
-        let sand = state.sand.get_or_insert_with(|| Sand::new(bounds.width, bounds.height, 0x5EED));
-        sand.resize(bounds.width, bounds.height);
-        sand.step(dt, self.drive);
-        Some(Action::request_redraw_at(*now + Duration::from_millis(33))) // 30 fps
-    }
-
-    fn draw(&self, state: &ScopeState, renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
-        if let Some(sand) = &state.sand {
-            for (x, y, size, tint, level) in sand.dots(self.drive) {
-                // Only grains inside the scope: canvas geometry is not
-                // clipped to its bounds, and in strong wind grains overshoot
-                // into the ping row below (2026-10-07).
-                if level == 0 || x < 0.0 || y < 0.0 || x + size > bounds.width || y + size > bounds.height {
-                    continue;
-                }
-                let base = match tint {
-                    Tint::Downlink => PHOSPHOR,
-                    Tint::Uplink => AMBER,
-                    Tint::Spark => WHITE,
-                };
-                frame.fill_rectangle(Point::new(x, y), Size::new(size, size), alpha(base, f32::from(level) / 10.0));
-            }
-        }
-        // 7×7 phosphor corner marks inside each corner.
-        let (w, h, m) = (bounds.width, bounds.height, CORNER_MARK_PX);
-        for (x, y, dx, dy) in [(0.0, 0.0, 1.0, 1.0), (w, 0.0, -1.0, 1.0), (0.0, h, 1.0, -1.0), (w, h, -1.0, -1.0)] {
-            let path = Path::new(|p| {
-                p.move_to(Point::new(x + dx * m, y + dy * 0.5));
-                p.line_to(Point::new(x + dx * 0.5, y + dy * 0.5));
-                p.line_to(Point::new(x + dx * 0.5, y + dy * m));
-            });
-            frame.stroke(&path, Stroke::default().with_color(PHOSPHOR).with_width(1.0));
-        }
-        vec![frame.into_geometry()]
-    }
-}
-
-// ---- ping sparkline -------------------------------------------------------------
-
-pub struct Sparkline {
-    pub dots: Vec<Dot>,
-    pub avg_y: f32,
-    pub color: Color,
-    pub live: bool,
-}
-
-impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Sparkline {
-    type State = ();
-
-    fn draw(&self, _: &(), renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
-        // The dots are laid out on the handoff's 240 px track; the row
-        // leaves the sparkline less than that on a 360 px popover, so the
-        // track is scaled to the width it actually got rather than clipped
-        // (which hid the newest samples at its right end).
-        let w = bounds.width;
-        let sx = w / SPARK_W;
-        let base = SPARK_H - 0.5;
-        frame.stroke(&Path::line(Point::new(0.0, base), Point::new(w, base)), Stroke::default().with_color(LINE).with_width(1.0));
-        if self.live {
-            // The average: white 30 %, dashed 1 4.
-            let mut x = 0.0;
-            while x < w {
-                frame.fill_rectangle(Point::new(x, self.avg_y - 0.5), Size::new(1.0, 1.0), alpha(WHITE, 0.3));
-                x += 5.0;
-            }
-        }
-        for d in &self.dots {
-            let x = (d.x * sx).min(w - d.size);
-            frame.fill_rectangle(Point::new(x, d.y), Size::new(d.size, d.size), alpha(self.color, d.opacity));
-        }
-        vec![frame.into_geometry()]
-    }
 }
 
 // ---- rocker ---------------------------------------------------------------------
@@ -342,19 +244,9 @@ impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Ellipsis {
 
 // ---- arrow -----------------------------------------------------------------------------
 
-/// Which way an [`Arrow`] points.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Direction {
-    Up,
-    Down,
-    Left,
-}
-
-/// A filled triangle standing in for ▲ ▼ ◄, which B612 Mono lacks (▲ ◄)
-/// or draws at a different weight than the drawn ones (▼): the readout
-/// labels and the focused tag draw all three here so they match.
+/// A filled left-pointing triangle standing in for ◄, which B612 Mono
+/// lacks: the focused tag's arrow.
 pub struct Arrow {
-    pub direction: Direction,
     pub color: Color,
 }
 
@@ -364,11 +256,7 @@ impl<M> canvas::Program<M, cosmic::Theme, Renderer> for Arrow {
     fn draw(&self, _: &(), renderer: &Renderer, _: &cosmic::Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
         let (w, h) = (bounds.width, bounds.height);
-        let [a, b, c] = match self.direction {
-            Direction::Up => [Point::new(w / 2.0, 0.0), Point::new(w, h), Point::new(0.0, h)],
-            Direction::Down => [Point::new(0.0, 0.0), Point::new(w, 0.0), Point::new(w / 2.0, h)],
-            Direction::Left => [Point::new(0.0, h / 2.0), Point::new(w, 0.0), Point::new(w, h)],
-        };
+        let [a, b, c] = [Point::new(0.0, h / 2.0), Point::new(w, 0.0), Point::new(w, h)];
         let path = Path::new(|p| {
             p.move_to(a);
             p.line_to(b);

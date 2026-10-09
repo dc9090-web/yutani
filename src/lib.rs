@@ -10,22 +10,21 @@ pub mod eve_settings;
 pub mod ipc;
 pub mod launch_eve;
 pub mod model;
-/// Bounded subprocess execution. In the lib because `tunnel::control` — a
-/// lib module — has to run `systemctl is-failed` under a timeout.
+/// Bounded subprocess execution.
 pub mod proc;
 pub mod service;
+/// The daemon's reply to the IPC `status` request.
+pub mod status;
 /// Steam's launch options for EVE: read, judged, never written.
 pub mod steam;
-pub mod tunnel;
 
 /// What EVE Online's *Launch Options* in Steam must say for Yutani to see
 /// the client (Steam → EVE Online → Properties → Launch Options).
 ///
 /// `%command%` is Steam's placeholder for everything it would have run; by
 /// putting `yutani launch --` in front of it, Steam launches the game
-/// *through* Yutani, which is what lets the daemon adopt the process into
-/// `yutani-eve.slice` (so the tunnel's cgroup rule applies to it) and
-/// track its window. `PROTON_ENABLE_WAYLAND=1` keeps the client on a
+/// *through* Yutani, which is what lets it set the game's environment and
+/// lets the daemon track its window. `PROTON_ENABLE_WAYLAND=1` keeps the client on a
 /// native Wayland surface — thumbnails capture that, not an XWayland
 /// window — and `WINE_NO_WM_DECORATION=1` stops Wine drawing its own
 /// title bar over it.

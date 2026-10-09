@@ -32,7 +32,7 @@ pub fn unit_text(exe: &str) -> String {
     let exe = quote_exec(exe);
     format!(
         "[Unit]\n\
-         Description=Yutani - EVE Online thumbnails, hotkeys and tunnel\n\
+         Description=Yutani - EVE Online thumbnails and hotkeys\n\
          PartOf=graphical-session.target\n\
          After=graphical-session.target\n\
          # A crash loop (ten failures in a minute) stops rather than spinning.\n\

@@ -15,7 +15,7 @@ use crate::app::{Applet, Msg, close_popup_message, open_popup_message};
 pub fn panel_button(state: &Applet) -> Element<'_, Msg> {
     let clients = state.status.as_ref().map_or(0, |s| s.clients.len());
     let steam_problem = state.status.as_ref().is_some_and(|s| yutani::steam::first_message(&s.steam).is_some());
-    let icon = icon_state(state.status.as_ref().map(|s| &s.tunnel), clients, state.pending(), steam_problem);
+    let icon = icon_state(state.status.is_some(), clients, steam_problem);
     let (w, h) = state.core.applet.suggested_size(true);
     let mark = widget::icon(widget::icon::from_svg_bytes(icon.bytes(h)).symbolic(true))
         .class(theme::mark_class())

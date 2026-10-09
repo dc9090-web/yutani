@@ -6,8 +6,8 @@
 //! The daemon runs as `yutani.service` with `KillMode=control-group`. When
 //! Steam is not running yet, the `steam` we spawn *becomes* the Steam
 //! client, so it must not stay in the service's cgroup: restarting the
-//! daemon would kill Steam, and with it any EVE process not yet adopted
-//! into the EVE slice. So the spawn goes through `systemd-run --user
+//! daemon would kill Steam, and with it every EVE client it started. So
+//! the spawn goes through `systemd-run --user
 //! --scope --slice=app.slice`, which puts it in its own scope like any app
 //! the desktop starts. `systemd-run --scope` stays in the foreground for
 //! the scope's lifetime; the reaper thread waits for it.

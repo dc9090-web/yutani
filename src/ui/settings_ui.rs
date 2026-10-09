@@ -82,8 +82,6 @@ pub const CODE_PAD: Padding = pad(12.0, 13.0, 12.0, 13.0);
 pub const LAYOUT_ROW_PAD: Padding = pad(12.0, 14.0, 12.0, 14.0);
 /// The layouts footer — `13px 14px`.
 pub const LAYOUT_FOOTER_PAD: Padding = pad(13.0, 14.0, 13.0, 14.0);
-/// A drop zone — `18px 16px`.
-pub const DROP_PAD: Padding = pad(18.0, 16.0, 18.0, 16.0);
 
 // ---- typography (px) ---------------------------------------------------------
 
@@ -108,9 +106,6 @@ pub const CHOICE_NAME: f32 = 13.0;
 pub const CHOICE_DESC: f32 = 11.5;
 pub const LAYOUT_NAME: f32 = 13.5;
 pub const LAYOUT_META: f32 = 11.0;
-pub const STATE_HEADLINE: f32 = 14.0;
-pub const STATE_SUB: f32 = 11.5;
-pub const FACT_VALUE: f32 = 11.5;
 pub const CODE: f32 = 12.0;
 
 // ---- text ----------------------------------------------------------------------
@@ -208,7 +203,7 @@ fn surface(radius: f32, bg: fn(&Cosmic) -> Color, edge: Option<fn(&Cosmic) -> Co
     })
 }
 
-/// Sunken surface (code block, drop zone).
+/// Sunken surface (code block).
 fn sunken_bg(c: &Cosmic) -> Color {
     roles::with_alpha(roles::ink(c), 0.04)
 }
@@ -334,22 +329,6 @@ pub fn dot<'a, M: 'a>(on: bool, tint: Tint, px: f32) -> Element<'a, M> {
             container::Style {
                 background: Some(Background::Color(if on { tint_color(c, tint) } else { roles::with_alpha(roles::ink(c), 0.25) })),
                 border: Border { radius: Radius::from(px / 2.0), ..Default::default() },
-                ..Default::default()
-            }
-        }))
-        .into()
-}
-
-/// A dot with the 4 px glow ring behind it.
-pub fn glowing_dot<'a, M: 'a>(on: bool, tint: Tint, px: f32) -> Element<'a, M> {
-    widget::container(dot(on, tint, px))
-        .padding(4)
-        .class(cosmic_theme::Container::custom(move |theme| {
-            let c = theme.cosmic();
-            let color = if on { tint_color(c, tint) } else { roles::with_alpha(roles::ink(c), 0.25) };
-            container::Style {
-                background: Some(Background::Color(roles::with_alpha(color, 0.35))),
-                border: Border { radius: Radius::from(px / 2.0 + 4.0), ..Default::default() },
                 ..Default::default()
             }
         }))
@@ -594,8 +573,8 @@ fn inert_class(radius: f32) -> cosmic_theme::Button {
     }
 }
 
-/// The accent primary button (`Copy to N other characters`, `Install
-/// tunnel`); inert when there is nothing to press.
+/// The accent primary button (`Copy to N other characters`); inert when
+/// there is nothing to press.
 pub fn primary_button<'a, M: Clone + 'a>(label: &'a str, msg: Option<M>) -> Element<'a, M> {
     let (class, role) = match msg {
         Some(_) => (cosmic_theme::Button::Suggested, Role::OnAccent),
@@ -653,35 +632,6 @@ pub fn destructive_button<'a, M: Clone + 'a>(label: &'a str, msg: Option<M>) -> 
         .height(Length::Fixed(BUTTON_H))
         .padding([0, 12])
         .class(cosmic_theme::Button::Destructive)
-        .on_press_maybe(msg)
-        .into()
-}
-
-/// An outline button in destructive text (`Uninstall…`, `Delete…`).
-pub fn destructive_outline_button<'a, M: Clone + 'a>(label: &'a str, msg: Option<M>) -> Element<'a, M> {
-    let class = cosmic_theme::Button::Custom {
-        active: Box::new(|_, t| {
-            let c = t.cosmic();
-            button_style(roles::destructive(c), None, Some(roles::with_alpha(roles::destructive(c), 0.5)), ITEM_RADIUS)
-        }),
-        disabled: Box::new(|t| {
-            let c = t.cosmic();
-            button_style(roles::dimmed(roles::destructive(c)), None, Some(roles::with_alpha(roles::destructive(c), 0.25)), ITEM_RADIUS)
-        }),
-        hovered: Box::new(|_, t| {
-            let c = t.cosmic();
-            button_style(roles::destructive(c), Some(roles::with_alpha(roles::destructive(c), 0.12)), Some(roles::with_alpha(roles::destructive(c), 0.5)), ITEM_RADIUS)
-        }),
-        pressed: Box::new(|_, t| {
-            let c = t.cosmic();
-            button_style(roles::destructive(c), Some(roles::with_alpha(roles::destructive(c), 0.18)), Some(roles::with_alpha(roles::destructive(c), 0.5)), ITEM_RADIUS)
-        }),
-    };
-    let role = if msg.is_some() { Role::Destructive } else { Role::Disabled };
-    widget::button::custom(centred(labelled(label, BUTTON, Weight::Medium, role)))
-        .height(Length::Fixed(BUTTON_H))
-        .padding([0, 13])
-        .class(class)
         .on_press_maybe(msg)
         .into()
 }

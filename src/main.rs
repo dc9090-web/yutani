@@ -1,18 +1,18 @@
-mod adopt;
 mod backend;
 mod cli;
 mod doctor;
+mod eve_process;
 mod launch;
 mod launch_steam;
 mod shortcuts;
 mod ui;
 
-// `ipc`, `model` and `tunnel` now live in the library (so `yutani-applet`
-// can share them). Re-binding them at the binary's crate root keeps every
-// `crate::ipc::…` / `crate::model::…` / `crate::tunnel::…` path in
-// `src/ui/`, `src/cli.rs`, `src/shortcuts.rs` and `src/adopt.rs` working
-// unchanged: a private `use` is visible to this module and its descendants.
-use yutani::{ipc, model, tunnel};
+// `ipc`, `model` and `status` live in the library (so `yutani-applet` can
+// share them). Re-binding them at the binary's crate root keeps every
+// `crate::ipc::…` / `crate::model::…` / `crate::status::…` path in `src/ui/`,
+// `src/cli.rs` and `src/shortcuts.rs` working unchanged: a private `use` is
+// visible to this module and its descendants.
+use yutani::{ipc, model, status};
 
 use clap::{Parser, Subcommand};
 use std::io::{self, Write as _};
@@ -53,14 +53,14 @@ enum Command {
     Layouts,
     /// Open the settings window, optionally on a page
     Settings {
-        /// display | behaviour | layouts | characters | tunnel | steam
+        /// display | behaviour | layouts | characters | steam
         page: Option<String>,
     },
     /// Ask the running instance to exit
     Quit,
-    /// Print the daemon's status (clients, visibility, tunnel) as JSON
+    /// Print the daemon's status (clients, visibility) as JSON
     Status,
-    /// Run a command (Steam's %command%) inside the tunnel cgroup
+    /// Run a command (Steam's %command%) with the game's launch environment
     Launch {
         /// The game command, e.g. Steam's %command%
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
@@ -82,11 +82,6 @@ enum Command {
     Applet {
         #[command(subcommand)]
         action: AppletAction,
-    },
-    /// EVE-only WireGuard tunnel
-    Tunnel {
-        #[command(subcommand)]
-        action: TunnelAction,
     },
 }
 
@@ -112,57 +107,6 @@ enum AppletAction {
     Install,
     /// Remove the icons and both .desktop files
     Uninstall,
-}
-
-#[derive(Subcommand)]
-enum TunnelAction {
-    /// Install the tunnel from a wg-quick .conf (asks for your password
-    /// once); with no .conf, rewrite the unit and polkit rule for this
-    /// binary from the conf already installed
-    Install {
-        conf: Option<std::path::PathBuf>,
-        /// Print what would be installed instead of installing (no root
-        /// needed); exits 1 if the real install would be refused
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Remove the tunnel unit, conf and polkit rule
-    Uninstall,
-    /// Start the tunnel (EVE traffic goes via the configured exit)
-    Connect,
-    /// Stop the tunnel (EVE traffic goes direct)
-    Disconnect,
-    /// Show tunnel state as JSON
-    Status,
-    /// [root] the worker behind yutani-tunnel.service
-    #[command(hide = true)]
-    Run,
-    /// [root] called by `install` through pkexec
-    #[command(hide = true)]
-    InstallRoot {
-        #[arg(long)]
-        conf: Option<std::path::PathBuf>,
-        /// Rewrite from the stored conf instead of `--conf`
-        #[arg(long)]
-        stored: bool,
-        #[arg(long)]
-        uid: u32,
-        #[arg(long)]
-        user: String,
-        #[arg(long)]
-        exe: String,
-        /// Resolvers for EVE's domains inside the tunnel (comma-separated);
-        /// empty = the built-in defaults
-        #[arg(long, value_delimiter = ',')]
-        dns_servers: Vec<std::net::Ipv4Addr>,
-        /// Domains routed to those resolvers (comma-separated); empty = the
-        /// built-in defaults
-        #[arg(long, value_delimiter = ',')]
-        dns_domains: Vec<String>,
-    },
-    /// [root] called by `uninstall` through pkexec
-    #[command(hide = true)]
-    UninstallRoot,
 }
 
 /// The daemon itself, in this process (the bare `yutani` and `yutani start`
@@ -256,71 +200,6 @@ fn main() -> ExitCode {
         Some(Command::Applet { action: AppletAction::Uninstall }) => {
             yutani::applet::install::uninstall().map(|()| ExitCode::SUCCESS)
         }
-        Some(Command::Tunnel { action }) => match action {
-            TunnelAction::Install { conf: None, dry_run: true } => {
-                Err(anyhow::anyhow!("a dry run needs the .conf: the installed one is readable by root only"))
-            }
-            TunnelAction::Install { conf: None, dry_run: false } => {
-                let t = model::config::Config::load().tunnel;
-                tunnel::install::reinstall(&t.dns_servers, &t.dns_domains).map(|()| ExitCode::SUCCESS)
-            }
-            TunnelAction::Install { conf: Some(conf), dry_run: true } => {
-                // The same uid/name pair and canonical exe path the real
-                // install passes to `install-root`.
-                let t = model::config::Config::load().tunnel;
-                tunnel::install::whoami().and_then(|(uid, user)| {
-                    let exe = tunnel::install::current_exe().unwrap_or_default();
-                    let report = tunnel::install::install_root(
-                        &conf.canonicalize().unwrap_or(conf.clone()),
-                        uid,
-                        &user,
-                        &exe,
-                        &t.dns_servers,
-                        &t.dns_domains,
-                        true,
-                    )?;
-                    print!("{report}");
-                    let plan = tunnel::worker::dry_run(&conf, uid, &t.dns_servers, &t.dns_domains)?;
-                    print!("\n{plan}");
-                    // The whole report is printed either way; the exit
-                    // status is what lets a script tell "would install
-                    // clean" from "would be refused" without parsing it.
-                    Ok(if tunnel::install::report_has_failure(&report) { ExitCode::from(1) } else { ExitCode::SUCCESS })
-                })
-            }
-            TunnelAction::Install { conf: Some(conf), dry_run: false } => {
-                // From the *validated* config: the root side re-checks these
-                // anyway, but a warning about a bad domain belongs here,
-                // before the password prompt.
-                let t = model::config::Config::load().tunnel;
-                tunnel::install::install(&conf, &t.dns_servers, &t.dns_domains).map(|()| ExitCode::SUCCESS)
-            }
-            TunnelAction::Uninstall => tunnel::install::uninstall().map(|()| ExitCode::SUCCESS),
-            TunnelAction::Connect => tunnel::control::connect().map(|()| ExitCode::SUCCESS),
-            TunnelAction::Disconnect => tunnel::control::disconnect().map(|()| ExitCode::SUCCESS),
-            TunnelAction::Status => {
-                let config = model::config::Config::load();
-                let st = tunnel::control::current_tunnel_status(&config.tunnel.location);
-                println!("{}", serde_json::to_string_pretty(&st).unwrap_or_default());
-                Ok(ExitCode::SUCCESS)
-            }
-            TunnelAction::Run => tunnel::worker::run().map(|()| ExitCode::SUCCESS),
-            TunnelAction::InstallRoot { conf, stored, uid, user, exe, dns_servers, dns_domains } => {
-                let report = match (conf, stored) {
-                    (Some(conf), false) => tunnel::install::install_root(&conf, uid, &user, &exe, &dns_servers, &dns_domains, false),
-                    (None, true) => tunnel::install::reinstall_root(uid, &user, &exe, &dns_servers, &dns_domains, false),
-                    _ => Err(anyhow::anyhow!("install-root takes either --conf <file> or --stored")),
-                };
-                report.map(|report| {
-                    print!("{report}");
-                    ExitCode::SUCCESS
-                })
-            }
-            TunnelAction::UninstallRoot => tunnel::install::uninstall_root(false).map(|r| {
-                print!("{r}");
-                ExitCode::SUCCESS
-            }),
-        },
         None => run_daemon(),
     };
     match result {

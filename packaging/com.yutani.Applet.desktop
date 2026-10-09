@@ -1,11 +1,11 @@
 [Desktop Entry]
 Name=Yutani
-Comment=EVE Online clients and the WireGuard tunnel
+Comment=EVE Online clients
 Type=Application
 Exec=/usr/bin/yutani-applet
 Terminal=false
 Categories=COSMIC;
-Keywords=COSMIC;Applet;EVE;WireGuard;VPN;Yutani;
+Keywords=COSMIC;Applet;EVE;Yutani;
 Icon=yutani-symbolic
 StartupNotify=true
 NoDisplay=true

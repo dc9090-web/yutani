@@ -92,7 +92,6 @@ pub const BRACKET_PX: f32 = 8.0;
 
 pub const ROW_PAD: Padding = pad(8.0, 12.0, 8.0, 12.0);
 pub const ROW_GAP: f32 = 10.0;
-pub const HAIRLINE_INSET: f32 = 12.0;
 pub const LED_PX: f32 = 8.0;
 pub const TOGGLE_W: f32 = 38.0;
 pub const TOGGLE_H: f32 = 19.0;
@@ -103,16 +102,6 @@ pub const ACCOUNT_ROW_HEIGHT: f32 = 28.0;
 pub const ACCOUNT_ROW_PAD: Padding = pad(0.0, 8.0, 0.0, 8.0);
 pub const INDEX_CHIP_PX: f32 = 17.0;
 pub const EMPTY_PAD: Padding = pad(10.0, 12.0, 11.0, 12.0);
-
-pub const SCOPE_HEIGHT: f32 = 104.0;
-pub const SCOPE_INSET: f32 = 12.0;
-pub const CORNER_MARK_PX: f32 = 7.0;
-pub const PING_LEFT_W: f32 = 64.0;
-/// The ping row's right column (quality word, 6 px gap, 6 px LED), sized
-/// for its longest word, `DEGRADED`, so the row does not reflow as the
-/// word changes. Checked against the bundled font in the tests.
-pub const QUALITY_W: f32 = 57.0;
-pub const FACTS_PAD: Padding = pad(7.0, 12.0, 8.0, 12.0);
 
 pub const HOST_PAD: Padding = pad(8.0, 12.0, 9.0, 12.0);
 pub const HOST_ROW_GAP: f32 = 6.0;
@@ -170,15 +159,6 @@ pub const INDEX_CHIP: Type = ty(9.5, Face::MonoBold, 0.0);
 pub const FOCUSED_TAG: Type = ty(8.5, Face::MonoBold, 0.16);
 pub const EMPTY_TITLE: Type = ty(10.5, Face::MonoBold, 0.08);
 pub const EMPTY_BODY: Type = ty(9.5, Face::Mono, 0.04);
-pub const READOUT_LABEL: Type = ty(8.5, Face::MonoBold, 0.16);
-pub const READOUT: Type = ty(16.0, Face::MonoBold, 0.0);
-pub const PING_VALUE: Type = ty(20.0, Face::MonoBold, 0.0);
-pub const UNIT: Type = ty(8.5, Face::Mono, 0.08);
-pub const SCOPE_FOOT: Type = ty(8.5, Face::Mono, 0.08);
-pub const PING_STATS: Type = ty(8.0, Face::Mono, 0.0);
-pub const QUALITY_WORD: Type = ty(8.5, Face::MonoBold, 0.0);
-pub const FACTS: Type = ty(8.5, Face::Mono, 0.04);
-pub const FACTS_KEY: Type = ty(8.5, Face::MonoBold, 0.04);
 pub const GAUGE_LABEL: Type = ty(9.0, Face::MonoBold, 0.12);
 pub const GAUGE_VALUE: Type = ty(11.0, Face::MonoBold, 0.0);
 pub const GAUGE_DETAIL: Type = ty(8.5, Face::Mono, 0.0);
@@ -190,10 +170,9 @@ pub const MENU: Type = ty(10.5, Face::Mono, 0.08);
 pub const FOOTER: Type = ty(8.5, Face::Mono, 0.16);
 pub const OVERFLOW: Type = ty(15.0, Face::Mono, 0.0);
 
-pub const ALL_TYPES: [Type; 34] = [
+pub const ALL_TYPES: [Type; 25] = [
     WORDMARK, SUBLINE, SUBLINE_JP, STATE_WORD, SECTION_INDEX, SECTION_LABEL, SECTION_META, COUNT, ROW_TITLE, ROW_SUB,
-    ACCOUNT_NAME, INDEX_CHIP, FOCUSED_TAG, EMPTY_TITLE, EMPTY_BODY, READOUT_LABEL, READOUT, PING_VALUE, UNIT, SCOPE_FOOT,
-    PING_STATS, QUALITY_WORD, FACTS, FACTS_KEY, GAUGE_LABEL, GAUGE_VALUE, GAUGE_DETAIL, NOTICE, PRIMARY, PRIMARY_SUB, LOG,
+    ACCOUNT_NAME, INDEX_CHIP, FOCUSED_TAG, EMPTY_TITLE, EMPTY_BODY, GAUGE_LABEL, GAUGE_VALUE, GAUGE_DETAIL, NOTICE, PRIMARY, PRIMARY_SUB, LOG,
     MENU, FOOTER, OVERFLOW,
 ];
 
@@ -374,18 +353,6 @@ mod tests {
         assert_eq!(hex(LAUNCH_GLOW), (0x7c, 0xe3, 0x8b, 0x40));
     }
 
-    /// `DEGRADED` (8 glyphs of 8.5 px B612 Mono Bold) + the 6 px gap + the
-    /// 6 px LED, rounded up to a whole pixel so the word never wraps.
-    #[test]
-    fn the_quality_column_fits_degraded_and_its_led() {
-        let word: f32 = "DEGRADED".chars().map(|c| crate::applet::fonts::advance_em(Face::MonoBold, c)).sum::<f32>() * QUALITY_WORD.size;
-        let eight = crate::applet::fonts::advance_em(Face::MonoBold, 'D') * QUALITY_WORD.size * 8.0;
-        assert!((word - eight).abs() < 1e-3, "a monospace face");
-        let need = eight + 6.0 + 6.0;
-        assert!(QUALITY_W >= need && QUALITY_W < need + 1.0, "QUALITY_W {QUALITY_W} for {need}");
-        assert_eq!(QUALITY_WORD.track, 0.0, "an untracked word: the sum above is its width");
-    }
-
     #[test]
     fn geometry_matches_the_handoff() {
         assert_eq!(POPOVER_WIDTH, 360);
@@ -393,7 +360,7 @@ mod tests {
         assert_eq!((TOGGLE_W, TOGGLE_H, KNOB_PX), (38.0, 19.0, 13.0));
         assert_eq!((ACCOUNT_ROW_HEIGHT, MENU_ROW_HEIGHT, PRIMARY_HEIGHT, OVERFLOW_PX), (28.0, 28.0, 36.0, 36.0));
         assert_eq!((LED_PX, HEADER_LED_PX, INDEX_CHIP_PX, PLATE_PX, PLATE_MARK_PX), (8.0, 6.0, 17.0, 26.0, 17.0));
-        assert_eq!((SCOPE_HEIGHT, GAUGE_CELLS, GAUGE_CELL_H), (104.0, 20, 7.0));
+        assert_eq!((GAUGE_CELLS, GAUGE_CELL_H), (20, 7.0));
         assert_eq!(HEADER_PAD, pad(12.0, 14.0, 10.0, 14.0));
         assert_eq!(CARD_MARGIN, pad(0.0, 10.0, 10.0, 10.0));
         assert_eq!(SECTION_HEAD_PAD, pad(0.0, 14.0, 6.0, 14.0));
@@ -401,14 +368,13 @@ mod tests {
         assert_eq!(MENU_PAD, 5.0);
     }
 
-    /// The terminal's floor is 8 px (ping stats, by design).
+    /// The terminal's floor is 8 px.
     #[test]
     fn nothing_is_set_below_8_px() {
         for t in ALL_TYPES {
             assert!(t.size >= 7.5, "{t:?}");
         }
         assert_eq!(SECTION_INDEX.size, 7.5, "the one exception: Michroma section chips");
-        assert_eq!(PING_STATS.size, 8.0);
     }
 
     #[test]

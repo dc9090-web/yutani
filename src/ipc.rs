@@ -84,11 +84,8 @@ pub enum Request {
     Quit,
     Status,
     /// The applet's popover is open. Older applets sent it to wake the
-    /// ping; the ping now follows EVE running, so the daemon answers `ok`
-    /// and does nothing.
+    /// ping, which is gone, so the daemon answers `ok` and does nothing.
     Watch,
-    TunnelConnect,
-    TunnelDisconnect,
     /// Start EVE through Steam and follow it to a hotkey-assigned client.
     Launch,
 }
@@ -131,9 +128,6 @@ impl Request {
             ("launch", None) => Ok(Request::Launch),
             ("status", None) => Ok(Request::Status),
             ("watch", None) => Ok(Request::Watch),
-            ("tunnel", Some("connect")) => Ok(Request::TunnelConnect),
-            ("tunnel", Some("disconnect")) => Ok(Request::TunnelDisconnect),
-            ("tunnel", _) => Err("tunnel needs connect or disconnect".into()),
             ("", _) => Err("empty request".into()),
             (cmd, Some(_))
                 if matches!(cmd, "next" | "prev" | "show" | "hide" | "toggle" | "layouts" | "quit" | "status" | "watch") =>
@@ -159,8 +153,6 @@ impl Request {
             Request::Quit => "quit\n".into(),
             Request::Status => "status\n".into(),
             Request::Watch => "watch\n".into(),
-            Request::TunnelConnect => "tunnel connect\n".into(),
-            Request::TunnelDisconnect => "tunnel disconnect\n".into(),
             Request::Launch => "launch\n".into(),
         }
     }
@@ -213,8 +205,6 @@ mod tests {
         assert_eq!(Request::parse("quit"), Ok(Request::Quit));
         assert_eq!(Request::parse("status"), Ok(Request::Status));
         assert_eq!(Request::parse("watch"), Ok(Request::Watch));
-        assert_eq!(Request::parse("tunnel connect"), Ok(Request::TunnelConnect));
-        assert_eq!(Request::parse("tunnel disconnect"), Ok(Request::TunnelDisconnect));
         assert_eq!(Request::parse("launch"), Ok(Request::Launch));
         assert_eq!(Request::Launch.to_line(), "launch\n");
     }
@@ -229,8 +219,7 @@ mod tests {
         assert_eq!(Request::parse("watch on").unwrap_err(), "watch takes no argument");
         assert_eq!(Request::parse("dance").unwrap_err(), "unknown command \"dance\"");
         assert_eq!(Request::parse("").unwrap_err(), "empty request");
-        assert_eq!(Request::parse("tunnel").unwrap_err(), "tunnel needs connect or disconnect");
-        assert_eq!(Request::parse("tunnel up").unwrap_err(), "tunnel needs connect or disconnect");
+        assert_eq!(Request::parse("tunnel connect").unwrap_err(), "unknown command \"tunnel\"", "the tunnel is gone");
     }
 
     #[test]
@@ -257,8 +246,7 @@ mod tests {
             Request::Quit,
             Request::Status,
             Request::Watch,
-            Request::TunnelConnect,
-            Request::TunnelDisconnect,
+            Request::Launch,
         ] {
             let line = r.to_line();
             assert!(line.ends_with('\n'));

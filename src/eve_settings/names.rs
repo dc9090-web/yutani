@@ -1,8 +1,8 @@
 //! Character names for the ids in the file names, from ESI's public
 //! `universe/names` endpoint, cached in `~/.config/yutani/characters.ron`.
 //!
-//! `curl` rather than an HTTP crate, like the tunnel worker's exit-IP
-//! lookup: one request, no new dependency, and a process timeout around it.
+//! `curl` rather than an HTTP crate: one request, no new dependency, and a
+//! process timeout around it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

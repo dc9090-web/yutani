@@ -17,8 +17,7 @@ libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "a401af8b1c54a8
     "wgpu",
     "single-instance",
     "applet",
-    # The XDG file-chooser portal, for the Tunnel page's Browse… button
-    # (`ui::App::browse_tunnel_conf`).
+    # The XDG file-chooser portal, for the Characters page's folder chooser.
     "xdg-portal",
 ] }
 calloop = { version = "0.14.4", features = ["executor"] }
@@ -31,8 +30,8 @@ notify = "8"
 tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "signal", "time", "macros"] }
 serde_json = "1"
 anyhow = "1"
-# Already in the tree via tokio and friends; only the `O_*` flag constants
-# are used (`tunnel::install::conf_guard`).
+# Already in the tree via tokio and friends; only `localtime_r` is used
+# (`model::date`).
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"

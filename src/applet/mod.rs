@@ -11,19 +11,15 @@ pub mod host;
 pub mod icon;
 pub mod install;
 pub mod menu;
-pub mod ping;
-pub mod rate;
 pub mod rocker;
-pub mod sand;
 pub mod skin;
 pub mod theme;
 
 use std::time::{Duration, Instant};
 
-/// The longest the icon shows the sync state after a `tunnel
-/// connect|disconnect` (spec §3). It is the *upper bound* on the wait, not
-/// the wait: [`still_pending`] ends it the moment the daemon reports the
-/// state that was asked for.
+/// The longest a start or quit of the service shows as settling. It is the
+/// *upper bound* on the wait, not the wait: the poll ends it the moment the
+/// daemon reports the state that was asked for.
 pub const PENDING_S: u64 = 10;
 
 /// How long an `err …` note stays under the menu (spec §7).
@@ -48,8 +44,6 @@ pub fn clip_note(text: &str) -> String {
 /// performs itself instead of asking the daemon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
-    Connect,
-    Disconnect,
     /// 1-based index in the daemon's layout order — the order `status`
     /// lists clients in.
     Focus(usize),
@@ -68,8 +62,6 @@ impl Action {
     pub fn request(&self) -> Option<crate::ipc::Request> {
         use crate::ipc::Request;
         match self {
-            Action::Connect => Some(Request::TunnelConnect),
-            Action::Disconnect => Some(Request::TunnelDisconnect),
             Action::Focus(n) => Some(Request::Focus(*n)),
             Action::Quit => Some(Request::Quit),
             Action::Preferences => Some(Request::Settings),
@@ -78,19 +70,6 @@ impl Action {
             Action::Launch => Some(crate::ipc::Request::Launch),
         }
     }
-}
-
-/// What the menu says under a Connect/Disconnect row while the daemon is
-/// still working on it — up to [`client::TUNNEL_TIMEOUT`], most of which
-/// would otherwise be a row that looks ignored. `None` for every other
-/// action: they are answered at once.
-pub fn waiting_note(action: Action) -> Option<String> {
-    let verb = match action {
-        Action::Connect => "connecting",
-        Action::Disconnect => "disconnecting",
-        _ => return None,
-    };
-    Some(format!("{verb}… (up to {} s)", client::TUNNEL_TIMEOUT.as_secs()))
 }
 
 /// 1 s with the popup open, 5 s with it closed (spec §2). The applet's
@@ -122,16 +101,9 @@ pub fn start_command() -> std::process::Command {
     cmd
 }
 
-/// A pending connect/disconnect has got what it asked for: the tunnel a
-/// Connect wanted up is up, or the one a Disconnect wanted down is down.
-pub fn pending_done(want_connected: bool, observed_connected: bool) -> bool {
-    want_connected == observed_connected
-}
-
-/// Whether a connect/disconnect armed with deadline `until` is still
-/// settling at `now`. The observed state ends it early (`satisfied`); the
-/// deadline only stops the sync icon spinning forever when the daemon never
-/// gets there.
+/// Whether a start or quit armed with deadline `until` is still settling
+/// at `now`. The observed state ends it early (`satisfied`); the deadline
+/// only stops it waiting forever when the daemon never gets there.
 pub fn still_pending(until: Instant, now: Instant, satisfied: bool) -> bool {
     !satisfied && now < until
 }
@@ -199,31 +171,12 @@ mod tests {
 
     #[test]
     fn actions_map_onto_the_ipc_protocol() {
-        assert_eq!(Action::Connect.request(), Some(Request::TunnelConnect));
-        assert_eq!(Action::Disconnect.request(), Some(Request::TunnelDisconnect));
         assert_eq!(Action::Focus(3).request(), Some(Request::Focus(3)));
         assert_eq!(Action::Quit.request(), Some(Request::Quit));
         assert_eq!(Action::Preferences.request(), Some(crate::ipc::Request::Settings));
         assert_eq!(Action::LayoutsAndCharacters.request(), Some(crate::ipc::Request::SettingsPage("layouts".into())));
         assert_eq!(Action::StartDaemon.request(), None);
         assert_eq!(Action::Launch.request(), Some(Request::Launch));
-    }
-
-    /// I2: only the two tunnel actions keep the user waiting.
-    #[test]
-    fn only_the_tunnel_actions_have_something_to_say_while_waiting() {
-        assert_eq!(waiting_note(Action::Connect).as_deref(), Some("connecting… (up to 15 s)"));
-        assert_eq!(waiting_note(Action::Disconnect).as_deref(), Some("disconnecting… (up to 15 s)"));
-        for action in [
-            Action::Focus(1),
-            Action::Quit,
-            Action::Preferences,
-            Action::LayoutsAndCharacters,
-            Action::StartDaemon,
-            Action::Launch,
-        ] {
-            assert_eq!(waiting_note(action), None, "{action:?}");
-        }
     }
 
     #[test]
@@ -249,15 +202,6 @@ mod tests {
         let cmd = start_command();
         assert_eq!(std::path::Path::new(cmd.get_program()).file_name().unwrap(), "yutani");
         assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["start"]);
-    }
-
-    #[test]
-    fn a_pending_action_ends_when_the_daemon_agrees() {
-        // Connect is satisfied by a link that is up, Disconnect by one down.
-        assert!(pending_done(true, true));
-        assert!(pending_done(false, false));
-        assert!(!pending_done(true, false));
-        assert!(!pending_done(false, true));
     }
 
     #[test]

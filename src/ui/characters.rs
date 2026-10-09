@@ -175,10 +175,8 @@ pub const RECENT_WRITE_WINDOW: Duration = Duration::from_secs(3);
 
 /// EVE processes owned by `uid` under `proc_root` (`/proc`), as
 /// `(pid, name)` sorted by pid. Matched on `comm` or argv[0] the way
-/// `adopt::scan` does, but without its slice filter: a client launched
-/// through `yutani launch` is in the slice and is exactly the one whose
-/// exit we are waiting for.
-pub fn running_eve_processes(proc_root: &Path, patterns: &[String], uid: u32) -> Vec<(u32, String)> {
+/// `eve_process::process_running` does.
+pub fn running_eve_processes(proc_root: &Path, patterns: &[&str], uid: u32) -> Vec<(u32, String)> {
     use std::os::unix::fs::MetadataExt;
     let Ok(dir) = std::fs::read_dir(proc_root) else { return Vec::new() };
     let mut out = Vec::new();
@@ -191,9 +189,9 @@ pub fn running_eve_processes(proc_root: &Path, patterns: &[String], uid: u32) ->
         let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
         let cmdline = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
         let argv0 = cmdline.split(|b| *b == 0).next().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
-        let name = if crate::adopt::is_eve_process(comm.trim(), patterns) {
+        let name = if crate::eve_process::is_eve_process(comm.trim(), patterns) {
             comm.trim().to_string()
-        } else if crate::adopt::is_eve_process(&argv0, patterns) {
+        } else if crate::eve_process::is_eve_process(&argv0, patterns) {
             argv0.rsplit(['/', '\\']).next().unwrap_or(&argv0).to_string()
         } else {
             continue;
@@ -233,7 +231,7 @@ pub fn recent_write(listing: &Listing, now: SystemTime) -> Option<&Entry> {
 /// through, so nothing else fresh existed then and no client was running.
 pub fn write_blocker(
     listing: &Listing,
-    patterns: &[String],
+    patterns: &[&str],
     proc_root: &Path,
     uid: u32,
     now: SystemTime,
@@ -249,7 +247,7 @@ pub fn write_blocker(
 }
 
 /// [`write_blocker`] against the real `/proc`, our uid and the clock.
-pub fn write_blocker_now(listing: &Listing, patterns: &[String], own_write: Option<SystemTime>) -> Option<String> {
+pub fn write_blocker_now(listing: &Listing, patterns: &[&str], own_write: Option<SystemTime>) -> Option<String> {
     write_blocker(listing, patterns, Path::new("/proc"), crate::ipc::uid(), SystemTime::now(), own_write)
 }
 
@@ -732,12 +730,12 @@ mod tests {
         std::fs::write(dir.join("cmdline"), cmdline).unwrap();
     }
 
-    fn patterns() -> Vec<String> {
-        vec!["exefile.exe".into(), "eve-online.exe".into()]
+    fn patterns() -> Vec<&'static str> {
+        vec!["exefile.exe", "eve-online.exe"]
     }
 
     /// The window is gone but `exefile.exe` is not: the process walk sees
-    /// it by `comm` or by argv[0], for our uid only, in or out of the slice.
+    /// it by `comm` or by argv[0], for our uid only.
     #[test]
     fn running_eve_processes_are_found_by_comm_or_argv0_for_our_uid() {
         let root = tmpdir("proc");

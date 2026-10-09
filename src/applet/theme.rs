@@ -16,7 +16,7 @@ pub fn badge_px(icon_px: f32) -> f32 {
 }
 /// The status badge's ring, in the panel's own background.
 pub const BADGE_RING_PX: f32 = 1.5;
-/// The panel icon's opacity in the daemon-offline / not-installed state:
+/// The panel icon's opacity in the daemon-offline state:
 /// the redesign's 40 %, "present but inactive".
 pub const DIM_OPACITY: f32 = 0.40;
 
@@ -112,16 +112,13 @@ pub const EVE_BADGE_ON_LIGHT: Color = Color::from_rgb8(0x1f, 0x6f, 0xd8);
 pub fn badge_fill(badge: super::icon::Badge) -> Color {
     use super::icon::Badge;
     match badge {
-        Badge::Connected => crate::applet::skin::PHOSPHOR,
         Badge::Eve => EVE_BADGE_ON_DARK,
-        Badge::Attention | Badge::Sync => crate::applet::skin::AMBER,
+        Badge::Attention => crate::applet::skin::AMBER,
     }
 }
 
-/// The status badge: phosphor, blue or amber on a dark panel, the
-/// theme's success/warning (and the darker blue) on a light one (phosphor on a light grey is
-/// under 2:1); a 1.5 px ring in the panel's own colour; Sync is a hollow
-/// outline.
+/// The status badge: blue or amber on a dark panel, a darker blue or the
+/// theme's warning on a light one; a 1.5 px ring in the panel's own colour.
 pub fn badge_class(badge: super::icon::Badge) -> cosmic::theme::Container<'static> {
     use super::icon::Badge;
     cosmic::theme::Container::custom(move |theme| {
@@ -131,15 +128,13 @@ pub fn badge_class(badge: super::icon::Badge) -> cosmic::theme::Container<'stati
             badge_fill(badge)
         } else {
             match badge {
-                Badge::Connected => success(c),
                 Badge::Eve => EVE_BADGE_ON_LIGHT,
-                Badge::Attention | Badge::Sync => warning(c),
+                Badge::Attention => warning(c),
             }
         };
-        let (bg, ring) = if badge == Badge::Sync { (panel, fill) } else { (fill, panel) };
         container::Style {
-            background: Some(Background::Color(bg)),
-            border: Border { radius: Radius::from(1.0), width: BADGE_RING_PX, color: ring },
+            background: Some(Background::Color(fill)),
+            border: Border { radius: Radius::from(1.0), width: BADGE_RING_PX, color: panel },
             ..Default::default()
         }
     })
@@ -157,7 +152,6 @@ mod tests {
         assert_eq!(badge_px(64.0), 10.0);
         assert_eq!(BADGE_RING_PX, 1.5);
         assert_eq!(DIM_OPACITY, 0.40);
-        assert_eq!(badge_fill(crate::applet::icon::Badge::Connected), crate::applet::skin::PHOSPHOR);
         assert_eq!(badge_fill(crate::applet::icon::Badge::Attention), crate::applet::skin::AMBER);
         assert_eq!(badge_fill(crate::applet::icon::Badge::Eve), EVE_BADGE_ON_DARK);
     }

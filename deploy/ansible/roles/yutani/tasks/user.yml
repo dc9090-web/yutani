@@ -37,7 +37,7 @@
 # daemon that is running under its unit is restarted: one that is not
 # running is left alone (the user starts Yutani when they want it), and one
 # started outside the unit (`yutani start` before `service install`) is not
-# systemd's to restart. The tunnel is a separate root unit and stays up. The
+# systemd's to restart. The
 # panel keeps running the old applet until it is restarted (log out and in,
 # or `pkill -x cosmic-panel`); the README says so.
 - name: Is the daemon running under its unit?

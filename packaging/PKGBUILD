@@ -6,26 +6,21 @@
 # daemon's systemd *user* unit. Per user, afterwards:
 #     systemctl --user enable --now yutani
 #     yutani shortcuts install
-#     yutani tunnel install ~/Downloads/<your>.conf      # optional
 #     Settings → Desktop → Panel → Applets → add "Yutani"
 
 pkgname=yutani
 pkgver=0.3.0.r351.g43dcc93
 pkgrel=1
-pkgdesc="Live thumbnails, hotkeys, a panel applet and an EVE-only WireGuard tunnel for EVE Online on COSMIC"
+pkgdesc="Live thumbnails, hotkeys and a panel applet for EVE Online on COSMIC"
 arch=('x86_64')
 url="https://github.com/dc9090-web/yutani"
 license=('GPL-3.0-only')
 depends=(
   'cosmic-panel'            # hosts the applet
   'cosmic-comp'             # the layer-shell and screencopy protocols the daemon needs
-  'xdg-desktop-portal-cosmic' # the file and folder choosers in the settings window
-  'wireguard-tools'         # wg
-  'nftables'                # nft
-  'iproute2'                # ip
-  'systemd'                 # systemctl, resolvectl, busctl, systemd-run
-  'polkit'                  # pkexec for the tunnel install
-  'curl'                    # the tunnel's exit-address lookup and ESI names
+  'xdg-desktop-portal-cosmic' # the folder chooser in the settings window
+  'systemd'                 # systemctl, busctl, systemd-run
+  'curl'                    # ESI character names
   'hicolor-icon-theme'
   'mesa'                    # libgbm and the EGL the GPU thumbnail pass loads
   'vulkan-icd-loader'       # wgpu

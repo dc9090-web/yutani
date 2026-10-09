@@ -26,7 +26,3 @@
 
 - name: Applet, service and shortcuts
   ansible.builtin.import_tasks: user.yml
-
-- name: EVE-only WireGuard tunnel
-  ansible.builtin.import_tasks: tunnel.yml
-  when: yutani_wg_conf | length > 0

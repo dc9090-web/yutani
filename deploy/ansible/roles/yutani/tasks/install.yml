@@ -1,5 +1,5 @@
 ---
-- name: Install the binaries (root-owned — the tunnel unit refuses anything else)
+- name: Install the binaries
   become: true
   ansible.builtin.copy:
     src: "{{ yutani_src_dir }}/target/release/{{ item }}"
