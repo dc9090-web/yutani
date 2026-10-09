@@ -7,7 +7,7 @@
 
 <br>
 
-**Live thumbnails, one-key client switching and an EVE-only WireGuard tunnel for EVE Online multiboxing on COSMIC.**
+**Live thumbnails and one-key client switching for EVE Online multiboxing on COSMIC.**
 
 Native Wayland. No middleware, no X11 layer, no injected DLLs. Just the latest COSMIC and Wayland protocols, a GPU and a very small daemon.
 
@@ -28,13 +28,12 @@ Native Wayland. No middleware, no X11 layer, no injected DLLs. Just the latest C
 
 ## ✨ What it does
 
-Yutani watches every EVE client on your desktop and gives you three things:
+Yutani watches every EVE client on your desktop and gives you two things:
 
 | | |
 | --- | --- |
 | 🖼️ **Live thumbnails** | Every other client, live, in a small overlay you can put anywhere. Click one to switch. |
 | ⌨️ **Global hotkeys** | `Ctrl+Alt+1…9` focuses a client, `Ctrl+Alt+←/→` steps through them, `Ctrl+Alt+T` hides the overlay. Works from inside the game. |
-| 🔒 **EVE-only tunnel** | All EVE traffic, and only EVE traffic, through a WireGuard exit of your choosing. Fewer hops, lower latency, kill-switch included. |
 
 …plus a panel applet, a settings window, a character-settings copier and a CLI that drives all of it.
 
@@ -49,8 +48,6 @@ Yutani is written in Rust against the protocols COSMIC ships today. Nothing is e
 | 🐧 | **Wayland, native** | The EVE client runs as a real Wayland toplevel under Proton (`PROTON_ENABLE_WAYLAND=1`). No XWayland, no window decorations from Wine. |
 | 🪐 | **COSMIC 1.9** | Developed and tested on COSMIC 1.9 (cosmic-comp 1.9.0); 0.1.x was built on 1.8, and nothing since needs 1.9-only protocols. `ext-image-copy-capture` and `ext-foreign-toplevel` for per-window capture, `zwlr_layer_shell` for the overlay, COSMIC's toplevel manager for focus. `yutani doctor` lists every protocol and whether your compositor has it. |
 | ⚡ | **Zero-copy capture** | Frames land in GPU `dmabuf` buffers via `gbm` and are post-processed on the GPU (scale, rounded corners). Nothing is read back to the CPU. Capture rate is yours to pick: 10, 15, 30 or 60 fps. |
-| 🧵 | **cgroup v2 + nftables** | The tunnel does not route by IP. Every EVE process lives in `yutani-eve.slice`, and the kernel marks its packets by cgroup. Everything else on the machine goes direct. |
-| 🔐 | **systemd + polkit** | The tunnel runs as a root-owned unit with a 0600 config. One password at install; connect and disconnect are passwordless afterwards. Private keys are never printed or logged. |
 | 🦀 | **One small binary** | `yutani` is the daemon, the CLI and the settings window. `yutani-applet` is the panel applet. Both come from one `cargo build`. |
 | 📦 | **Arch / CachyOS** | A `PKGBUILD` builds a proper pacman package from this checkout. Upgrading is `makepkg -si` again. |
 
@@ -76,32 +73,13 @@ Yutani is written in Rust against the protocols COSMIC ships today. Nothing is e
 
 ---
 
-## 🔒 The EVE-only tunnel
+## 🧭 The panel applet
 
 <div align="center">
-<img src="docs/screenshots/applet-popover.png" alt="The Yutani panel applet in its phosphor-terminal look: service and tunnel switches, accounts, a live network scope, ping to Tranquility through the tunnel, and CPU, GPU and RAM gauges" width="362">
+<img src="docs/screenshots/applet-popover.png" alt="The Yutani panel applet in its phosphor-terminal look: the service switch, accounts, CPU, GPU and RAM gauges and the Launch EVE button" width="362">
 
-*The panel applet: service and tunnel switches, accounts, a live network scope, ping to Tranquility through the tunnel, and host load.*
+*The panel applet: the service switch, accounts (click one to focus it), host load and Launch EVE.*
 </div>
-
-Give Yutani a wg-quick `.conf` (Proton VPN's download works as-is) and EVE's traffic goes through that exit while everything else on the machine stays direct.
-
-- 🎯 **Only EVE.** Launcher, client and their DNS. Your browser, Discord and Steam downloads never touch the tunnel.
-- 🛣️ **Fewer hops, lower latency.** Pick an exit near CCP's London datacentre and stop routing through your ISP's scenic tour.
-- 🛑 **Kill-switch.** If the tunnel is meant to be up and is not, EVE has no network at all rather than a leaking one.
-- 🌐 **DNS inside the tunnel.** EVE's domains resolve through resolvers reached *through* the tunnel, so nothing leaks via the system resolver.
-- 🔁 **Adopts running clients.** Started EVE before the tunnel? Yutani moves the process into the tunnel cgroup for you.
-- 📊 **Watch it work.** The applet shows the exit endpoint, uptime, live up/down rates and session totals over a sand-field scope whose speed is your throughput and whose colour mix is your up/down ratio.
-- 📡 **Ping to Tranquility, through the tunnel.** While an EVE client runs or the popover is open, the tunnel times a TCP connect to Tranquility once a second along the same path EVE's traffic takes: min/avg/max, jitter, loss and a sparkline. The quality word (NOMINAL, DEGRADED, POOR) is judged against your own normal, so a steady 330 ms from the far side of the world reads NOMINAL. Nothing is sent, and the probe pauses when nobody needs it.
-
-```bash
-yutani tunnel install ~/Downloads/EVE-UK-455.conf   # once; polkit asks for your password
-yutani tunnel connect                               # from now on: no password
-yutani tunnel status
-yutani tunnel disconnect
-```
-
-The settings window's **Tunnel** page does the same with a file chooser or drag-and-drop.
 
 ---
 
@@ -120,10 +98,10 @@ Set the overview, window positions and chat layout up once on one character, the
 
 | | |
 | --- | --- |
-| 🧭 **Panel applet** | A MU/TH/UR-style phosphor console: service and tunnel switches, accounts (click to focus), the network scope and ping, CPU/GPU/RAM load with temperatures, and a **▶ Launch EVE** button. Bundles its own fonts (B612 Mono, Michroma). Drops the scope first on short screens. |
+| 🧭 **Panel applet** | A MU/TH/UR-style phosphor console: the service switch, accounts (click to focus), CPU/GPU/RAM load with temperatures, and a **▶ Launch EVE** button. Bundles its own fonts (B612 Mono, Michroma). |
 | 🚀 **Launch EVE** | One press in the applet asks Steam to start EVE, minimises Steam's window if it popped up, waits while you click Play in the launcher, then shows the new client's hotkey and focuses it. A four-line log in the popover follows each step. |
-| ⚙️ **Settings window** | Display, Behavior, Layouts, Characters, Tunnel and Steam pages. Every change is live; the file it writes is plain RON at `~/.config/yutani/config.ron`. |
-| 🎮 **Steam integration** | One launch-options line makes Steam start EVE *through* Yutani so the tunnel and thumbnails see it from the first frame. The Steam page prints it with a Copy button. |
+| ⚙️ **Settings window** | Display, Behavior, Layouts, Characters and Steam pages. Every change is live; the file it writes is plain RON at `~/.config/yutani/config.ron`. |
+| 🎮 **Steam integration** | One launch-options line makes Steam start EVE *through* Yutani, so every client is capturable and keeps drawing while covered. The Steam page prints it with a Copy button. |
 | 🛰️ **Steam launch check** | If that line ever points at a `yutani` that is not there any more, Play fails silently. Yutani checks every 30 s and warns on the panel icon, in the popover and on the Steam page. |
 | 🩺 **`yutani doctor`** | Prints every Wayland protocol Yutani needs and whether your compositor advertises it. |
 | 🤖 **Ansible role** | `deploy/ansible/` sets up a fresh Arch/CachyOS COSMIC machine end to end. |
@@ -136,7 +114,7 @@ Set the overview, window positions and chat layout up once on one character, the
 
 - COSMIC **1.9** on a Wayland session (CachyOS or Arch). It is what Yutani is developed and tested on; 1.8 should still work but is no longer tested.
 - Proton with Wayland support for the clients. Tested with **GE-Proton11-6**.
-- For the tunnel: `wireguard-tools`, `nftables`, `polkit`, `curl` (all declared by the package).
+- `curl` for character names (declared by the package).
 - A stable Rust toolchain to build (`rustup default stable`).
 
 ### The package (recommended)
@@ -158,9 +136,8 @@ makepkg -si            # add --nocheck to skip the test suite
 Then, once per user:
 
 ```bash
-systemctl --user enable --now yutani                 # the daemon, back in a second after a crash
-yutani shortcuts install                             # the COSMIC keyboard shortcuts
-yutani tunnel install ~/Downloads/EVE-UK-455.conf    # optional: the EVE-only tunnel
+systemctl --user enable --now yutani    # the daemon, back in a second after a crash
+yutani shortcuts install                # the COSMIC keyboard shortcuts
 ```
 
 Add the applet: **Settings → Desktop → Panel → Applets → Yutani**.
@@ -188,7 +165,7 @@ For each EVE account in Steam: **EVE Online → Properties → Launch Options**:
 PROTON_ENABLE_WAYLAND=1 WINE_NO_WM_DECORATION=1 yutani launch -- %command%
 ```
 
-`PROTON_ENABLE_WAYLAND=1` gives each client a native Wayland toplevel that Yutani can capture, `WINE_NO_WM_DECORATION=1` stops Wine drawing its own title bar, and `yutani launch` starts the game inside the tunnel's cgroup. Spell the path out (`/usr/bin/yutani launch -- %command%`) if Steam cannot find `yutani` on `PATH`.
+`PROTON_ENABLE_WAYLAND=1` gives each client a native Wayland toplevel that Yutani can capture, `WINE_NO_WM_DECORATION=1` stops Wine drawing its own title bar, and `yutani launch` sets the game's present mode (below) before starting it. Spell the path out (`/usr/bin/yutani launch -- %command%`) if Steam cannot find `yutani` on `PATH`.
 
 `yutani launch` also adds `MESA_VK_WSI_PRESENT_MODE=mailbox` and `DXVK_FRAME_RATE=<your fastest display's refresh rate>` to the game's environment, so a client covered by another full-screen client keeps rendering (its thumbnail stays live) without running the GPU flat out. The compositor still vsyncs the screen, so nothing tears. (Not `immediate`: Mesa only offers that on compositors with tearing control, COSMIC has none, and a rejected override leaves the game stuck in vsync.) A value you put on the launch line yourself wins, and both knobs live under `launch` in `~/.config/yutani/config.ron`:
 
@@ -210,8 +187,7 @@ launch: (
 | `yutani focus N`, `next`, `prev` | Focus a client in layout order. |
 | `yutani layouts`, `yutani layout <name>` | List and apply saved layouts. |
 | `yutani settings [page]` | Open the settings window. |
-| `yutani tunnel connect` / `disconnect` / `status` | Drive the tunnel. |
-| `yutani status` | The daemon's state (clients, visibility, tunnel, Steam launch check) as JSON. |
+| `yutani status` | The daemon's state (clients, visibility, Steam launch check) as JSON. |
 | `yutani doctor` | Check the compositor for everything Yutani needs. |
 | `yutani quit` | Ask the running daemon to exit. |
 
@@ -219,14 +195,14 @@ launch: (
 
 ## 🤖 Deploying with Ansible
 
-`deploy/ansible/` has a playbook and a `yutani` role that does everything on this page, packages, build, applet, service, shortcuts and the optional tunnel, on a fresh Arch/CachyOS COSMIC machine, idempotently:
+`deploy/ansible/` has a playbook and a `yutani` role that does everything on this page, packages, build, applet, service and shortcuts, on a fresh Arch/CachyOS COSMIC machine, idempotently:
 
 ```bash
 cd deploy/ansible
 ansible-playbook -K playbook.yml -e yutani_user=<your user>
 ```
 
-See [deploy/ansible/README.md](deploy/ansible/README.md) for the variables and for installing the tunnel in the same run.
+See [deploy/ansible/README.md](deploy/ansible/README.md) for the variables.
 
 ---
 
@@ -236,8 +212,6 @@ See [deploy/ansible/README.md](deploy/ansible/README.md) for the variables and f
 - Capture is per-toplevel through `ext_image_copy_capture` with `ext_foreign_toplevel_image_capture_source`. Buffers are `gbm` dmabufs when the compositor offers ABGR8888, `wl_shm` otherwise.
 - A small GL pass scales each frame into a thumbnail-sized dmabuf with the corner radius baked into its alpha, so the compositor composites it directly.
 - The applet is a separate process that polls the daemon's unix socket for a JSON `status`; the protocol is versioned by `serde(default)` so daemon and applet can be upgraded independently. `YUTANI_APPLET_PREVIEW=1 yutani-applet` shows the popover in an ordinary window.
-- The ping probe runs in the tunnel's root worker, on its own thread, binding the tunnel address so policy routing sends it down the tunnel. It runs only while a lease file the daemon renews (`$XDG_RUNTIME_DIR/yutani-ping.lease`) is fresh; the worker only reads that file's timestamp.
-- The tunnel's root side is one systemd unit and one polkit rule. Marks come from cgroup matching in nftables; the kill-switch and the DNS DNAT live in the same table.
 - Design notes for every subsystem live in [`docs/superpowers/specs/`](docs/superpowers/specs/).
 
 ---
