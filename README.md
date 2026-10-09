@@ -76,7 +76,7 @@ Yutani is written in Rust against the protocols COSMIC ships today. Nothing is e
 ## 🧭 The panel applet
 
 <div align="center">
-<img src="docs/screenshots/applet-popover.png" alt="The Yutani panel applet in its phosphor-terminal look: the service switch, accounts, CPU, GPU and RAM gauges and the Launch EVE button" width="362">
+<img src="docs/screenshots/applet-popover.png" alt="The Yutani panel applet in its phosphor-terminal look: the service switch, accounts, CPU, GPU and RAM gauges and the Launch EVE button" width="360">
 
 *The panel applet: the service switch, accounts (click one to focus it), host load and Launch EVE.*
 </div>
@@ -212,6 +212,7 @@ See [deploy/ansible/README.md](deploy/ansible/README.md) for the variables.
 - Capture is per-toplevel through `ext_image_copy_capture` with `ext_foreign_toplevel_image_capture_source`. Buffers are `gbm` dmabufs when the compositor offers ABGR8888, `wl_shm` otherwise.
 - A small GL pass scales each frame into a thumbnail-sized dmabuf with the corner radius baked into its alpha, so the compositor composites it directly.
 - The applet is a separate process that polls the daemon's unix socket for a JSON `status`; the protocol is versioned by `serde(default)` so daemon and applet can be upgraded independently. `YUTANI_APPLET_PREVIEW=1 yutani-applet` shows the popover in an ordinary window.
+- The applet draws with iced's wgpu renderer, vendored in `vendor/iced_wgpu/` with MSAA switched off: on the panel's popup surface, MSAA left frozen copies of the popover's drawn shapes behind whenever it changed height (see `vendor/iced_wgpu/README.yutani.md`).
 - Design notes for every subsystem live in [`docs/superpowers/specs/`](docs/superpowers/specs/).
 
 ---
