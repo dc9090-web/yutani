@@ -493,16 +493,49 @@ fn swatch_class(color: Option<[f32; 4]>, selected: bool) -> cosmic_theme::Button
     }
 }
 
-/// A row of swatches plus the selected hex (or `accent`).
-pub fn swatches<'a, M: Clone + 'a>(options: &[Swatch], selected: Option<&str>, msg: impl Fn(String) -> M + 'a) -> Element<'a, M> {
+/// The custom swatch: the custom colour, ringed as selected, or a `+` on
+/// the control surface.
+fn custom_swatch_class(color: Option<[f32; 4]>) -> cosmic_theme::Button {
+    match color {
+        Some(_) => swatch_class(color, true),
+        None => {
+            let style = |c: &Cosmic, hover: bool| button::Style {
+                background: Some(Background::Color(if hover { roles::hover(c) } else { roles::control_bg(c) })),
+                border_radius: Radius::from(SWATCH_RADIUS),
+                border_width: 1.0,
+                border_color: roles::control_border(c),
+                ..Default::default()
+            };
+            cosmic_theme::Button::Custom {
+                active: Box::new(move |_, t| style(t.cosmic(), false)),
+                disabled: Box::new(move |t| style(t.cosmic(), false)),
+                hovered: Box::new(move |_, t| style(t.cosmic(), true)),
+                pressed: Box::new(move |_, t| style(t.cosmic(), true)),
+            }
+        }
+    }
+}
+
+/// A row of swatches, a trailing "custom" swatch that opens the colour
+/// picker (`on_custom`), and the selected hex (or `accent`). The custom
+/// swatch wears the selected colour, ringed, when no preset matches it, and
+/// a `+` otherwise.
+pub fn swatches<'a, M: Clone + 'a>(
+    options: &[Swatch],
+    selected: Option<&str>,
+    msg: impl Fn(String) -> M + 'a,
+    on_custom: M,
+) -> Element<'a, M> {
     let mut row = Row::new().spacing(5).align_y(Alignment::Center);
     let selected_norm = selected.map(str::to_ascii_lowercase);
+    let mut matched = false;
     for sw in options {
         let is = match (sw.hex, &selected_norm) {
             (None, None) => true,
             (Some(h), Some(s)) => h.eq_ignore_ascii_case(s),
             _ => false,
         };
+        matched |= is;
         let color = sw.hex.and_then(yutani::model::config::parse_color);
         row = row.push(
             widget::button::custom(widget::space().width(Length::Fixed(SWATCH_PX)).height(Length::Fixed(SWATCH_PX)))
@@ -511,6 +544,17 @@ pub fn swatches<'a, M: Clone + 'a>(options: &[Swatch], selected: Option<&str>, m
                 .on_press(msg(sw.hex.unwrap_or("").to_string())),
         );
     }
+    let custom = (!matched).then(|| selected.and_then(yutani::model::config::parse_color)).flatten();
+    let face: Element<'a, M> = match custom {
+        Some(_) => widget::space().width(Length::Fixed(SWATCH_PX)).height(Length::Fixed(SWATCH_PX)).into(),
+        None => widget::container(text("+", ROW_LABEL, Weight::Normal, Role::Secondary))
+            .width(Length::Fixed(SWATCH_PX))
+            .height(Length::Fixed(SWATCH_PX))
+            .align_x(Horizontal::Center)
+            .align_y(Vertical::Center)
+            .into(),
+    };
+    row = row.push(widget::button::custom(face).padding(0).class(custom_swatch_class(custom)).on_press(on_custom));
     let readout = selected.map_or_else(|| "accent".to_string(), |s| s.to_ascii_lowercase());
     row = row.push(widget::container(mono(readout, ROW_HELP, Weight::Normal, Role::Secondary)).width(Length::Fixed(62.0)).padding([0, 0, 0, 5]));
     row.into()

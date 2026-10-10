@@ -14,6 +14,7 @@ use cosmic::iced::alignment::{Horizontal, Vertical};
 use cosmic::iced::font::Weight;
 use cosmic::iced::window::Id as SurfaceId;
 use cosmic::iced::{Alignment, Color, Length};
+use cosmic::widget::color_picker::{ColorPickerModel, ColorPickerUpdate};
 use cosmic::widget::segmented_button;
 use cosmic::widget::{self, Column, Row};
 
@@ -132,6 +133,47 @@ pub const PALETTE: [ui::Swatch; 4] = [
     ui::Swatch { hex: Some("#1b2130") },
 ];
 
+/// Which border colour a custom-colour picker is editing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BorderTarget {
+    Focused,
+    Other,
+}
+
+impl BorderTarget {
+    /// The row's own message for a colour (`""` is the theme accent, for
+    /// the focused border only).
+    pub fn msg(self, hex: String) -> Msg {
+        match self {
+            BorderTarget::Focused => Msg::ActiveBorder(hex),
+            BorderTarget::Other => Msg::InactiveBorder(hex),
+        }
+    }
+
+    /// The config's current value as a row message would spell it.
+    fn current(self, config: &Config) -> String {
+        match self {
+            BorderTarget::Focused => config.active_border.clone().unwrap_or_default(),
+            BorderTarget::Other => config.inactive_border.clone(),
+        }
+    }
+}
+
+/// The custom-colour picker open under one border row (libcosmic's own,
+/// the one COSMIC Settings uses), with the value it opened on so Cancel can
+/// put it back.
+pub struct Picker {
+    pub target: BorderTarget,
+    pub model: ColorPickerModel,
+    pub before: String,
+}
+
+/// `#rrggbb` for a picked colour; the picker has no alpha.
+pub fn color_hex(color: Color) -> String {
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", byte(color.r), byte(color.g), byte(color.b))
+}
+
 /// The help line under the frame-rate pills, per value.
 pub fn fps_help(fps: u32) -> &'static str {
     match fps {
@@ -209,6 +251,8 @@ pub struct State {
     /// re-seeded by a later hand edit (which would eat what is being typed).
     pub active_border_field: String,
     pub inactive_border_field: String,
+    /// The custom-colour picker, while one is open.
+    pub picker: Option<Picker>,
     /// One line of feedback, shown at the header's end in place of `saved`.
     pub note: Option<String>,
     /// Set when `current.ron` exists but does not parse: auto-save is
@@ -256,6 +300,7 @@ impl State {
             confirm_delete: None,
             active_border_field: config.active_border.clone().unwrap_or_default(),
             inactive_border_field: config.inactive_border.clone(),
+            picker: None,
             note: None,
             layout_error: None,
             characters: Default::default(),
@@ -297,6 +342,65 @@ impl State {
         self.renaming = None;
         self.confirm_delete = None;
         self.copy_phase = CopyPhase::Idle;
+        self.picker = None;
+    }
+
+    /// The custom swatch was pressed: open the picker under that row on the
+    /// current colour, or close it if it is already open there.
+    pub fn toggle_picker(&mut self, target: BorderTarget, config: &Config) {
+        if self.picker.as_ref().is_some_and(|p| p.target == target) {
+            self.picker = None;
+            return;
+        }
+        let rgba = |c: [f32; 4]| Color { r: c[0], g: c[1], b: c[2], a: c[3] };
+        let fallback = match target {
+            BorderTarget::Focused => cosmic::theme::active().cosmic().accent_color().into(),
+            BorderTarget::Other => rgba(parse_color(&Config::default().inactive_border).unwrap_or([0.25, 0.25, 0.25, 1.0])),
+        };
+        let before = target.current(config);
+        let initial = parse_color(&before).map(rgba);
+        let mut model = ColorPickerModel::new("Hex", "RGB", Some(fallback), initial);
+        let _ = model.update::<()>(ColorPickerUpdate::ToggleColorPicker);
+        self.picker = Some(Picker { target, model, before });
+    }
+
+    /// Feed the open picker one update. Returns its task (the clipboard
+    /// write behind its Copy button) and, when the update settles on a
+    /// colour, the row message that writes it: a drag's release and Enter
+    /// apply live and keep the picker open, Save applies and closes,
+    /// Cancel puts back the colour it opened on, Reset the default.
+    pub fn picker_update<M>(&mut self, update: ColorPickerUpdate) -> (cosmic::Task<M>, Option<Msg>) {
+        let Some(picker) = self.picker.as_mut() else { return (cosmic::Task::none(), None) };
+        let target = picker.target;
+        match update {
+            ColorPickerUpdate::Cancel => {
+                let before = picker.before.clone();
+                self.picker = None;
+                (cosmic::Task::none(), Some(target.msg(before)))
+            }
+            ColorPickerUpdate::Reset => {
+                let _ = picker.model.update::<()>(ColorPickerUpdate::Reset);
+                let default = match target {
+                    BorderTarget::Focused => String::new(),
+                    BorderTarget::Other => Config::default().inactive_border,
+                };
+                (cosmic::Task::none(), Some(target.msg(default)))
+            }
+            ColorPickerUpdate::AppliedColor | ColorPickerUpdate::ActionFinished => {
+                let save = matches!(update, ColorPickerUpdate::AppliedColor);
+                let _ = picker.model.update::<()>(update);
+                let hex = picker.model.get_applied_color().map(color_hex);
+                if save {
+                    self.picker = None;
+                } else {
+                    // libcosmic closes the picker on every drag release;
+                    // here it stays open until Save or Cancel.
+                    let _ = picker.model.update::<()>(ColorPickerUpdate::ToggleColorPicker);
+                }
+                (cosmic::Task::none(), hex.map(|h| target.msg(h)))
+            }
+            update => (picker.model.update(update), None),
+        }
     }
 
     pub fn page(&self) -> Page {
@@ -325,13 +429,21 @@ pub enum Msg {
     Zoom(f32),
     /// Thumbnail opacity, percent (opacity spec §1.2).
     Opacity(u8),
+    /// The border toggle: off draws none, keeping width and colours.
+    ShowBorder(bool),
     BorderPx(u32),
+    /// The rounded-corners toggle: off draws square, keeping the radius.
+    RoundCorners(bool),
     CornerRadius(u32),
     ShowNames(bool),
     ActiveBorder(String),
     InactiveBorder(String),
     /// Border 1, radius 8, Accent, the inactive default.
     ResetFrame,
+    /// A border row's custom swatch: open (or close) its colour picker.
+    OpenPicker(BorderTarget),
+    /// The open colour picker's own messages.
+    Picker(ColorPickerUpdate),
     /// A sidebar item was pressed.
     Page(segmented_button::Entity),
     Mode(usize),
@@ -464,7 +576,21 @@ pub fn apply_config_field(config: &mut Config, msg: &Msg) -> Result<bool, String
         // out of the widget otherwise puts a 1.3000001 in the file.
         Msg::Zoom(v) => config.zoom_factor = ((*v * 10.0).round() / 10.0).clamp(1.0, 4.0),
         Msg::Opacity(v) => config.thumb_opacity = (*v).clamp(20, 100),
+        Msg::ShowBorder(on) => {
+            config.show_border = Some(*on);
+            // Switched on at 0 px would still draw nothing.
+            if *on && config.border_px == 0 {
+                config.border_px = 1;
+            }
+        }
         Msg::BorderPx(v) => config.border_px = (*v).min(16),
+        Msg::RoundCorners(on) => {
+            config.round_corners = *on;
+            // Switched on at 0 px would still be square.
+            if *on && config.corner_radius == 0 {
+                config.corner_radius = 8;
+            }
+        }
         Msg::CornerRadius(v) => config.corner_radius = (*v).min(64),
         Msg::ShowNames(v) => config.show_names = *v,
         Msg::ActiveBorder(text) => config.active_border = parse_optional_color(text)?,
@@ -472,7 +598,9 @@ pub fn apply_config_field(config: &mut Config, msg: &Msg) -> Result<bool, String
         Msg::ResetFrame => {
             let d = Config::default();
             config.border_px = 1;
+            config.show_border = Some(true);
             config.corner_radius = 8;
+            config.round_corners = true;
             config.active_border = None;
             config.inactive_border = d.inactive_border;
         }
@@ -624,8 +752,8 @@ fn broken_config(error: &str) -> Element<'_, Msg> {
 fn preview_strip<'a>(config: &'a Config) -> Element<'a, Msg> {
     let w = (config.thumb_width as f32 * 0.42).round();
     let h = (w * 0.5625).round();
-    let radius = config.corner_radius as f32;
-    let border = (config.border_px as f32).max(1.0);
+    let radius = config.radius() as f32;
+    let border = config.border_width() as f32;
     let alpha = f32::from(config.thumb_opacity) / 100.0;
     let inactive = parse_color(&config.inactive_border).unwrap_or([0.25, 0.25, 0.25, 1.0]);
     let active = config.active_border.as_deref().and_then(parse_color);
@@ -709,12 +837,14 @@ fn display_page<'a>(state: &'a State, config: &'a Config) -> Element<'a, Msg> {
     let names = ui::row("Show character names", Some("Caption under each thumbnail."), ui::toggle(config.show_names, Msg::ShowNames));
     let thumbnails = ui::card(vec![preview_strip(config), width, zoom, opacity, names]);
 
+    let on = config.border_on();
+    let toggle = ui::row_tight("Show border", Some("Off draws none; width and colours are kept."), ui::toggle(on, Msg::ShowBorder));
     let border = ui::row_tight(
         "Border width",
         None,
         ui::stepper(
             format!("{} px", config.border_px),
-            (config.border_px > 0).then(|| Msg::BorderPx(config.border_px - 1)),
+            (config.border_px > 1).then(|| Msg::BorderPx(config.border_px - 1)),
             (config.border_px < 8).then(|| Msg::BorderPx(config.border_px + 1)),
         ),
     );
@@ -723,7 +853,7 @@ fn display_page<'a>(state: &'a State, config: &'a Config) -> Element<'a, Msg> {
         None,
         ui::stepper(
             format!("{} px", config.corner_radius),
-            (config.corner_radius > 0).then(|| Msg::CornerRadius(config.corner_radius.saturating_sub(2))),
+            (config.corner_radius > 2).then(|| Msg::CornerRadius(config.corner_radius.saturating_sub(2))),
             (config.corner_radius < 24).then(|| Msg::CornerRadius(config.corner_radius + 2)),
         ),
     );
@@ -732,12 +862,12 @@ fn display_page<'a>(state: &'a State, config: &'a Config) -> Element<'a, Msg> {
     let active = ui::row_tight(
         "Focused client border",
         Some("Marks the client your keyboard is driving."),
-        ui::swatches(&focused_palette, config.active_border.as_deref(), Msg::ActiveBorder),
+        ui::swatches(&focused_palette, config.active_border.as_deref(), Msg::ActiveBorder, Msg::OpenPicker(BorderTarget::Focused)),
     );
     let inactive = ui::row_tight(
         "Other clients border",
         Some("Keep it dim so the focused one stands out."),
-        ui::swatches(&PALETTE, Some(config.inactive_border.as_str()), Msg::InactiveBorder),
+        ui::swatches(&PALETTE, Some(config.inactive_border.as_str()), Msg::InactiveBorder, Msg::OpenPicker(BorderTarget::Other)),
     );
     let reset = widget::container(
         Row::new().width(Length::Fill).push(widget::space().width(Length::Fill)).push(ui::standard_button("Reset frame to defaults", Some(Msg::ResetFrame))),
@@ -745,11 +875,36 @@ fn display_page<'a>(state: &'a State, config: &'a Config) -> Element<'a, Msg> {
     .width(Length::Fill)
     .padding(ui::CARD_FOOTER_PAD)
     .into();
-    let _ = state;
+    // The picker opens under the row whose custom swatch opened it.
+    let picker_under = |target: BorderTarget| {
+        state.picker.as_ref().filter(|p| p.target == target).map(|p| -> Element<'a, Msg> {
+            widget::container(p.model.builder(Msg::Picker).build("Recent colours", "Copy to clipboard", "Copied"))
+                .width(Length::Fill)
+                .align_x(Horizontal::Right)
+                .padding([4, 16, 13, 16])
+                .into()
+        })
+    };
+    let round = ui::row_tight("Rounded corners", None, ui::toggle(config.round_corners, Msg::RoundCorners));
+    let mut frame = vec![toggle];
+    if on {
+        frame.push(border);
+    }
+    frame.push(round);
+    if config.round_corners {
+        frame.push(radius);
+    }
+    if on {
+        frame.push(active);
+        frame.extend(picker_under(BorderTarget::Focused));
+        frame.push(inactive);
+        frame.extend(picker_under(BorderTarget::Other));
+    }
+    frame.push(reset);
     pane(
         "Display",
         "How each EVE client's thumbnail looks on the overlay.",
-        vec![thumbnails, ui::section("Frame", ui::card(vec![border, radius, active, inactive, reset]))],
+        vec![thumbnails, ui::section("Frame", ui::card(frame))],
     )
 }
 
@@ -1045,6 +1200,7 @@ mod tests {
             confirm_delete: None,
             active_border_field: String::new(),
             inactive_border_field: String::new(),
+            picker: None,
             note: None,
             layout_error: None,
             characters: Default::default(),
@@ -1349,6 +1505,62 @@ mod tests {
         );
         assert!(copy_confirm_text("A", 1, true).starts_with("This replaces the interface and account settings of 1 character with A’s."));
         assert_eq!(copy_done_text("Ishukone", 3), "Ishukone’s settings copied to 3 characters. Restart any running client to see them.");
+    }
+
+    /// The border toggle keeps width and colours; switched on at 0 px it
+    /// draws 1 px rather than nothing.
+    #[test]
+    fn the_border_toggle_keeps_the_frame_and_never_switches_on_to_nothing() {
+        let mut c = Config { border_px: 3, active_border: Some("#ff8800".into()), ..Config::default() };
+        assert!(c.border_on());
+        assert_eq!(apply_config_field(&mut c, &Msg::ShowBorder(false)), Ok(true));
+        assert_eq!((c.border_width(), c.border_px, c.active_border.as_deref()), (0, 3, Some("#ff8800")));
+        assert_eq!(apply_config_field(&mut c, &Msg::ShowBorder(true)), Ok(true));
+        assert_eq!(c.border_width(), 3);
+        let mut c = Config::default();
+        assert!(!c.border_on());
+        assert_eq!(apply_config_field(&mut c, &Msg::ShowBorder(true)), Ok(true));
+        assert_eq!(c.border_width(), 1);
+    }
+
+    #[test]
+    fn a_picked_colour_is_written_as_rrggbb() {
+        assert_eq!(color_hex(Color { r: 1.0, g: 0.5, b: 0.0, a: 1.0 }), "#ff8000");
+        assert_eq!(color_hex(Color::BLACK), "#000000");
+    }
+
+    /// Cancel puts back the colour the picker opened on; Save closes it.
+    #[test]
+    fn the_picker_cancels_back_to_where_it_started() {
+        let config = Config { inactive_border: "#123456".into(), ..Config::default() };
+        let mut state = test_state();
+        state.toggle_picker(BorderTarget::Other, &config);
+        assert!(state.picker.as_ref().is_some_and(|p| p.model.get_is_active()));
+        let (_, msg) = state.picker_update::<()>(ColorPickerUpdate::ActionFinished);
+        assert!(matches!(msg, Some(Msg::InactiveBorder(ref h)) if h == "#123456"));
+        assert!(state.picker.as_ref().is_some_and(|p| p.model.get_is_active()), "a drag release keeps it open");
+        let (_, msg) = state.picker_update::<()>(ColorPickerUpdate::Cancel);
+        assert!(matches!(msg, Some(Msg::InactiveBorder(ref h)) if h == "#123456"));
+        assert!(state.picker.is_none());
+        state.toggle_picker(BorderTarget::Focused, &config);
+        let (_, msg) = state.picker_update::<()>(ColorPickerUpdate::Reset);
+        assert!(matches!(msg, Some(Msg::ActiveBorder(ref h)) if h.is_empty()));
+        let (_, _) = state.picker_update::<()>(ColorPickerUpdate::AppliedColor);
+        assert!(state.picker.is_none());
+    }
+
+    /// The corners toggle keeps the radius; switched on at 0 px it rounds
+    /// to the default 8 rather than staying square.
+    #[test]
+    fn the_corners_toggle_keeps_the_radius() {
+        let mut c = Config { corner_radius: 12, ..Config::default() };
+        assert_eq!(apply_config_field(&mut c, &Msg::RoundCorners(false)), Ok(true));
+        assert_eq!((c.radius(), c.corner_radius), (0, 12));
+        assert_eq!(apply_config_field(&mut c, &Msg::RoundCorners(true)), Ok(true));
+        assert_eq!(c.radius(), 12);
+        let mut c = Config { corner_radius: 0, round_corners: false, ..Config::default() };
+        assert_eq!(apply_config_field(&mut c, &Msg::RoundCorners(true)), Ok(true));
+        assert_eq!(c.radius(), 8);
     }
 
     /// Reset frame: the handoff's defaults, and the accent for the focused

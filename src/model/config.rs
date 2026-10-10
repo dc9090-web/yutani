@@ -151,6 +151,10 @@ pub struct Config {
     /// Border width in logical px; 0 (default) draws no border at all —
     /// corners are rounded in the frame itself.
     pub border_px: u32,
+    /// The settings window's border toggle. Off keeps `border_px` (and the
+    /// colours) for when it is switched back on; absent — every file from
+    /// before the toggle — means "on if `border_px` is non-zero".
+    pub show_border: Option<bool>,
     pub show_names: bool,
     /// Hover zoom multiplier, 1.0–4.0 (1.0 = no hover zoom).
     pub zoom_factor: f32,
@@ -168,6 +172,9 @@ pub struct Config {
     pub mode: Mode,
     /// Corner radius of each thumbnail in logical px (COSMIC window radius is 8).
     pub corner_radius: u32,
+    /// The settings window's rounded-corners toggle. Off draws square
+    /// corners and keeps `corner_radius` for when it is switched back on.
+    pub round_corners: bool,
     pub dock_edge: Edge,
     /// Keyboard shortcuts written by `yutani shortcuts install`.
     pub shortcuts: ShortcutsConfig,
@@ -187,6 +194,7 @@ impl Default for Config {
             active_border: None,
             inactive_border: "#404040".to_string(),
             border_px: 0,
+            show_border: None,
             show_names: true,
             zoom_factor: 1.0,
             thumb_opacity: 100,
@@ -196,6 +204,7 @@ impl Default for Config {
             snap_edges: true,
             mode: Mode::Dock,
             corner_radius: 8,
+            round_corners: true,
             dock_edge: Edge::Top,
             shortcuts: ShortcutsConfig::default(),
             launch: LaunchConfig::default(),
@@ -212,6 +221,22 @@ pub fn config_path() -> PathBuf {
 }
 
 impl Config {
+    /// Whether the thumbnail border is drawn (see `show_border`).
+    pub fn border_on(&self) -> bool {
+        self.show_border.unwrap_or(self.border_px > 0)
+    }
+
+    /// The border width actually drawn: `border_px`, or 0 while it is off.
+    pub fn border_width(&self) -> u32 {
+        if self.border_on() { self.border_px } else { 0 }
+    }
+
+    /// The corner radius actually drawn: `corner_radius`, or 0 while
+    /// rounded corners are off.
+    pub fn radius(&self) -> u32 {
+        if self.round_corners { self.corner_radius } else { 0 }
+    }
+
     pub fn load() -> Self {
         Self::load_from(&config_path())
     }

@@ -14,7 +14,7 @@ use crate::model::config::{Config, Mode, parse_color};
 /// window's aspect as displayed (a raw frame with a 90°/270° transform is
 /// shown with its axes swapped).
 pub fn size(config: &Config, image: Option<&CaptureImage>) -> (u32, u32) {
-    size_at_width(config.thumb_width, config.border_px, image)
+    size_at_width(config.thumb_width, config.border_width(), image)
 }
 
 /// `size` at an explicit content width: the hover zoom scales the width
@@ -37,7 +37,7 @@ pub fn zoomed_size(config: &Config, image: Option<&CaptureImage>, zoomed: bool) 
         return size(config, image);
     }
     let width = (config.thumb_width as f32 * config.zoom_factor).round() as u32;
-    size_at_width(width, config.border_px, image)
+    size_at_width(width, config.border_width(), image)
 }
 
 /// Surface size for a `src_w`×`src_h` source shown `thumb_width` wide
@@ -67,7 +67,7 @@ pub fn view<'a>(client: &'a Client, config: &Config) -> Element<'a, Msg> {
     let active_override = client.info.activated.then(|| config.active_border.as_deref().and_then(parse_color)).flatten();
     let inactive = parse_color(&config.inactive_border).unwrap_or([0.25, 0.25, 0.25, 1.0]);
     let activated = client.info.activated;
-    let border_px = config.border_px as f32;
+    let border_px = config.border_width() as f32;
     // One factor for everything drawn here — the image (through the
     // compositor's alpha modifier) and every iced layer over it — so the
     // thumbnail fades as one object rather than leaving an opaque frame
@@ -138,7 +138,7 @@ pub fn view<'a>(client: &'a Client, config: &Config) -> Element<'a, Msg> {
 
     let stack = cosmic::iced::widget::stack(layers).width(Length::Fill).height(Length::Fill);
 
-    let radius = config.corner_radius as f32;
+    let radius = config.radius() as f32;
     let framed = widget::container(stack)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -187,6 +187,12 @@ mod tests {
         let c = with_opacity(Color { r: 0.1, g: 0.2, b: 0.3, a: 0.5 }, 0.5);
         assert_eq!((c.r, c.g, c.b), (0.1, 0.2, 0.3));
         assert!((c.a - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_border_switched_off_takes_no_room() {
+        let config = Config { thumb_width: 320, border_px: 2, show_border: Some(false), ..Config::default() };
+        assert_eq!(size(&config, None), (320, 180));
     }
 
     #[test]

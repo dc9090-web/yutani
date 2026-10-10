@@ -272,7 +272,7 @@ impl App {
         let Some(client) = self.clients.get(handle) else { return };
         let s = self.scale_for(handle, client) as u32;
         let physical = (logical.0 * s, logical.1 * s);
-        let radius = self.config.corner_radius * s;
+        let radius = self.config.radius() * s;
         tracing::debug!(?handle, ?logical, scale = s, ?physical, radius, "thumb size");
         self.send(Cmd::SetThumbSize(handle.clone(), physical, radius));
     }
@@ -1311,8 +1311,9 @@ impl App {
         if new.fps != self.config.fps {
             self.send(Cmd::SetFps(new.fps));
         }
-        if new.corner_radius != self.config.corner_radius {
+        if new.radius() != self.config.radius() {
             self.config.corner_radius = new.corner_radius;
+            self.config.round_corners = new.round_corners;
             self.resend_thumb_sizes();
         }
         let mode_changed = new.mode != self.config.mode;
@@ -1442,6 +1443,17 @@ impl App {
                 S::ResetFrame => {
                     state.active_border_field.clear();
                     state.inactive_border_field = Config::default().inactive_border;
+                }
+                S::OpenPicker(target) => {
+                    state.toggle_picker(*target, &self.config);
+                    return Task::none();
+                }
+                S::Picker(update) => {
+                    let (task, apply) = state.picker_update(update.clone());
+                    return match apply {
+                        Some(msg) => Task::batch([task, self.on_settings(msg)]),
+                        None => task,
+                    };
                 }
                 S::Name(text) => {
                     state.name_field = text.clone();
