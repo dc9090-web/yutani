@@ -146,7 +146,15 @@ Per pane, what is new in the code:
   live radius/border/colours/opacity/names); rows as designed plus the
   opacity row; steppers (`spin_button`) with the handoff's ranges; swatch
   rows (Accent + four) with hex readout; "Reset frame to defaults" → border
-  1, radius 8, Accent, inactive default.
+  1, radius 8, Accent, inactive default. Added 2026-10-10: *Show border*
+  and *Rounded corners* toggles head the Frame card (off hides the width
+  stepper and colour rows, or the radius stepper, and keeps their values;
+  on from 0 px gives 1 px / 8 px, so the steppers now stop at 1 and 2);
+  each colour row ends in a custom swatch (`+`, or the custom colour
+  ringed) that opens libcosmic's colour picker inline under the row — a
+  drag's release or Enter applies live, Save closes, Cancel restores the
+  colour it opened on, Reset gives Accent / `#404040`; reset turns both
+  toggles on.
 - **Behaviour:** mode as two described cards; Dock edge row rendered only
   when Docked; fps segmented 15/30/60 with the changing help text;
   visibility segmented; three toggles; prefix segmented (Ctrl + Alt / Super

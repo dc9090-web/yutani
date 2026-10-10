@@ -242,7 +242,7 @@ is shown (square corners). See `2026-09-12-yutani-gpu-thumbnails-design.md`.
 ### Thumbnail widget (shared by both modes)
 
 ```
-container (border: border_px, colour = active ? active_border : inactive_border, radius corner_radius)
+container (border: border_width(), colour = active ? active_border : inactive_border, radius radius())
   └ stack
       ├ Subsurface(frame, content_fit: Contain, z: -1)
       ├ text(character_name | "Logging in…")  bottom-left pill, hidden if !show_names
@@ -253,6 +253,9 @@ Width is `config.thumb_width`; height follows the captured window's aspect.
 The image subsurface sits below the parent (`z = -1`); border, name label and
 pin are iced-drawn over it; corners are rounded in the buffer itself (the
 backend's GL pass masks each frame with `corner_radius`, see §5).
+`Config::border_width()` and `Config::radius()` are `border_px` and
+`corner_radius` with the settings window's toggles applied (`show_border`,
+`round_corners`): 0 while switched off.
 `CaptureState::Unavailable` replaces the subsurface with a grey placeholder
 and the name.
 
@@ -408,9 +411,11 @@ if the socket is absent it prints "yutani is not running" and exits 1.
   active_border: None,        // None = COSMIC theme accent (focused-window outline colour)
   inactive_border: "#404040",
   border_px: 0,                // 0 = no border (default since 2026-09-12); corners stay rounded
+  show_border: None,         // the settings toggle; Some(false) draws none and keeps border_px; None = on iff border_px > 0
   show_names: true,
   zoom_factor: 1.0,          // 1.0 = no hover zoom
   corner_radius: 8,          // px, baked into the frame on the GPU
+  round_corners: true,       // the settings toggle; false = square corners, corner_radius kept
   visibility: EveFocusedOnly, // Always | EveFocusedOnly (default since 2026-09-12: thumbnails only over EVE)
   hide_active: false,
   snap_grid: true,

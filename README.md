@@ -62,7 +62,7 @@ Yutani is written in Rust against the protocols COSMIC ships today. Nothing is e
 </div>
 
 - 👥 **Any number of accounts.** Every EVE client is picked up automatically, named by character, and given the next free hotkey.
-- 🎛️ **Thumbnails are 100 % yours.** Width, opacity (20–100 %), corner radius, border colour and width, character-name label, hover zoom (up to 4×), and the capture rate.
+- 🎛️ **Thumbnails are 100 % yours.** Width, opacity (20–100 %), rounded or square corners and their radius, a border you can switch on or off with its width and colours (presets, or any colour from COSMIC's colour picker), character-name label, hover zoom (up to 4×), and the capture rate.
 - 📍 **Put them anywhere.** *Floating* mode drags free, with snap-to-grid and snap-to-edge against other thumbnails. *Dock* mode pins them to the top, bottom, left or right edge of the screen.
 - 🧠 **Positions are remembered per character.** Log Ishukone in tomorrow and her thumbnail is where you left it. Save whole arrangements as named layouts and apply them from the applet or the CLI.
 - 🖥️ **Full-screen, windowed, or fixed.** The overlay is a layer-shell surface, so it sits above a full-screen client just as happily as over a window. *Dock* mode is the fixed-position option for people who never want to drag.
