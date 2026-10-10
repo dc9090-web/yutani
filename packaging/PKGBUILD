@@ -9,7 +9,7 @@
 #     Settings → Desktop → Panel → Applets → add "Yutani"
 
 pkgname=yutani
-pkgver=0.4.0.r357.ga9e268d
+pkgver=0.4.0.r359.g079661d
 pkgrel=1
 pkgdesc="Live thumbnails, hotkeys and a panel applet for EVE Online on COSMIC"
 arch=('x86_64')
