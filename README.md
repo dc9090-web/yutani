@@ -103,6 +103,7 @@ Set the overview, window positions and chat layout up once on one character, the
 | | |
 | --- | --- |
 | 🧭 **Panel applet** | A MU/TH/UR-style phosphor console: the service switch, accounts (click to focus), CPU/GPU/RAM load with temperatures, and a **▶ Launch EVE** button. Bundles its own fonts (B612 Mono, Michroma). |
+| 🎨 **Dock icons for EVE** | Under Proton the EVE launcher and client show up in COSMIC's dock with blank icons. Yutani ships an icon for each, matched to their windows (`eve-online.exe` and `exefile.exe`), so both are easy to spot. |
 | 🚀 **Launch EVE** | One press in the applet asks Steam to start EVE, minimises Steam's window if it popped up, waits while you click Play in the launcher, then shows the new client's hotkey and focuses it. A four-line log in the popover follows each step. |
 | ⚙️ **Settings window** | Display, Behavior, Layouts, Characters and Steam pages. Every change is live; the file it writes is plain RON at `~/.config/yutani/config.ron`. |
 | 🎮 **Steam integration** | One launch-options line makes Steam start EVE *through* Yutani, so every client is capturable and keeps drawing while covered. The Steam page prints it with a Copy button. |
@@ -224,4 +225,4 @@ See [deploy/ansible/README.md](deploy/ansible/README.md) for the variables.
 
 ## 📜 License
 
-GPL-3.0-only. EVE Online and all related marks are the property of CCP hf. Yutani is a fan-made tool and is not affiliated with or endorsed by CCP.
+GPL-3.0-only. EVE Online and all related marks are the property of CCP hf. Yutani is a fan-made tool and is not affiliated with or endorsed by CCP. The EVE logo in the dock icons (`assets/icons/eve-*.png`) is CCP's, used only to label the game's own windows, and is not covered by the GPL.
