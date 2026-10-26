@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=EVE Launcher
+Exec=steam steam://rungameid/8500
+Icon=yutani-eve-launcher
+StartupWMClass=eve-online.exe
+NoDisplay=true
+Terminal=false

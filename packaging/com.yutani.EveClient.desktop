@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=EVE Online
+Exec=steam steam://rungameid/8500
+Icon=yutani-eve-client
+StartupWMClass=exefile.exe
+NoDisplay=true
+Terminal=false

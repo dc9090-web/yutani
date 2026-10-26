@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
-use crate::assets::{APP_NAME, ICONS, LEGACY_ICONS, SYMBOLIC_NAME};
+use crate::assets::{APP_NAME, EVE_ICONS, ICONS, LEGACY_ICONS, SYMBOLIC_NAME};
 
 /// Must match `Applet::APP_ID` in the applet binary — cosmic-panel keys
 /// applets on the desktop-entry id.
@@ -17,6 +17,34 @@ pub const DESKTOP_ID: &str = "com.yutani.Applet.desktop";
 /// `NoDisplay=true` and only cosmic-panel reads it, this one is what the
 /// Applications list shows.
 pub const LAUNCHER_ID: &str = "com.yutani.Yutani.desktop";
+
+/// One of [`EVE_ENTRIES`]. `NoDisplay`: Steam's own EVE entry is the one in
+/// Applications; these only lend the windows an icon. `Exec` starts EVE
+/// through Steam, for a dock pin.
+macro_rules! eve_entry {
+    ($name:literal, $icon:literal, $class:literal) => {
+        concat!(
+            "[Desktop Entry]\n",
+            "Type=Application\n",
+            "Name=", $name, "\n",
+            "Exec=steam steam://rungameid/8500\n",
+            "Icon=", $icon, "\n",
+            "StartupWMClass=", $class, "\n",
+            "NoDisplay=true\n",
+            "Terminal=false\n",
+        )
+    };
+}
+
+/// Hidden entries that give EVE's own windows a dock icon: COSMIC matches a
+/// window to the entry whose `StartupWMClass` is its app_id, and Wine names
+/// the launcher's `eve-online.exe` and the client's `exefile.exe` (seen on
+/// GE-Proton11-6 and 11-11). `(file name, text)`; the package ships the
+/// same files from `packaging/`.
+pub const EVE_ENTRIES: [(&str, &str); 2] = [
+    ("com.yutani.EveLauncher.desktop", eve_entry!("EVE Launcher", "yutani-eve-launcher", "eve-online.exe")),
+    ("com.yutani.EveClient.desktop", eve_entry!("EVE Online", "yutani-eve-client", "exefile.exe")),
+];
 
 /// Every file one install touches. A struct rather than more and more
 /// parameters, so `install_to`/`uninstall_from` stay readable.
@@ -204,11 +232,12 @@ fn remove_legacy_icons(theme_dir: &Path) -> anyhow::Result<usize> {
     Ok(removed)
 }
 
-/// Write the five icons and both desktop files; returns how many files were
-/// written. Overwrites, so running it twice is a no-op with the same count.
-/// Any icon a previous version wrote under its old names is removed.
+/// Write the icons, both desktop files and the EVE entries; returns how
+/// many files were written. Overwrites, so running it twice is a no-op with
+/// the same count. Any icon a previous version wrote under its old names is
+/// removed.
 pub fn install_to(paths: &Paths, applet_exec: &str, yutani_exec: &str) -> anyhow::Result<usize> {
-    for (dir, name, bytes) in ICONS {
+    for (dir, name, bytes) in ICONS.iter().chain(&EVE_ICONS) {
         let path = icon_path(&paths.icons, dir, name);
         let parent = path.parent().expect("an icon path always has its theme subdirectory");
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -217,15 +246,21 @@ pub fn install_to(paths: &Paths, applet_exec: &str, yutani_exec: &str) -> anyhow
     remove_legacy_icons(&paths.icons)?;
     write_entry(&paths.applet, desktop_entry(applet_exec))?;
     write_entry(&paths.launcher, launcher_entry(yutani_exec))?;
-    Ok(ICONS.len() + 2)
+    for (file, text) in EVE_ENTRIES {
+        write_entry(&paths.applications().join(file), text.to_string())?;
+    }
+    Ok(ICONS.len() + EVE_ICONS.len() + 2 + EVE_ENTRIES.len())
 }
 
 /// Remove exactly the files `install_to` wrote (and any a previous version
 /// wrote); returns how many existed.
 pub fn uninstall_from(paths: &Paths) -> anyhow::Result<usize> {
     let mut removed = 0;
-    for (dir, name, _) in ICONS {
+    for (dir, name, _) in ICONS.iter().chain(&EVE_ICONS) {
         removed += usize::from(remove_entry(&icon_path(&paths.icons, dir, name))?);
+    }
+    for (file, _) in EVE_ENTRIES {
+        removed += usize::from(remove_entry(&paths.applications().join(file))?);
     }
     removed += remove_legacy_icons(&paths.icons)?;
     removed += usize::from(remove_entry(&paths.applet)?);
@@ -307,12 +342,39 @@ mod tests {
         Sandbox { root, paths }
     }
 
+    /// Every file an install writes.
+    const FILES: usize = ICONS.len() + EVE_ICONS.len() + 2 + EVE_ENTRIES.len();
+
     fn install(s: &Sandbox) -> usize {
         install_to(&s.paths, "/opt/yutani-applet", "/opt/yutani").unwrap()
     }
 
     fn symbolic(sandbox: &Sandbox) -> PathBuf {
         sandbox.paths.icons.join(crate::assets::SYMBOLIC_DIR)
+    }
+
+    /// The EVE entries the package ships are the ones `applet install`
+    /// writes, and each names an icon `EVE_ICONS` installs at every size.
+    #[test]
+    fn the_eve_entries_match_the_package_and_name_installed_icons() {
+        assert_eq!(EVE_ENTRIES[0].1, include_str!("../../packaging/com.yutani.EveLauncher.desktop"));
+        assert_eq!(EVE_ENTRIES[1].1, include_str!("../../packaging/com.yutani.EveClient.desktop"));
+        for ((_, text), (icon, class)) in EVE_ENTRIES.iter().zip([
+            (crate::assets::EVE_LAUNCHER_ICON, "eve-online.exe"),
+            (crate::assets::EVE_CLIENT_ICON, "exefile.exe"),
+        ]) {
+            assert!(text.lines().any(|l| l == format!("Icon={icon}")), "{text}");
+            assert!(text.lines().any(|l| l == format!("StartupWMClass={class}")), "{text}");
+            assert!(text.contains("NoDisplay=true\n"));
+            let sizes = EVE_ICONS.iter().filter(|(_, name, _)| *name == format!("{icon}.png")).count();
+            assert_eq!(sizes, 6, "{icon}");
+        }
+        // Real PNGs, at the size their directory says.
+        for (dir, name, bytes) in EVE_ICONS {
+            assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "{dir}/{name}");
+            let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+            assert_eq!(dir, format!("{width}x{width}/apps"), "{name}");
+        }
     }
 
     /// The entries the package ships are byte-for-byte what `applet
@@ -381,24 +443,24 @@ mod tests {
     #[test]
     fn install_writes_every_icon_and_both_desktop_files_and_is_idempotent() {
         let s = dirs("install");
-        assert_eq!(install(&s), 7);
-        for (dir, name, bytes) in crate::assets::ICONS {
-            assert_eq!(std::fs::read(s.paths.icons.join(dir).join(name)).unwrap(), bytes);
+        assert_eq!(install(&s), FILES);
+        for (dir, name, bytes) in crate::assets::ICONS.iter().chain(&EVE_ICONS) {
+            assert_eq!(std::fs::read(s.paths.icons.join(dir).join(name)).unwrap(), *bytes);
         }
         let applet = std::fs::read_to_string(&s.paths.applet).unwrap();
         assert!(applet.contains("Exec=/opt/yutani-applet"));
         let launcher = std::fs::read_to_string(&s.paths.launcher).unwrap();
         assert!(launcher.contains("Exec=/opt/yutani start\n"));
         assert!(launcher.contains("Icon=yutani\n"));
-        // Running it again rewrites the same seven files, not more.
-        assert_eq!(install(&s), 7);
+        // Running it again rewrites the same files, not more.
+        assert_eq!(install(&s), FILES);
         assert_eq!(std::fs::read_dir(symbolic(&s)).unwrap().count(), 1);
         assert_eq!(
             std::fs::read_dir(s.paths.icons.join(crate::assets::SCALABLE_DIR)).unwrap().count(),
             1
         );
-        // Both entries, and nothing else, in `applications`.
-        assert_eq!(std::fs::read_dir(s.paths.applet.parent().unwrap()).unwrap().count(), 2);
+        // Our entries, and nothing else, in `applications`.
+        assert_eq!(std::fs::read_dir(s.paths.applet.parent().unwrap()).unwrap().count(), 2 + EVE_ENTRIES.len());
     }
 
     /// The launcher's colours must not land among the symbolic icons, where
@@ -425,12 +487,12 @@ mod tests {
             }
         };
         write_legacy(&s);
-        assert_eq!(install(&s), 7);
+        assert_eq!(install(&s), FILES);
         for (dir, name) in LEGACY_ICONS {
             assert!(!s.paths.icons.join(dir).join(name).exists(), "{dir}/{name} must be gone after install");
         }
         write_legacy(&s);
-        assert_eq!(uninstall_from(&s.paths).unwrap(), 7 + LEGACY_ICONS.len());
+        assert_eq!(uninstall_from(&s.paths).unwrap(), FILES + LEGACY_ICONS.len());
         for (dir, name) in LEGACY_ICONS {
             assert!(!s.paths.icons.join(dir).join(name).exists(), "{dir}/{name} must be gone after uninstall");
         }
@@ -443,7 +505,7 @@ mod tests {
         std::fs::write(symbolic(&s).join("someone-elses-symbolic.svg"), b"<svg/>").unwrap();
         let foreign = s.paths.applet.parent().unwrap().join("someone-elses.desktop");
         std::fs::write(&foreign, b"[Desktop Entry]\n").unwrap();
-        assert_eq!(uninstall_from(&s.paths).unwrap(), 7);
+        assert_eq!(uninstall_from(&s.paths).unwrap(), FILES);
         assert!(!s.paths.applet.exists());
         assert!(!s.paths.launcher.exists());
         assert!(symbolic(&s).join("someone-elses-symbolic.svg").exists(), "foreign icons stay");
@@ -462,7 +524,7 @@ mod tests {
         let s = dirs("partial");
         install(&s);
         std::fs::remove_file(&s.paths.launcher).unwrap();
-        assert_eq!(uninstall_from(&s.paths).unwrap(), 6);
+        assert_eq!(uninstall_from(&s.paths).unwrap(), FILES - 1);
     }
 
     #[test]

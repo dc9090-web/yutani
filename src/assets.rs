@@ -49,6 +49,30 @@ pub const ICONS: [(&str, &str, &[u8]); 5] = [
     (APPS_32_DIR, "yutani.svg", YUTANI_APP_32),
 ];
 
+/// The EVE launcher's and client's own icons (Daniel's art, 2026-10-26),
+/// for the dock: Wine gives their windows app_ids no desktop entry claims,
+/// so COSMIC drew them blank. `crate::applet::install::EVE_ENTRIES` points
+/// each window at its icon. PNG at every size the dock asks for, 512 px
+/// down, each resampled once from the 512.
+macro_rules! eve_icons {
+    ($($app:literal $size:literal),* $(,)?) => {
+        [$((
+            concat!($size, "x", $size, "/apps"),
+            concat!("yutani-eve-", $app, ".png"),
+            include_bytes!(concat!("../assets/icons/eve-", $app, "-", $size, ".png")) as &[u8],
+        )),*]
+    };
+}
+
+pub const EVE_ICONS: [(&str, &str, &[u8]); 12] = eve_icons![
+    "launcher" "512", "launcher" "256", "launcher" "128", "launcher" "64", "launcher" "48", "launcher" "32",
+    "client" "512", "client" "256", "client" "128", "client" "64", "client" "48", "client" "32",
+];
+
+/// The EVE icons' theme names.
+pub const EVE_LAUNCHER_ICON: &str = "yutani-eve-launcher";
+pub const EVE_CLIENT_ICON: &str = "yutani-eve-client";
+
 /// The files the pre-redesign install wrote (2026-09-12 handoff). Both
 /// `install` and `uninstall` remove them, so an upgraded machine is left
 /// with no stale marks in its theme.

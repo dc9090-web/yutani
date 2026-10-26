@@ -70,10 +70,20 @@ package() {
   install -Dm644 assets/icons/yutani.svg             "$icons/scalable/apps/yutani.svg"
   install -Dm644 assets/icons/yutani-48.svg          "$icons/48x48/apps/yutani.svg"
   install -Dm644 assets/icons/yutani-32.svg          "$icons/32x32/apps/yutani.svg"
+  # The EVE launcher's and client's dock icons (src/assets.rs::EVE_ICONS).
+  local app size
+  for app in launcher client; do
+    for size in 512 256 128 64 48 32; do
+      install -Dm644 "assets/icons/eve-$app-$size.png" "$icons/${size}x${size}/apps/yutani-eve-$app.png"
+    done
+  done
 
   # The applet entry cosmic-panel lists, and the Applications launcher.
   install -Dm644 packaging/com.yutani.Applet.desktop "$pkgdir/usr/share/applications/com.yutani.Applet.desktop"
   install -Dm644 packaging/com.yutani.Yutani.desktop "$pkgdir/usr/share/applications/com.yutani.Yutani.desktop"
+  # Hidden entries that lend EVE's own windows those icons in the dock.
+  install -Dm644 packaging/com.yutani.EveLauncher.desktop "$pkgdir/usr/share/applications/com.yutani.EveLauncher.desktop"
+  install -Dm644 packaging/com.yutani.EveClient.desktop "$pkgdir/usr/share/applications/com.yutani.EveClient.desktop"
 
   # The daemon's user unit: `systemctl --user enable --now yutani`.
   install -Dm644 packaging/yutani.service "$pkgdir/usr/lib/systemd/user/yutani.service"
