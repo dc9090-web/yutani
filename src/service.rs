@@ -126,6 +126,43 @@ pub fn start_unit() -> anyhow::Result<()> {
     systemctl(&["start", UNIT_NAME])
 }
 
+/// Stop the unit if it runs. Best effort, for `yutani exit`: after a
+/// `quit` the daemon is already on its way out, and this only makes sure
+/// systemd is not about to bring it back. Quiet when there is no unit.
+pub fn stop_unit() {
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", UNIT_NAME])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// The link `systemctl --user enable` makes for this unit's
+/// `WantedBy=graphical-session.target`, under `config_dir`.
+pub fn wants_link_in(config_dir: &Path) -> PathBuf {
+    config_dir.join("systemd").join("user").join("graphical-session.target.wants").join(UNIT_NAME)
+}
+
+/// Whether the daemon starts at login: the unit is enabled for this user.
+/// Read from the link itself rather than `systemctl is-enabled`, so the
+/// settings window can ask without a subprocess.
+pub fn starts_at_login() -> bool {
+    dirs::config_dir().is_some_and(|dir| wants_link_in(&dir).symlink_metadata().is_ok())
+}
+
+/// Start the daemon at login, or stop doing so. Turning it on installs the
+/// per-user unit first when no unit exists (a source build), for `exe`.
+pub fn set_starts_at_login(on: bool, exe: &Path) -> anyhow::Result<()> {
+    if on {
+        if !installed() {
+            install(exe)?;
+        }
+        systemctl(&["enable", UNIT_NAME])
+    } else {
+        systemctl(&["disable", UNIT_NAME])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +173,16 @@ mod tests {
     fn the_packaged_unit_is_what_service_install_writes_for_usr_bin() {
         assert_eq!(include_str!("../packaging/yutani.service"), unit_text("/usr/bin/yutani"));
         assert_eq!(PACKAGED_UNIT, "/usr/lib/systemd/user/yutani.service");
+    }
+
+    /// `WantedBy=graphical-session.target` is what `enable` links from.
+    #[test]
+    fn start_at_login_is_the_graphical_session_wants_link() {
+        assert!(unit_text("/usr/bin/yutani").contains("WantedBy=graphical-session.target\n"));
+        assert_eq!(
+            wants_link_in(Path::new("/c")),
+            Path::new("/c/systemd/user/graphical-session.target.wants/yutani.service")
+        );
     }
 
     #[test]

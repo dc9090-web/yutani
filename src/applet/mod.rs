@@ -40,7 +40,7 @@ pub fn clip_note(text: &str) -> String {
     }
 }
 
-/// A menu press. `request()` is `None` for the one action the applet
+/// A menu press. `request()` is `None` for the actions the applet
 /// performs itself instead of asking the daemon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -56,6 +56,9 @@ pub enum Action {
     StartDaemon,
     /// Launch EVE through Steam (Phase 3).
     Launch,
+    /// Close all of Yutani: the daemon, its unit, and this applet, which
+    /// comes off the panel until Yutani next starts (`crate::panel`).
+    Exit,
 }
 
 impl Action {
@@ -66,7 +69,7 @@ impl Action {
             Action::Quit => Some(Request::Quit),
             Action::Preferences => Some(Request::Settings),
             Action::LayoutsAndCharacters => Some(Request::SettingsPage("layouts".into())),
-            Action::StartDaemon => None,
+            Action::StartDaemon | Action::Exit => None,
             Action::Launch => Some(crate::ipc::Request::Launch),
         }
     }

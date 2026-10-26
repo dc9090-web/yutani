@@ -274,6 +274,9 @@ pub struct State {
     /// seeded from `App::steam_findings` when the window opens and
     /// refreshed by `Msg::SteamChecked`.
     pub steam_findings: Vec<yutani::steam::Finding>,
+    /// Behaviour: the daemon's unit is enabled, so it starts at login
+    /// (`yutani::service::starts_at_login`), re-read with the rest.
+    pub start_at_login: bool,
 }
 
 impl State {
@@ -309,6 +312,7 @@ impl State {
             steam_full_path: false,
             exe_path,
             steam_findings: Vec::new(),
+            start_at_login: false,
         };
         state.refresh();
         state
@@ -318,6 +322,7 @@ impl State {
     /// `config.ron` currently parses, and whether `current.ron` does.
     pub fn refresh(&mut self) {
         self.layouts = layout::summaries();
+        self.start_at_login = yutani::service::starts_at_login();
         self.refresh_from(&config_path());
         self.refresh_layout_from(&layout::current_path());
     }
@@ -461,6 +466,10 @@ pub enum Msg {
     CopyReset,
     /// Steam: "Steam can't find yutani".
     SteamFullPath(bool),
+    /// Behaviour: enable or disable the unit.
+    StartAtLogin(bool),
+    /// `systemctl enable`/`disable` finished (`Err`: for the note line).
+    StartAtLoginSet(Result<(), String>),
     /// Characters page: the source card pressed.
     SourceCharacter(usize),
     /// Characters page: also copy the account-wide file.
@@ -648,7 +657,7 @@ pub fn view<'a>(
         (Page::Characters, _) => super::characters::view(state, clients_running),
         (_, Some(error)) => broken_config(error),
         (Page::Display, None) => display_page(state, config),
-        (Page::Behavior, None) => behavior_page(config),
+        (Page::Behavior, None) => behavior_page(state, config),
     };
     let pane = widget::scrollable(widget::container(body).width(Length::Fill).padding(ui::CONTENT_PAD))
         .width(Length::Fill)
@@ -910,7 +919,7 @@ fn display_page<'a>(state: &'a State, config: &'a Config) -> Element<'a, Msg> {
 
 // ---- Behaviour ----------------------------------------------------------------------
 
-fn behavior_page<'a>(config: &'a Config) -> Element<'a, Msg> {
+fn behavior_page<'a>(state: &'a State, config: &'a Config) -> Element<'a, Msg> {
     let floating = index_of(&MODES, &Mode::Floating).unwrap_or(0);
     let dock = index_of(&MODES, &Mode::Dock).unwrap_or(1);
     let modes = widget::container(
@@ -968,6 +977,12 @@ fn behavior_page<'a>(config: &'a Config) -> Element<'a, Msg> {
     }
     let chips = widget::container(grid).width(Length::Fill).padding(ui::ROW_PAD).into();
 
+    let startup = ui::row(
+        "Start Yutani at login",
+        Some("Thumbnails and hotkeys are ready when you sign in. Off: start Yutani from the panel or from Applications."),
+        ui::toggle(state.start_at_login, Msg::StartAtLogin),
+    );
+
     pane(
         "Behaviour",
         "Where thumbnails sit, when they appear, and the keys that drive them.",
@@ -975,6 +990,7 @@ fn behavior_page<'a>(config: &'a Config) -> Element<'a, Msg> {
             ui::section("Arrangement", ui::card(arrangement)),
             ui::section("Visibility & dragging", ui::card(visibility)),
             ui::section("Keyboard shortcuts", ui::card(vec![prefix, chips])),
+            ui::section("Startup", ui::card(vec![startup])),
         ],
     )
 }
@@ -1208,6 +1224,7 @@ mod tests {
             copied: false,
             steam_full_path: false,
             exe_path: "/usr/bin/yutani".to_string(),
+            start_at_login: false,
             steam_findings: Vec::new(),
         }
     }

@@ -58,6 +58,8 @@ enum Command {
     },
     /// Ask the running instance to exit
     Quit,
+    /// Close every part of Yutani: the daemon, its service, the settings window and the panel applet (the next start brings the applet back)
+    Exit,
     /// Print the daemon's status (clients, visibility) as JSON
     Status,
     /// Run a command (Steam's %command%) with the game's launch environment
@@ -109,12 +111,29 @@ enum AppletAction {
     Uninstall,
 }
 
+/// `yutani exit`: the daemon (and the unit, so systemd does not bring it
+/// back), then the applet off every panel, which is what makes
+/// cosmic-panel close it.
+fn exit_all() -> anyhow::Result<ExitCode> {
+    if cli::is_running() {
+        let _ = cli::send(&ipc::Request::Quit);
+    }
+    yutani::service::stop_unit();
+    yutani::panel::take_off()?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// The daemon itself, in this process (the bare `yutani` and `yutani start`
 /// without a unit).
 fn run_daemon() -> anyhow::Result<ExitCode> {
     if cli::is_running() {
         let _ = writeln!(io::stderr().lock(), "yutani is already running");
         return Ok(ExitCode::from(1));
+    }
+    // Back from `yutani exit`: the applet goes back on the panel it was
+    // taken off. Not fatal: thumbnails work without it.
+    if let Err(err) = yutani::panel::put_back() {
+        tracing::warn!("cannot put the applet back on the panel: {err:#}");
     }
     let config = model::config::Config::load();
     // The IPC server owns the socket file: it is removed on `quit`, and a
@@ -153,6 +172,7 @@ fn main() -> ExitCode {
         Some(Command::Settings { page: None }) => Ok(cli::send(&ipc::Request::Settings)),
         Some(Command::Settings { page: Some(page) }) => Ok(cli::send(&ipc::Request::SettingsPage(page))),
         Some(Command::Quit) => Ok(cli::send(&ipc::Request::Quit)),
+        Some(Command::Exit) => exit_all(),
         Some(Command::Status) => Ok(cli::send(&ipc::Request::Status)),
         Some(Command::Launch { command }) => Ok(launch::run(command)),
         Some(Command::Shortcuts { action: ShortcutsAction::Install }) => {

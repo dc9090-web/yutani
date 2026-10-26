@@ -1504,6 +1504,28 @@ impl App {
                     state.steam_full_path = *on;
                     return Task::none();
                 }
+                // The toggle moves at once; systemctl runs off the UI
+                // thread, and its answer re-reads the link either way.
+                S::StartAtLogin(on) => {
+                    state.start_at_login = *on;
+                    let (on, exe) = (*on, PathBuf::from(&state.exe_path));
+                    return cosmic::iced::Task::perform(
+                        tokio::task::spawn_blocking(move || {
+                            yutani::service::set_starts_at_login(on, &exe).map_err(|err| format!("{err:#}"))
+                        }),
+                        |done| {
+                            let result = done.unwrap_or_else(|err| Err(err.to_string()));
+                            cosmic::Action::App(Msg::Settings(settings::Msg::StartAtLoginSet(result)))
+                        },
+                    );
+                }
+                S::StartAtLoginSet(result) => {
+                    state.start_at_login = yutani::service::starts_at_login();
+                    if let Err(err) = result {
+                        state.note = Some(err.clone());
+                    }
+                    return Task::none();
+                }
                 // Clamped to the listing the window is showing: libcosmic
                 // publishes an index past the end on ctrl+scroll, and a
                 // refresh can shrink the list under a queued message.

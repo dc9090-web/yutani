@@ -10,6 +10,8 @@ pub mod eve_settings;
 pub mod ipc;
 pub mod launch_eve;
 pub mod model;
+/// Taking the applet off COSMIC's panels on exit, and putting it back.
+pub mod panel;
 /// Bounded subprocess execution.
 pub mod proc;
 pub mod service;

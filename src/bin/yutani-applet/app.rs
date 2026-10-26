@@ -312,6 +312,18 @@ impl cosmic::Application for Applet {
                     Task::none()
                 }
             },
+            // The daemon first (offline is fine), then the panel lists:
+            // taking the applet off them is what makes cosmic-panel close it.
+            Msg::Press(Action::Exit) => cosmic::task::future(async {
+                let _ = client::send(yutani::ipc::Request::Quit).await;
+                let result = tokio::task::spawn_blocking(|| {
+                    yutani::service::stop_unit();
+                    yutani::panel::take_off().map(drop).map_err(|err| format!("cannot exit: {err:#}"))
+                })
+                .await
+                .unwrap_or_else(|err| Err(format!("cannot exit: {err}")));
+                Msg::Done(Action::Exit, result)
+            }),
             Msg::Press(action) => {
                 let Some(request) = action.request() else {
                     return Task::none();
@@ -328,6 +340,8 @@ impl cosmic::Application for Applet {
                 self.quitting = Some(Instant::now() + Duration::from_secs(PENDING_S));
                 self.poll()
             }
+            // Off the panel already, or about to be: nothing left to show.
+            Msg::Done(Action::Exit, Ok(())) => std::process::exit(0),
             Msg::Done(_, Ok(())) => self.poll(),
             Msg::Done(action, Err(msg)) => {
                 if action == Action::StartDaemon {
