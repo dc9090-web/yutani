@@ -34,6 +34,7 @@ Yutani watches every EVE client on your desktop and gives you two things:
 | --- | --- |
 | 🖼️ **Live thumbnails** | Every other client, live, in a small overlay you can put anywhere. Click one to switch. |
 | ⌨️ **Global hotkeys** | `Ctrl+Alt+1…9` focuses a client, `Ctrl+Alt+←/→` steps through them, `Ctrl+Alt+T` hides the overlay. Works from inside the game. |
+| 🛰️ **Where they are, and what's shooting them** | Each caption names the character's solar system (or *Docked*). Taking fire, a scram, a point, a jam or a neut turns the caption red with the incoming dps and `SCRAM` / `POINT` / `JAM` / `NEUT` tags, and the border red, read live from EVE's own log files. |
 
 …plus a panel applet, a settings window, a character-settings copier and a CLI that drives all of it.
 
@@ -70,6 +71,7 @@ Yutani is written in Rust against the protocols COSMIC ships today. Nothing is e
 - 🧼 **Clean clients.** `WINE_NO_WM_DECORATION=1` removes Wine's title bar; COSMIC draws the frame, or none at all in full screen.
 - 🎞️ **Live even when covered.** A full-screen client hidden under another gets no frame callbacks from the compositor, and with vsync on it simply stops drawing, so its thumbnail would freeze. `yutani launch` starts each client in Mesa's mailbox present mode instead, which never waits for that callback, with DXVK's frame limiter set to your fastest display's refresh rate so nothing runs flat out. Both are plain environment variables; set either one on the launch line yourself and Yutani leaves it alone, or tune them under `launch` in `config.ron`.
 - 🎨 **Follows your theme.** The active border defaults to COSMIC's accent colour, the same one the compositor outlines the focused window with.
+- 📡 **Read from the game's logs.** EVE writes `Documents/EVE/logs` inside its Proton prefix; Yutani finds it through Steam's library list (or `eve_logs_dir` in `config.ron`), tails each character's game log and Local chat log, and derives the status line from the lines you would see in the combat log. Nothing is injected, polled from memory or sent anywhere. Shield, armour and hull are not in the logs, so they are not shown. `yutani doctor` says which folder is in use.
 
 ---
 
@@ -108,7 +110,7 @@ Set the overview, window positions and chat layout up once on one character, the
 | ⚙️ **Settings window** | Display, Behavior, Layouts, Characters and Steam pages. Every change is live; the file it writes is plain RON at `~/.config/yutani/config.ron`. |
 | 🎮 **Steam integration** | One launch-options line makes Steam start EVE *through* Yutani, so every client is capturable and keeps drawing while covered. The Steam page prints it with a Copy button. |
 | 🛰️ **Steam launch check** | If that line ever points at a `yutani` that is not there any more, Play fails silently. Yutani checks every 30 s and warns on the panel icon, in the popover and on the Steam page. |
-| 🩺 **`yutani doctor`** | Prints every Wayland protocol Yutani needs and whether your compositor advertises it. |
+| 🩺 **`yutani doctor`** | Prints every Wayland protocol Yutani needs and whether your compositor advertises it, plus the EVE logs folder the status line reads. |
 | 🤖 **Ansible role** | `deploy/ansible/` sets up a fresh Arch/CachyOS COSMIC machine end to end. |
 
 ---

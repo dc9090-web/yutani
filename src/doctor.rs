@@ -79,6 +79,10 @@ fn write_checks(out: &mut impl io::Write, checks: &[Check]) -> io::Result<()> {
 }
 
 /// The GL line and the verdict.
+fn write_logs_line(out: &mut impl io::Write, logs: &str) -> io::Result<()> {
+    writeln!(out, "{:<56} {}", "EVE logs (status line)", logs)
+}
+
 fn write_verdict(out: &mut impl io::Write, gl_status: &str, ok: bool) -> io::Result<()> {
     writeln!(out, "\n{:<56} {}", "gl (rounded corners)", gl_status)?;
     if ok {
@@ -122,6 +126,22 @@ pub fn run() -> anyhow::Result<ExitCode> {
         })
         .map(|()| "ok".to_string())
         .unwrap_or_else(|err| format!("unavailable: {err:#} (thumbnails will have square corners)"));
+    // The log reader behind the thumbnails' status line.
+    let config = crate::model::config::Config::load();
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let logs = match yutani::eve_logs::discover(config.eve_logs_dir.as_deref().map(std::path::Path::new), &home) {
+        Ok(dir) => {
+            let found = yutani::eve_logs::tail::scan(&dir, std::time::SystemTime::now());
+            let names: Vec<&String> = found.game.keys().chain(found.local.keys()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+            if names.is_empty() {
+                format!("{} (no log written in the last hour)", dir.display())
+            } else {
+                format!("{} ({})", dir.display(), names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", "))
+            }
+        }
+        Err(e) => format!("off: {e}"),
+    };
+    tolerate_broken_pipe(write_logs_line(&mut out, &logs))?;
     tolerate_broken_pipe(write_verdict(&mut out, &gl_status, ok))?;
 
     Ok(if ok { ExitCode::SUCCESS } else { ExitCode::from(2) })
