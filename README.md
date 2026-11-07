@@ -12,7 +12,7 @@
 Native Wayland. No middleware, no X11 layer, no injected DLLs. Just the latest COSMIC and Wayland protocols, a GPU and a very small daemon.
 
 [![Rust](https://img.shields.io/badge/Rust-stable-b7410e?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![COSMIC](https://img.shields.io/badge/COSMIC-1.10%2B-3b82f6)](https://system76.com/cosmic)
+[![COSMIC](https://img.shields.io/badge/COSMIC-1.11%2B-3b82f6)](https://system76.com/cosmic)
 [![Wayland](https://img.shields.io/badge/Wayland-native-7c3aed)](https://wayland.freedesktop.org/)
 [![Arch / CachyOS](https://img.shields.io/badge/Arch%20%2F%20CachyOS-pacman%20package-1793d1?logo=archlinux&logoColor=white)](packaging/PKGBUILD)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-green)](LICENSE)
@@ -47,7 +47,7 @@ Yutani is written in Rust against the protocols COSMIC ships today. Nothing is e
 | | Technology | Why it matters |
 | --- | --- | --- |
 | 🐧 | **Wayland, native** | The EVE client runs as a real Wayland toplevel under Proton (`PROTON_ENABLE_WAYLAND=1`). No XWayland, no window decorations from Wine. |
-| 🪐 | **COSMIC 1.10+** | Fully supported on COSMIC 1.10 and later; developed and tested on COSMIC 1.10 (cosmic-comp 1.10.0). `ext-image-copy-capture` and `ext-foreign-toplevel` for per-window capture, `zwlr_layer_shell` for the overlay, COSMIC's toplevel manager for focus. `yutani doctor` lists every protocol and whether your compositor has it. |
+| 🪐 | **COSMIC 1.11+** | Fully supported on COSMIC 1.11 and later; developed and tested on COSMIC 1.11 (cosmic-comp 1.11.0). `ext-image-copy-capture` and `ext-foreign-toplevel` for per-window capture, `zwlr_layer_shell` for the overlay, COSMIC's toplevel manager for focus. `yutani doctor` lists every protocol and whether your compositor has it. |
 | ⚡ | **Zero-copy capture** | Frames land in GPU `dmabuf` buffers via `gbm` and are post-processed on the GPU (scale, rounded corners). Nothing is read back to the CPU. Capture rate is yours to pick: 10, 15, 30 or 60 fps. |
 | 🦀 | **One small binary** | `yutani` is the daemon, the CLI and the settings window. `yutani-applet` is the panel applet. Both come from one `cargo build`. |
 | 📦 | **Arch / CachyOS** | A `PKGBUILD` builds a proper pacman package from this checkout. Upgrading is `makepkg -si` again. |
@@ -125,7 +125,7 @@ Set the overview, window positions and chat layout up once on one character, the
 
 ### Requirements
 
-- COSMIC **1.10 or later** on a Wayland session (CachyOS or Arch). Fully supported, and what Yutani is developed and tested on.
+- COSMIC **1.11 or later** on a Wayland session (CachyOS or Arch). Fully supported, and what Yutani is developed and tested on.
 - Proton with Wayland support for the clients. Tested with **GE-Proton11-11**.
 - `curl` for character names (declared by the package).
 - A stable Rust toolchain to build (`rustup default stable`).
