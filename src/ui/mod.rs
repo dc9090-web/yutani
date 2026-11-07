@@ -97,6 +97,8 @@ pub struct Client {
     /// Pause/resume is an edge on this, not on whether a surface exists, so
     /// a client born hidden is paused too.
     pub paused: bool,
+    /// What the EVE log says about this character (system, under fire…).
+    pub status: status::Status,
     /// Connector name of the output this client's surface was created on;
     /// empty when it has none. Applying a layout compares this with the
     /// layout's output: a layer surface is bound to one output for life, so
@@ -118,6 +120,9 @@ pub struct App {
     pub launch: Option<yutani::launch_eve::Launch<Handle>>,
     /// The zero of the launch state machine's millisecond clock.
     pub launch_epoch: Instant,
+    /// EVE's `Documents/EVE/logs`, when found; `None` keeps the status
+    /// line off (`resolve_logs_dir`).
+    pub logs_dir: Option<PathBuf>,
     pub outputs: Vec<Output>,
     pub layout: Layout,
     /// Set at startup when `current.ron` exists but failed to parse (spec
@@ -194,6 +199,10 @@ pub enum Msg {
     /// `refresh_characters`; `on_characters_listed` takes them from here.
     CharactersListed(CharactersListed),
     Settings(settings::Msg),
+    /// New lines in EVE's logs, already parsed (`yutani::eve_logs::watch`).
+    EveLog(Vec<yutani::eve_logs::LogEvent>),
+    /// 1 Hz while any client's status has a live hold: let it expire.
+    StatusTick,
 }
 
 /// What the Characters page reads from disk: the profile listing (or why
@@ -230,6 +239,12 @@ fn response_of(result: Result<Option<String>, String>) -> crate::ipc::Response {
 const OWN_WRITE_ECHO: Duration = Duration::from_millis(500);
 
 impl App {
+    /// Any client's status still has a timed hold or hit running.
+    pub fn status_active(&self) -> bool {
+        let now = Instant::now();
+        self.clients.values().any(|c| c.status.active(now))
+    }
+
     /// Hand a command to the backend. `false` when it could not be sent —
     /// before the backend has handed over its channel (the first moments
     /// after start), or after it closed — so a caller that answers someone
@@ -1223,6 +1238,7 @@ impl App {
                     last_size: None,
                     paused: false,
                     output: String::new(),
+                    status: status::Status::default(),
                 });
                 let was_named = matches!(entry.info.login, Login::LoggedIn(_));
                 entry.info = info;
@@ -1316,6 +1332,9 @@ impl App {
             self.config.corner_radius = new.corner_radius;
             self.config.round_corners = new.round_corners;
             self.resend_thumb_sizes();
+        }
+        if new.eve_logs_dir != self.config.eve_logs_dir {
+            self.logs_dir = resolve_logs_dir(&new);
         }
         let mode_changed = new.mode != self.config.mode;
         self.config = new;
@@ -2077,6 +2096,22 @@ impl App {
     }
 }
 
+/// Where EVE's logs are, for the status line: the config override or the
+/// Steam library walk. `None` (with a warning) switches the feature off.
+fn resolve_logs_dir(config: &Config) -> Option<PathBuf> {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    match yutani::eve_logs::discover(config.eve_logs_dir.as_deref().map(Path::new), &home) {
+        Ok(dir) => {
+            tracing::info!("EVE logs: {}", dir.display());
+            Some(dir)
+        }
+        Err(e) => {
+            tracing::warn!("EVE log status off: {e}");
+            None
+        }
+    }
+}
+
 impl Application for App {
     type Executor = cosmic::executor::Default;
     type Flags = AppFlags;
@@ -2100,6 +2135,7 @@ impl Application for App {
                 (Layout::default(), true)
             }
         };
+        let logs_dir = resolve_logs_dir(&flags.0);
         let app = App {
             core,
             config: flags.0,
@@ -2109,6 +2145,7 @@ impl Application for App {
             steam_windows: HashMap::new(),
             launch: None,
             launch_epoch: Instant::now(),
+            logs_dir,
             outputs: Vec::new(),
             layout,
             layout_poisoned,
@@ -2192,6 +2229,23 @@ impl Application for App {
                 Task::none()
             }
             Msg::Settings(msg) => self.on_settings(msg),
+            Msg::EveLog(events) => {
+                let now = Instant::now();
+                for ev in events {
+                    let client = self.clients.values_mut().find(|c| matches!(&c.info.login, Login::LoggedIn(n) if *n == ev.character));
+                    if let Some(c) = client {
+                        c.status.apply(&ev.kind, now);
+                    }
+                }
+                Task::none()
+            }
+            Msg::StatusTick => {
+                let now = Instant::now();
+                for c in self.clients.values_mut() {
+                    c.status.tick(now);
+                }
+                Task::none()
+            }
             Msg::Ipc(ev) => {
                 let (reply, task) = self.handle_request(&ev.request, &ev.reply);
                 if let Reply::Now(result) = reply {
@@ -2253,6 +2307,12 @@ impl Application for App {
         }
         if self.launch.is_some() {
             subs.push(cosmic::iced::time::every(Duration::from_millis(500)).map(|_| Msg::LaunchTick));
+        }
+        if let Some(dir) = self.logs_dir.clone() {
+            subs.push(yutani::eve_logs::watch::subscription(dir).map(Msg::EveLog));
+        }
+        if self.status_active() {
+            subs.push(cosmic::iced::time::every(Duration::from_secs(1)).map(|_| Msg::StatusTick));
         }
         Subscription::batch(subs)
     }
@@ -2395,6 +2455,7 @@ mod tests {
             steam_windows: HashMap::new(),
             launch: None,
             launch_epoch: Instant::now(),
+            logs_dir: None,
             outputs: Vec::new(),
             layout: Layout::default(),
             layout_poisoned: false,
@@ -2428,6 +2489,29 @@ mod tests {
 
     fn surface_of(app: &App, h: &Handle) -> Option<SurfaceId> {
         app.clients[h].surface
+    }
+
+    fn log_event(character: &str, kind: yutani::eve_logs::EventKind) -> yutani::eve_logs::LogEvent {
+        yutani::eve_logs::LogEvent { character: character.into(), at: yutani::eve_logs::EveTime(0), kind }
+    }
+
+    #[test]
+    fn log_events_reach_the_named_client_and_the_tick_runs_while_active() {
+        use yutani::eve_logs::EventKind;
+        let fake = Fake::new();
+        let mut app = app(Config::default());
+        let h = fake.handle();
+        let mut named = info(false, Vec::new());
+        named.login = Login::LoggedIn("TrilliumONE".into());
+        let _ = app.on_backend(Event::ClientAdded(h.clone(), named));
+        let _ = app.update(Msg::EveLog(vec![log_event("TrilliumONE", EventKind::System("Jita".into()))]));
+        assert_eq!(app.clients[&h].status.system.as_deref(), Some("Jita"));
+        let _ = app.update(Msg::EveLog(vec![log_event("Nobody", EventKind::Jammed("x".into()))]));
+        assert!(!app.status_active());
+        let _ = app.update(Msg::EveLog(vec![log_event("TrilliumONE", EventKind::Jammed("x".into()))]));
+        assert!(app.status_active());
+        let _ = app.update(Msg::StatusTick);
+        assert!(app.status_active(), "a 5 s hold survives an immediate tick");
     }
 
     /// `status` is what the applet polls every 5 s (1 s with its popup
