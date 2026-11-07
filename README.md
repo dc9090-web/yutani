@@ -71,6 +71,12 @@ Yutani is written in Rust against the protocols COSMIC ships today. Nothing is e
 - 🧼 **Clean clients.** `WINE_NO_WM_DECORATION=1` removes Wine's title bar; COSMIC draws the frame, or none at all in full screen.
 - 🎞️ **Live even when covered.** A full-screen client hidden under another gets no frame callbacks from the compositor, and with vsync on it simply stops drawing, so its thumbnail would freeze. `yutani launch` starts each client in Mesa's mailbox present mode instead, which never waits for that callback, with DXVK's frame limiter set to your fastest display's refresh rate so nothing runs flat out. Both are plain environment variables; set either one on the launch line yourself and Yutani leaves it alone, or tune them under `launch` in `config.ron`.
 - 🎨 **Follows your theme.** The active border defaults to COSMIC's accent colour, the same one the compositor outlines the focused window with.
+<div align="center">
+<img src="docs/screenshots/thumbnail-status.png" alt="A thumbnail whose caption reads Jita 0.9, the security figure in the client's teal" width="336">
+
+*The status line: solar system and its security status, in the client's colours. Under fire it turns red and gains the incoming dps and SCRAM / POINT / JAM / NEUT tags.*
+</div>
+
 - 📡 **Read from the game's logs.** EVE writes `Documents/EVE/logs` inside its Proton prefix; Yutani finds it through Steam's library list (or `eve_logs_dir` in `config.ron`), tails each character's game log and Local chat log, and derives the status line from the lines you would see in the combat log. Nothing is injected, polled from memory or sent anywhere. The system's security status is shown beside its name in the colour the client uses for it, from a table of every system built into the binary (CCP's Static Data Export, via fuzzwork's CSV dump). Shield, armour and hull are not in the logs, so they are not shown. `yutani doctor` says which folder is in use.
 
 ---
