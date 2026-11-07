@@ -5,7 +5,7 @@ use cosmic::iced::platform_specific::shell::subsurface_widget::Subsurface;
 use cosmic::widget;
 use cosmic::{Element, theme};
 
-use super::{Client, Msg};
+use super::{Client, Msg, status};
 use crate::backend::CaptureImage;
 use crate::backend::gl::swaps_axes;
 use crate::model::config::{Config, Mode, parse_color};
@@ -60,6 +60,22 @@ pub fn with_opacity(color: Color, factor: f32) -> Color {
     Color { a: color.a * factor, ..color }
 }
 
+/// The alarm border and caption colour, `#e11d48`.
+pub const ALARM: [f32; 4] = [0.882, 0.114, 0.282, 1.0];
+
+/// The border colour: alarm (shot at or tackled) over everything, else the
+/// active override, else the theme accent, else the inactive colour.
+pub fn border_rgba(alarm: bool, activated: bool, active_override: Option<[f32; 4]>, inactive: [f32; 4], accent: [f32; 4]) -> [f32; 4] {
+    if alarm {
+        return ALARM;
+    }
+    match (activated, active_override) {
+        (true, Some(c)) => c,
+        (true, None) => accent,
+        (false, _) => inactive,
+    }
+}
+
 pub fn view<'a>(client: &'a Client, config: &Config) -> Element<'a, Msg> {
     // Active border: the configured colour, else the theme accent (what the
     // compositor outlines the focused window with). Resolved inside the style
@@ -75,6 +91,9 @@ pub fn view<'a>(client: &'a Client, config: &Config) -> Element<'a, Msg> {
     // white whatever the theme, so it takes the factor as an explicit colour.
     let alpha = opacity(config, client.hovered);
     let text_ink = theme::Text::Color(with_opacity(Color::WHITE, alpha));
+    let now = std::time::Instant::now();
+    let alarm = client.status.alarm(now);
+    let status_line = config.show_status.then(|| status::caption(&client.status, now)).flatten();
 
     let image: Element<'a, Msg> = if client.unavailable {
         widget::container(widget::text("capture unavailable").size(12).class(text_ink))
@@ -108,8 +127,23 @@ pub fn view<'a>(client: &'a Client, config: &Config) -> Element<'a, Msg> {
     };
 
     let mut layers: Vec<Element<'a, Msg>> = vec![image];
-    if config.show_names {
-        let label = widget::container(widget::text(client.info.login.label()).size(13).class(text_ink))
+    if config.show_names || status_line.is_some() {
+        let mut lines: Vec<Element<'a, Msg>> = Vec::new();
+        if config.show_names {
+            lines.push(widget::text(client.info.login.label()).size(13).class(text_ink).into());
+        }
+        if let Some(line) = status_line {
+            // The alarm colour again in the caption, so the signal survives
+            // a switched-off border.
+            let ink = if alarm {
+                theme::Text::Color(with_opacity(Color { r: ALARM[0], g: ALARM[1], b: ALARM[2], a: 1.0 }, alpha))
+            } else {
+                text_ink
+            };
+            lines.push(widget::text(line).size(11).class(ink).into());
+        }
+        let lines = cosmic::iced::widget::column(lines).spacing(0);
+        let label = widget::container(lines)
             .padding([2, 6])
             .class(theme::Container::custom(move |_| widget::container::Style {
                 background: Some(cosmic::iced::Background::Color(with_opacity(Color { r: 0.0, g: 0.0, b: 0.0, a: 0.6 }, alpha))),
@@ -143,14 +177,8 @@ pub fn view<'a>(client: &'a Client, config: &Config) -> Element<'a, Msg> {
         .width(Length::Fill)
         .height(Length::Fill)
         .class(theme::Container::custom(move |theme| {
-            let [r, g, b, a] = match (activated, active_override) {
-                (true, Some(c)) => c,
-                (true, None) => {
-                    let accent = theme.cosmic().accent_color();
-                    [accent.red, accent.green, accent.blue, accent.alpha]
-                }
-                (false, _) => inactive,
-            };
+            let accent = theme.cosmic().accent_color();
+            let [r, g, b, a] = border_rgba(alarm, activated, active_override, inactive, [accent.red, accent.green, accent.blue, accent.alpha]);
             widget::container::Style {
                 border: Border { color: with_opacity(Color { r, g, b, a }, alpha), width: border_px, radius: radius.into() },
                 ..Default::default()
@@ -187,6 +215,17 @@ mod tests {
         let c = with_opacity(Color { r: 0.1, g: 0.2, b: 0.3, a: 0.5 }, 0.5);
         assert_eq!((c.r, c.g, c.b), (0.1, 0.2, 0.3));
         assert!((c.a - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn alarm_outranks_active_and_inactive() {
+        let grey = [0.1, 0.1, 0.1, 1.0];
+        let accent = [0.0, 0.0, 1.0, 1.0];
+        assert_eq!(border_rgba(true, true, None, grey, accent), ALARM);
+        assert_eq!(border_rgba(true, false, None, grey, accent), ALARM);
+        assert_eq!(border_rgba(false, false, None, grey, accent), grey);
+        assert_eq!(border_rgba(false, true, None, grey, accent), accent);
+        assert_eq!(border_rgba(false, true, Some([0.0, 1.0, 0.0, 1.0]), grey, accent), [0.0, 1.0, 0.0, 1.0]);
     }
 
     #[test]
