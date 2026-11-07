@@ -80,7 +80,7 @@ pub fn border_rgba(alarm: bool, activated: bool, active_override: Option<[f32; 4
     }
 }
 
-pub fn view<'a>(client: &'a Client, config: &Config) -> Element<'a, Msg> {
+pub fn view<'a>(client: &'a Client, config: &Config, status: &status::Status) -> Element<'a, Msg> {
     // Active border: the configured colour, else the theme accent (what the
     // compositor outlines the focused window with). Resolved inside the style
     // closure because that is where the theme is available.
@@ -96,8 +96,8 @@ pub fn view<'a>(client: &'a Client, config: &Config) -> Element<'a, Msg> {
     let alpha = opacity(config, client.hovered);
     let text_ink = theme::Text::Color(with_opacity(Color::WHITE, alpha));
     let now = std::time::Instant::now();
-    let alarm = client.status.alarm(now);
-    let status_line = config.show_status.then(|| status::caption(&client.status, now)).flatten();
+    let alarm = status.alarm(now);
+    let status_line = config.show_status.then(|| status::caption(status, now)).flatten();
 
     let image: Element<'a, Msg> = if client.unavailable {
         widget::container(widget::text("capture unavailable").size(12).class(text_ink))

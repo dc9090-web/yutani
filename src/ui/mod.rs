@@ -97,8 +97,6 @@ pub struct Client {
     /// Pause/resume is an edge on this, not on whether a surface exists, so
     /// a client born hidden is paused too.
     pub paused: bool,
-    /// What the EVE log says about this character (system, under fire…).
-    pub status: status::Status,
     /// Connector name of the output this client's surface was created on;
     /// empty when it has none. Applying a layout compares this with the
     /// layout's output: a layer surface is bound to one output for life, so
@@ -123,6 +121,11 @@ pub struct App {
     /// EVE's `Documents/EVE/logs`, when found; `None` keeps the status
     /// line off (`resolve_logs_dir`).
     pub logs_dir: Option<PathBuf>,
+    /// What the EVE logs say about each character, by name. Kept here
+    /// rather than on the `Client` because the log reader's backfill can
+    /// arrive before the window is discovered (and the window can be
+    /// recreated), and the status must survive both.
+    pub status: HashMap<String, status::Status>,
     pub outputs: Vec<Output>,
     pub layout: Layout,
     /// Set at startup when `current.ron` exists but failed to parse (spec
@@ -239,10 +242,20 @@ fn response_of(result: Result<Option<String>, String>) -> crate::ipc::Response {
 const OWN_WRITE_ECHO: Duration = Duration::from_millis(500);
 
 impl App {
-    /// Any client's status still has a timed hold or hit running.
+    /// Any character's status still has a timed hold or hit running.
     pub fn status_active(&self) -> bool {
         let now = Instant::now();
-        self.clients.values().any(|c| c.status.active(now))
+        self.status.values().any(|s| s.active(now))
+    }
+
+    /// The log status of a client's character; a blank one until the
+    /// client is named or its log has said anything.
+    pub fn status_of(&self, client: &Client) -> &status::Status {
+        static NONE: std::sync::LazyLock<status::Status> = std::sync::LazyLock::new(status::Status::default);
+        match &client.info.login {
+            Login::LoggedIn(name) => self.status.get(name).unwrap_or(&NONE),
+            Login::LoggingIn => &NONE,
+        }
     }
 
     /// Hand a command to the backend. `false` when it could not be sent —
@@ -1238,7 +1251,6 @@ impl App {
                     last_size: None,
                     paused: false,
                     output: String::new(),
-                    status: status::Status::default(),
                 });
                 let was_named = matches!(entry.info.login, Login::LoggedIn(_));
                 entry.info = info;
@@ -2146,6 +2158,7 @@ impl Application for App {
             launch: None,
             launch_epoch: Instant::now(),
             logs_dir,
+            status: HashMap::new(),
             outputs: Vec::new(),
             layout,
             layout_poisoned,
@@ -2232,17 +2245,14 @@ impl Application for App {
             Msg::EveLog(events) => {
                 let now = Instant::now();
                 for ev in events {
-                    let client = self.clients.values_mut().find(|c| matches!(&c.info.login, Login::LoggedIn(n) if *n == ev.character));
-                    if let Some(c) = client {
-                        c.status.apply(&ev.kind, now);
-                    }
+                    self.status.entry(ev.character).or_default().apply(&ev.kind, now);
                 }
                 Task::none()
             }
             Msg::StatusTick => {
                 let now = Instant::now();
-                for c in self.clients.values_mut() {
-                    c.status.tick(now);
+                for s in self.status.values_mut() {
+                    s.tick(now);
                 }
                 Task::none()
             }
@@ -2375,7 +2385,7 @@ impl Application for App {
             let (w, h) = thumbnail::size(&self.config, client.image.as_ref());
             let (x, y) = client.position;
             widget::container(
-                widget::container(thumbnail::view(client, &self.config))
+                widget::container(thumbnail::view(client, &self.config, self.status_of(client)))
                     .width(Length::Fixed(w as f32))
                     .height(Length::Fixed(h as f32)),
             )
@@ -2385,7 +2395,7 @@ impl Application for App {
             .height(Length::Fill)
             .into()
         } else {
-            thumbnail::view(client, &self.config)
+            thumbnail::view(client, &self.config, self.status_of(client))
         }
     }
 }
@@ -2456,6 +2466,7 @@ mod tests {
             launch: None,
             launch_epoch: Instant::now(),
             logs_dir: None,
+            status: HashMap::new(),
             outputs: Vec::new(),
             layout: Layout::default(),
             layout_poisoned: false,
@@ -2505,8 +2516,11 @@ mod tests {
         named.login = Login::LoggedIn("TrilliumONE".into());
         let _ = app.on_backend(Event::ClientAdded(h.clone(), named));
         let _ = app.update(Msg::EveLog(vec![log_event("TrilliumONE", EventKind::System("Jita".into()))]));
-        assert_eq!(app.clients[&h].status.system.as_deref(), Some("Jita"));
-        let _ = app.update(Msg::EveLog(vec![log_event("Nobody", EventKind::Jammed("x".into()))]));
+        assert_eq!(app.status_of(&app.clients[&h]).system.as_deref(), Some("Jita"));
+        // A character whose window is not (yet) known keeps its status for
+        // when it is: the backfill races window discovery at startup.
+        let _ = app.update(Msg::EveLog(vec![log_event("Later", EventKind::System("Amarr".into()))]));
+        assert_eq!(app.status["Later"].system.as_deref(), Some("Amarr"));
         assert!(!app.status_active());
         let _ = app.update(Msg::EveLog(vec![log_event("TrilliumONE", EventKind::Jammed("x".into()))]));
         assert!(app.status_active());
