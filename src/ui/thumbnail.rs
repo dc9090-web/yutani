@@ -60,8 +60,12 @@ pub fn with_opacity(color: Color, factor: f32) -> Color {
     Color { a: color.a * factor, ..color }
 }
 
-/// The alarm border and caption colour, `#e11d48`.
+/// The alarm border colour, `#e11d48`.
 pub const ALARM: [f32; 4] = [0.882, 0.114, 0.282, 1.0];
+/// The alarm caption colour: the same red lifted to read on the dark pill (`#fb7185`).
+const ALARM_INK: Color = Color { r: 0.984, g: 0.443, b: 0.522, a: 1.0 };
+/// The caption pill: near-opaque so the text never fights the frame behind it.
+const PILL: Color = Color { r: 0.02, g: 0.02, b: 0.03, a: 0.82 };
 
 /// The border colour: alarm (shot at or tackled) over everything, else the
 /// active override, else the theme accent, else the inactive colour.
@@ -130,24 +134,20 @@ pub fn view<'a>(client: &'a Client, config: &Config) -> Element<'a, Msg> {
     if config.show_names || status_line.is_some() {
         let mut lines: Vec<Element<'a, Msg>> = Vec::new();
         if config.show_names {
-            lines.push(widget::text(client.info.login.label()).size(13).class(text_ink).into());
+            lines.push(widget::text(client.info.login.label()).size(15).font(cosmic::font::bold()).class(text_ink).into());
         }
         if let Some(line) = status_line {
             // The alarm colour again in the caption, so the signal survives
             // a switched-off border.
-            let ink = if alarm {
-                theme::Text::Color(with_opacity(Color { r: ALARM[0], g: ALARM[1], b: ALARM[2], a: 1.0 }, alpha))
-            } else {
-                text_ink
-            };
-            lines.push(widget::text(line).size(11).class(ink).into());
+            let ink = theme::Text::Color(with_opacity(if alarm { ALARM_INK } else { Color { a: 0.92, ..Color::WHITE } }, alpha));
+            lines.push(widget::text(line).size(12).font(cosmic::font::semibold()).class(ink).into());
         }
-        let lines = cosmic::iced::widget::column(lines).spacing(0);
+        let lines = cosmic::iced::widget::column(lines).spacing(1);
         let label = widget::container(lines)
-            .padding([2, 6])
+            .padding([4, 9])
             .class(theme::Container::custom(move |_| widget::container::Style {
-                background: Some(cosmic::iced::Background::Color(with_opacity(Color { r: 0.0, g: 0.0, b: 0.0, a: 0.6 }, alpha))),
-                border: Border { radius: 4.0.into(), ..Default::default() },
+                background: Some(cosmic::iced::Background::Color(with_opacity(PILL, alpha))),
+                border: Border { radius: 6.0.into(), ..Default::default() },
                 ..Default::default()
             }));
         layers.push(
