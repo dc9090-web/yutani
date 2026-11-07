@@ -156,6 +156,8 @@ pub struct Config {
     /// before the toggle — means "on if `border_px` is non-zero".
     pub show_border: Option<bool>,
     pub show_names: bool,
+    /// The second caption line: solar system, incoming dps, SCRAM/JAM/NEUT.
+    pub show_status: bool,
     /// Hover zoom multiplier, 1.0–4.0 (1.0 = no hover zoom).
     pub zoom_factor: f32,
     /// Thumbnail opacity as a whole-number percent, 20..=100 (100 = opaque).
@@ -183,6 +185,9 @@ pub struct Config {
     /// EVE's profile directory (the one holding `core_char_*.dat`), when
     /// Steam's library list cannot find it. Absolute path.
     pub eve_settings_dir: Option<String>,
+    /// EVE's `Documents/EVE/logs` directory when Steam's library list
+    /// cannot find it. Absolute path.
+    pub eve_logs_dir: Option<String>,
 }
 
 impl Default for Config {
@@ -196,6 +201,7 @@ impl Default for Config {
             border_px: 0,
             show_border: None,
             show_names: true,
+            show_status: true,
             zoom_factor: 1.0,
             thumb_opacity: 100,
             visibility: Visibility::EveFocusedOnly,
@@ -209,6 +215,7 @@ impl Default for Config {
             shortcuts: ShortcutsConfig::default(),
             launch: LaunchConfig::default(),
             eve_settings_dir: None,
+            eve_logs_dir: None,
         }
     }
 }
@@ -351,6 +358,7 @@ impl Config {
             }
         }
         check!(eve_settings_dir, |v: &Option<String>| v.as_deref().is_none_or(|p| Path::new(p).is_absolute()), "absolute path or unset");
+        check!(eve_logs_dir, |v: &Option<String>| v.as_deref().is_none_or(|p| Path::new(p).is_absolute()), "absolute path or unset");
         self
     }
 }
@@ -483,6 +491,7 @@ mod tests {
             active_border: Some("nope".into()),
             border_px: 99,
             eve_settings_dir: Some("relative/dir".into()),
+            eve_logs_dir: Some("relative/logs".into()),
             ..Config::default()
         }
         .validate();
@@ -493,6 +502,8 @@ mod tests {
         assert_eq!(c.active_border, d.active_border);
         assert_eq!(c.border_px, d.border_px);
         assert_eq!(c.eve_settings_dir, None);
+        assert_eq!(c.eve_logs_dir, None);
+        assert!(Config::default().show_status);
     }
 
     #[test]

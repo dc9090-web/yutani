@@ -441,6 +441,10 @@ pub enum Msg {
     RoundCorners(bool),
     CornerRadius(u32),
     ShowNames(bool),
+    /// The second caption line (system, dps, tags).
+    ShowStatus(bool),
+    /// The EVE logs folder override; empty means find it through Steam.
+    LogsDir(String),
     ActiveBorder(String),
     InactiveBorder(String),
     /// Border 1, radius 8, Accent, the inactive default.
@@ -602,6 +606,8 @@ pub fn apply_config_field(config: &mut Config, msg: &Msg) -> Result<bool, String
         }
         Msg::CornerRadius(v) => config.corner_radius = (*v).min(64),
         Msg::ShowNames(v) => config.show_names = *v,
+        Msg::ShowStatus(v) => config.show_status = *v,
+        Msg::LogsDir(text) => config.eve_logs_dir = (!text.trim().is_empty()).then(|| text.trim().to_string()),
         Msg::ActiveBorder(text) => config.active_border = parse_optional_color(text)?,
         Msg::InactiveBorder(text) => config.inactive_border = parse_required_color(text)?,
         Msg::ResetFrame => {
@@ -844,7 +850,20 @@ fn display_page<'a>(state: &'a State, config: &'a Config) -> Element<'a, Msg> {
         widget::slider(20..=100u8, config.thumb_opacity, Msg::Opacity).step(1u8).on_release(Msg::Commit).width(Length::Fixed(ui::SLIDER_W)).into(),
     );
     let names = ui::row("Show character names", Some("Caption under each thumbnail."), ui::toggle(config.show_names, Msg::ShowNames));
-    let thumbnails = ui::card(vec![preview_strip(config), width, zoom, opacity, names]);
+    let status = ui::row(
+        "Show system and combat status",
+        Some("Second caption line from EVE's own logs: solar system, incoming dps, SCRAM / POINT / JAM / NEUT. The border turns red while shot at or tackled."),
+        ui::toggle(config.show_status, Msg::ShowStatus),
+    );
+    let logs_dir = ui::row(
+        "EVE logs folder",
+        Some("Leave empty to find it through Steam: Documents/EVE/logs inside the Proton prefix."),
+        widget::text_input("found through Steam", config.eve_logs_dir.as_deref().unwrap_or(""))
+            .on_input(Msg::LogsDir)
+            .on_submit(|_| Msg::Commit)
+            .width(Length::Fixed(ui::SLIDER_W)),
+    );
+    let thumbnails = ui::card(vec![preview_strip(config), width, zoom, opacity, names, status, logs_dir]);
 
     let on = config.border_on();
     let toggle = ui::row_tight("Show border", Some("Off draws none; width and colours are kept."), ui::toggle(on, Msg::ShowBorder));
@@ -1403,6 +1422,12 @@ mod tests {
         assert_eq!(c.thumb_opacity, 100);
         assert_eq!(apply_config_field(&mut c, &Msg::ShowNames(false)), Ok(true));
         assert!(!c.show_names);
+        assert_eq!(apply_config_field(&mut c, &Msg::ShowStatus(false)), Ok(true));
+        assert!(!c.show_status);
+        assert_eq!(apply_config_field(&mut c, &Msg::LogsDir("/mnt/x/logs".into())), Ok(true));
+        assert_eq!(c.eve_logs_dir.as_deref(), Some("/mnt/x/logs"));
+        assert_eq!(apply_config_field(&mut c, &Msg::LogsDir(String::new())), Ok(true));
+        assert_eq!(c.eve_logs_dir, None);
         assert_eq!(apply_config_field(&mut c, &Msg::ActiveBorder("#ff8800".into())), Ok(true));
         assert_eq!(c.active_border.as_deref(), Some("#ff8800"));
         assert_eq!(apply_config_field(&mut c, &Msg::ActiveBorder(String::new())), Ok(true));
