@@ -36,6 +36,7 @@ pub mod pointer;
 pub mod rules;
 pub mod settings;
 pub mod settings_ui;
+pub mod status;
 pub mod thumbnail;
 
 /// The daemon's flags. `Config` itself lives in the library now, and the
