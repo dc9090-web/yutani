@@ -6,6 +6,7 @@
 //! in the logs; "under fire" is derived from incoming hits.
 
 pub mod parse;
+pub mod systems;
 pub mod tail;
 pub mod watch;
 

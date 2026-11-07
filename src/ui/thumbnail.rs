@@ -97,7 +97,7 @@ pub fn view<'a>(client: &'a Client, config: &Config, status: &status::Status) ->
     let text_ink = theme::Text::Color(with_opacity(Color::WHITE, alpha));
     let now = std::time::Instant::now();
     let alarm = status.alarm(now);
-    let status_line = config.show_status.then(|| status::caption(status, now)).flatten();
+    let status_spans = if config.show_status { status::caption_spans(status, now) } else { Vec::new() };
 
     let image: Element<'a, Msg> = if client.unavailable {
         widget::container(widget::text("capture unavailable").size(12).class(text_ink))
@@ -131,16 +131,27 @@ pub fn view<'a>(client: &'a Client, config: &Config, status: &status::Status) ->
     };
 
     let mut layers: Vec<Element<'a, Msg>> = vec![image];
-    if config.show_names || status_line.is_some() {
+    if config.show_names || !status_spans.is_empty() {
         let mut lines: Vec<Element<'a, Msg>> = Vec::new();
         if config.show_names {
             lines.push(widget::text(client.info.login.label()).size(15).font(cosmic::font::bold()).class(text_ink).into());
         }
-        if let Some(line) = status_line {
+        if !status_spans.is_empty() {
             // The alarm colour again in the caption, so the signal survives
-            // a switched-off border.
+            // a switched-off border. The security figure keeps the client's
+            // own colour for it whatever else is going on.
             let ink = theme::Text::Color(with_opacity(if alarm { ALARM_INK } else { Color { a: 0.92, ..Color::WHITE } }, alpha));
-            lines.push(widget::text(line).size(12).font(cosmic::font::semibold()).class(ink).into());
+            let runs: Vec<Element<'a, Msg>> = status_spans
+                .into_iter()
+                .map(|span| match span {
+                    status::Span::Plain(text) => widget::text(text).size(12).font(cosmic::font::semibold()).class(ink).into(),
+                    status::Span::Security { text, rgb: [r, g, b] } => {
+                        let sec_ink = theme::Text::Color(with_opacity(Color { r, g, b, a: 1.0 }, alpha));
+                        widget::text(text).size(12).font(cosmic::font::bold()).class(sec_ink).into()
+                    }
+                })
+                .collect();
+            lines.push(cosmic::iced::widget::row(runs).spacing(0).into());
         }
         let lines = cosmic::iced::widget::column(lines).spacing(1);
         let label = widget::container(lines)

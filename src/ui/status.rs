@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use yutani::eve_logs::EventKind;
+use yutani::eve_logs::{EventKind, systems};
 
 pub const DAMAGE_WINDOW: Duration = Duration::from_secs(5);
 pub const TACKLE_HOLD: Duration = Duration::from_secs(10);
@@ -108,20 +108,60 @@ impl Status {
     }
 }
 
-/// The second caption line, `None` when there is nothing to say.
-pub fn caption(status: &Status, now: Instant) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    match (&status.system, status.docked) {
-        (Some(s), true) => parts.push(format!("Docked · {s}")),
-        (Some(s), false) => parts.push(s.clone()),
-        (None, true) => parts.push("Docked".into()),
-        (None, false) => {}
+/// One run of the caption line: plain text in the caption's ink, or the
+/// system's security figure in the client's colour for it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Span {
+    Plain(String),
+    Security { text: String, rgb: [f32; 3] },
+}
+
+/// The second caption line as spans; empty when there is nothing to say.
+pub fn caption_spans(status: &Status, now: Instant) -> Vec<Span> {
+    let mut spans = Vec::new();
+    let mut plain = String::new();
+    if status.docked {
+        plain.push_str("Docked");
     }
+    if let Some(system) = &status.system {
+        if !plain.is_empty() {
+            plain.push_str(" · ");
+        }
+        plain.push_str(system);
+        if let Some(sec) = systems::security(system) {
+            plain.push(' ');
+            spans.push(Span::Plain(std::mem::take(&mut plain)));
+            spans.push(Span::Security { text: systems::label(sec), rgb: systems::color(sec) });
+        }
+    }
+    let mut rest: Vec<String> = Vec::new();
     if let Some(dps) = status.dps(now) {
-        parts.push(format!("{dps} dps"));
+        rest.push(format!("{dps} dps"));
     }
-    parts.extend(status.tags(now).into_iter().map(str::to_string));
-    (!parts.is_empty()).then(|| parts.join(" · "))
+    rest.extend(status.tags(now).into_iter().map(str::to_string));
+    for part in rest {
+        if !plain.is_empty() || !spans.is_empty() {
+            plain.push_str(" · ");
+        }
+        plain.push_str(&part);
+    }
+    if !plain.is_empty() {
+        spans.push(Span::Plain(plain));
+    }
+    spans
+}
+
+/// The caption line as one string (the spans' text run together).
+pub fn caption(status: &Status, now: Instant) -> Option<String> {
+    let spans = caption_spans(status, now);
+    (!spans.is_empty()).then(|| {
+        spans
+            .iter()
+            .map(|s| match s {
+                Span::Plain(t) | Span::Security { text: t, .. } => t.as_str(),
+            })
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -170,12 +210,14 @@ mod tests {
         let t0 = Instant::now();
         let mut s = Status::default();
         s.apply(&EventKind::System("Jita".into()), t0);
-        assert_eq!(caption(&s, t0).as_deref(), Some("Jita"));
+        assert_eq!(caption(&s, t0).as_deref(), Some("Jita 0.9"));
         s.apply(&EventKind::Docked, t0);
-        assert_eq!(caption(&s, t0).as_deref(), Some("Docked · Jita"));
+        assert_eq!(caption(&s, t0).as_deref(), Some("Docked · Jita 0.9"));
         s.apply(&EventKind::Undocked("Perimeter".into()), t0);
         assert!(!s.docked);
-        assert_eq!(caption(&s, t0).as_deref(), Some("Perimeter"));
+        assert_eq!(caption(&s, t0).as_deref(), Some("Perimeter 0.9"));
+        s.apply(&EventKind::System("Unknown Place".into()), t0);
+        assert_eq!(caption(&s, t0).as_deref(), Some("Unknown Place"));
         s.apply(&EventKind::System("Urlen".into()), t0);
         assert_eq!(s.system.as_deref(), Some("Urlen"));
     }
@@ -189,6 +231,25 @@ mod tests {
         assert_eq!(caption(&s, t0).as_deref(), Some("240 dps"));
         s.apply(&EventKind::System("Korsiki".into()), t0);
         s.apply(&EventKind::Scrambled("s".into()), t0);
-        assert_eq!(caption(&s, t0).as_deref(), Some("Korsiki · 240 dps · SCRAM"));
+        assert_eq!(caption(&s, t0).as_deref(), Some("Korsiki 0.6 · 240 dps · SCRAM"));
+        assert_eq!(
+            caption_spans(&s, t0),
+            vec![
+                Span::Plain("Korsiki ".into()),
+                Span::Security { text: "0.6".into(), rgb: systems::color(0.6) },
+                Span::Plain(" · 240 dps · SCRAM".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lowsec_system_gets_the_orange_figure() {
+        let t0 = Instant::now();
+        let mut s = Status::default();
+        s.apply(&EventKind::System("Akora".into()), t0);
+        assert_eq!(
+            caption_spans(&s, t0),
+            vec![Span::Plain("Akora ".into()), Span::Security { text: "0.3".into(), rgb: systems::color(0.3) }]
+        );
     }
 }
