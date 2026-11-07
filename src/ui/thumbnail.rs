@@ -64,6 +64,12 @@ pub fn with_opacity(color: Color, factor: f32) -> Color {
 pub const ALARM: [f32; 4] = [0.882, 0.114, 0.282, 1.0];
 /// The alarm caption colour: the same red lifted to read on the dark pill (`#fb7185`).
 const ALARM_INK: Color = Color { r: 0.984, g: 0.443, b: 0.522, a: 1.0 };
+/// The character name's face: a step past bold, so it holds up over a
+/// busy frame at thumbnail size.
+fn name_font() -> cosmic::font::Font {
+    cosmic::font::Font { weight: cosmic::iced::font::Weight::ExtraBold, ..cosmic::font::default() }
+}
+
 /// The caption pill: near-opaque so the text never fights the frame behind it.
 const PILL: Color = Color { r: 0.02, g: 0.02, b: 0.03, a: 0.82 };
 
@@ -134,7 +140,7 @@ pub fn view<'a>(client: &'a Client, config: &Config, status: &status::Status) ->
     if config.show_names || !status_spans.is_empty() {
         let mut lines: Vec<Element<'a, Msg>> = Vec::new();
         if config.show_names {
-            lines.push(widget::text(client.info.login.label()).size(15).font(cosmic::font::bold()).class(text_ink).into());
+            lines.push(widget::text(client.info.login.label()).size(16).font(name_font()).class(text_ink).into());
         }
         if !status_spans.is_empty() {
             // The alarm colour again in the caption, so the signal survives
@@ -144,10 +150,10 @@ pub fn view<'a>(client: &'a Client, config: &Config, status: &status::Status) ->
             let runs: Vec<Element<'a, Msg>> = status_spans
                 .into_iter()
                 .map(|span| match span {
-                    status::Span::Plain(text) => widget::text(text).size(12).font(cosmic::font::semibold()).class(ink).into(),
+                    status::Span::Plain(text) => widget::text(text).size(13).font(cosmic::font::bold()).class(ink).into(),
                     status::Span::Security { text, rgb: [r, g, b] } => {
                         let sec_ink = theme::Text::Color(with_opacity(Color { r, g, b, a: 1.0 }, alpha));
-                        widget::text(text).size(12).font(cosmic::font::bold()).class(sec_ink).into()
+                        widget::text(text).size(13).font(name_font()).class(sec_ink).into()
                     }
                 })
                 .collect();
